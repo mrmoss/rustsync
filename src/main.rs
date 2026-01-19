@@ -1,3 +1,4 @@
+use clap::Parser;
 use notify::{
     event::{DataChange, MetadataKind, ModifyKind, RenameMode},
     EventKind, RecommendedWatcher, RecursiveMode, Watcher,
@@ -291,16 +292,26 @@ fn handle_event(watch_root: &Path, output_root: &Path, event: &notify::Event) {
     }
 }
 
+#[derive(Parser)]
+struct Args {
+    watch_root: PathBuf,
+    output_root: PathBuf,
+}
+
 fn main() -> notify::Result<()> {
+    let args = Args::parse();
+
+    let watch_root = fs::canonicalize(PathBuf::from(args.watch_root))?;
+    let output_root = fs::canonicalize(PathBuf::from(args.output_root))?;
+
     let (sender, receiver) = channel();
     let mut watcher: RecommendedWatcher = Watcher::new(sender, notify::Config::default())?;
 
-    let watch_root = fs::canonicalize("./test/input")?;
-    let output_root = fs::canonicalize("./test/output")?;
-
     watcher.watch(&watch_root, RecursiveMode::Recursive)?;
 
-    println!("Watching {:?} (Ctrl+C to quit)", watch_root);
+    println!("Watching {:?}", watch_root);
+    println!("Outputting to {:?}", output_root);
+    println!("(Ctrl+C to quit)");
 
     for result in receiver {
         match result {
