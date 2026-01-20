@@ -1,105 +1,107 @@
+use anyhow::{Context, Result};
 use clap::Parser;
 use dirs::home_dir;
 use libp2p::identity;
 use std::{
     fs,
-    path::PathBuf,
+    path::{Path, PathBuf},
     process,
-    os::unix::fs::PermissionsExt,
 };
-use anyhow::{
-    Context,
-    Result
-};
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 
-pub struct QuicPeerKeys {
-    pub id: String,
-    pub keypair: identity::Keypair,
-    pub private: Vec<u8>,
-    pub public: Vec<u8>,
+fn save_keypair(dir: &Path, keypair: &identity::Keypair) -> Result<String> {
+    fs::create_dir_all(dir)?;
+
+    let peer_id = keypair.public().to_peer_id().to_string();
+    let private_path = dir.join(&peer_id).with_extension("private");
+    let public_path  = dir.join(&peer_id).with_extension("public");
+
+    let private = keypair
+        .to_protobuf_encoding()
+        .context("Failed to encode private key")?;
+    let public = keypair.public().encode_protobuf();
+
+    write_key(&private_path, &private, 0o600)?;
+    write_key(&public_path, &public, 0o644)?;
+
+    Ok(peer_id)
 }
 
-pub fn force_err() -> Result<QuicPeerKeys> {
-    anyhow::bail!("forced failure for test");
-}
+fn load_ed25519(dir: &Path, peer_id: &str) -> Result<identity::Keypair> {
+    let private_path = dir.join(peer_id).with_extension("private");
 
-fn default_rustsync_dir() -> String {
-    let home = home_dir().expect("Failed to get home directory");
-    home.join(".rustsync").to_str().expect("Home path is not valid UTF-8").to_string()
-}
+    let private = fs::read(&private_path)
+        .with_context(|| format!("Failed to read {:?}", private_path))?;
 
-pub fn load_ed25519(dpath: &PathBuf, peer_id: &str) -> Result<identity::Keypair> {
-    let private = read_key(&dpath.join(&peer_id).with_extension("private")).context("Could not load private key")?;
-    let keypair = identity::Keypair::from_protobuf_encoding(&private).context("Invalid private key")?;
+    let keypair = identity::Keypair::from_protobuf_encoding(&private)
+        .context("Invalid private key encoding")?;
 
-    let loaded_peer_id = keypair.public().to_peer_id().to_string();
-    if loaded_peer_id != peer_id {
+    let derived = keypair.public().to_peer_id().to_string();
+    if derived != peer_id {
         anyhow::bail!(
             "Peer ID mismatch: expected {}, got {}",
             peer_id,
-            loaded_peer_id
+            derived
         );
     }
 
     Ok(keypair)
 }
 
-pub fn generate_ed25519() -> Result<QuicPeerKeys> {
-    let keypair = identity::Keypair::generate_ed25519();
+fn write_key(path: &Path, data: &[u8], mode: u32) -> Result<()> {
+    fs::write(path, data)?;
+    #[cfg(unix)]
+    fs::set_permissions(path, fs::Permissions::from_mode(mode))?;
+    Ok(())
+}
 
-    Ok(QuicPeerKeys {
-        id: keypair.public().to_peer_id().to_string(),
-        keypair: keypair.clone(),
-        private: keypair.to_protobuf_encoding().context("Private key encode failure")?,
-        public: keypair.public().encode_protobuf(),
-    })
+fn default_rustsync_dir() -> String {
+    home_dir()
+        .expect("No home directory")
+        .join(".rustsync")
+        .to_string_lossy()
+        .into_owned()
 }
 
 #[derive(Parser)]
 #[command(name = "rustsync-keygen", about = "Generate rustsync peer keys")]
 struct Args {
     #[arg(short = 'O', long = "output", default_value_t = default_rustsync_dir())]
-    rustsync_keys_dpath: String,
-}
-
-fn write_key(fpath: &PathBuf, data: &Vec<u8>, permissions: u32) -> Result<()> {
-    println!("Writing key:\t{:?}", &fpath.display());
-    fs::write(&fpath, &data)?;
-    fs::set_permissions(&fpath, fs::Permissions::from_mode(permissions))?;
-    Ok(())
-}
-
-fn read_key(fpath: &PathBuf) -> Result<Vec<u8>> {
-    println!("Reading key:\t{:?}", &fpath.display());
-    Ok(fs::read(&fpath)?)
+    output: String,
 }
 
 fn main() -> Result<()> {
     let args = Args::parse();
-    let dpath = PathBuf::from(&args.rustsync_keys_dpath);
+    let dir = PathBuf::from(&args.output);
 
     #[cfg(unix)]
     {
-        println!("Verifying permissions on {:?}...", &dpath.display());
-        let metadata = fs::metadata(&dpath)?;
-        let perms = metadata.permissions();
-
-        if perms.mode() & 0o077 > 0 {
-            eprintln!("Error: Invalid permissions on {:?}", &dpath.display());
-            process::exit(-1);            
+        if dir.exists() {
+            let perms = fs::metadata(&dir)?.permissions();
+            if perms.mode() & 0o077 != 0 {
+                eprintln!(
+                    "Error: {:?} must not be accessible by group or others",
+                    dir
+                );
+                process::exit(1);
+            }
         }
     }
 
-    println!("Generating keys");
-    let peer = generate_ed25519()?;
+    println!("Generating new Ed25519 keypair…");
+    let keypair = identity::Keypair::generate_ed25519();
 
-    write_key(&dpath.join(&peer.id).with_extension("private"), &peer.private, 0o600)?;
-    write_key(&dpath.join(&peer.id).with_extension("public"), &peer.public, 0o644)?;
+    let peer_id = save_keypair(&dir, &keypair)?;
+    println!("Peer ID: {peer_id}");
 
-    println!("Reading keys");
-    let testpair = load_ed25519(&dpath, &peer.id);
-    println!("{:?}", peer.keypair);
-    println!("{:?}", testpair);
+    // Sanity check
+    let loaded = load_ed25519(&dir, &peer_id)?;
+    assert_eq!(
+        loaded.public().to_peer_id(),
+        keypair.public().to_peer_id()
+    );
 
+    println!("Keys written to {:?}", dir);
     Ok(())
 }
