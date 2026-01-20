@@ -2,6 +2,10 @@
 name = "filesync"
 path = "src/main.rs"
 
+[[bin]]
+name = "key-gen"
+path = "src/keys.rs"
+
 [package]
 name = "notify-demo"
 version = "2025.1.17"
@@ -9,6 +13,17 @@ edition = "2021"
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }
+dirs = "4"
 filetime = "0.2"
 libc = "0.2"
 notify = "6"
+libp2p = { version = "0.56", features = [
+    "tokio",      # async runtime support
+    "quic",       # QUIC transport
+    "ed25519",    # Ed25519 identity keys
+    "noise",      # optional Noise security protocol
+    "tcp",        # TCP transport if you want it too
+] }
+tokio = { version = "1", features = ["full"] }
+futures = "0.3"
+anyhow = "1.0"

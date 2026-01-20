@@ -67,6 +67,10 @@ fn handle_event_create_other(_watch_root: &Path, _output_root: &Path, path: &Pat
     eprintln!("Created[unsupported][other]: {:?}", path);
 }
 
+fn handle_event_create_hardlink(_watch_root: &Path, _output_root: &Path, path: &Path) {
+    eprintln!("Created[unsupported][hardlink]: {:?}", path);
+}
+
 fn handle_event_delete(watch_root: &Path, output_root: &Path, path: &Path) {
     println!("Deleted: {:?}", path);
 
@@ -186,10 +190,6 @@ fn handle_event_create_symlink(watch_root: &Path, output_root: &Path, path: &Pat
     }
 }
 
-fn handle_event_create_hardlink(_watch_root: &Path, _output_root: &Path, path: &Path) {
-    eprintln!("Created[unsupported][hardlink]: {:?}", path);
-}
-
 fn sync_file_to_mirror(watch_root: &Path, output_root: &Path, path: &Path, event_label: &str) {
     println!("{}: {:?}", event_label, path);
 
@@ -300,7 +300,6 @@ struct Args {
 
 fn main() -> notify::Result<()> {
     let args = Args::parse();
-
     let watch_root = fs::canonicalize(PathBuf::from(args.watch_root))?;
     let output_root = fs::canonicalize(PathBuf::from(args.output_root))?;
 

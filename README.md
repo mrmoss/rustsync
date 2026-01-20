@@ -33,6 +33,13 @@ After that we'll move on to encryption:
 
     cargo build
 
+## Configuration
+
+Do this on both the client and server:
+
+    ssh-keygen -t ed25519 -m PEM -f rustsync.key -N ""
+
+
 ## Running
 
 Below will mirror test/input to test/output:
