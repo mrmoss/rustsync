@@ -1,5 +1,4 @@
 use anyhow::{Context, Result};
-use clap::Parser;
 use dirs::home_dir;
 use libp2p::identity;
 use std::{
@@ -10,7 +9,14 @@ use std::{
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 
-fn save_keypair(dir: &Path, keypair: &identity::Keypair) -> Result<String> {
+fn write_key(path: &Path, data: &[u8], mode: u32) -> Result<()> {
+    fs::write(path, data)?;
+    #[cfg(unix)]
+    fs::set_permissions(path, fs::Permissions::from_mode(mode))?;
+    Ok(())
+}
+
+pub fn save_keypair(dir: &Path, keypair: &identity::Keypair) -> Result<String> {
     fs::create_dir_all(dir)?;
 
     let peer_id = keypair.public().to_peer_id().to_string();
@@ -28,7 +34,7 @@ fn save_keypair(dir: &Path, keypair: &identity::Keypair) -> Result<String> {
     Ok(peer_id)
 }
 
-fn load_ed25519(dir: &Path, peer_id: &str) -> Result<identity::Keypair> {
+pub fn load_keypair(dir: &Path, peer_id: &str) -> Result<identity::Keypair> {
     let private_path = dir.join(peer_id).with_extension("private");
 
     let private = fs::read(&private_path)
@@ -49,14 +55,7 @@ fn load_ed25519(dir: &Path, peer_id: &str) -> Result<identity::Keypair> {
     Ok(keypair)
 }
 
-fn write_key(path: &Path, data: &[u8], mode: u32) -> Result<()> {
-    fs::write(path, data)?;
-    #[cfg(unix)]
-    fs::set_permissions(path, fs::Permissions::from_mode(mode))?;
-    Ok(())
-}
-
-fn default_rustsync_dir() -> String {
+pub fn default_rustsync_dir() -> String {
     home_dir()
         .expect("No home directory")
         .join(".rustsync")
@@ -64,17 +63,7 @@ fn default_rustsync_dir() -> String {
         .into_owned()
 }
 
-#[derive(Parser)]
-#[command(name = "rustsync-keygen", about = "Generate rustsync peer keys")]
-struct Args {
-    #[arg(short = 'O', long = "output", default_value_t = default_rustsync_dir())]
-    output: String,
-}
-
-fn main() -> Result<()> {
-    let args = Args::parse();
-    let dir = PathBuf::from(&args.output);
-
+pub fn test_rustsync_dir(dir: &PathBuf) -> Result<()> {
     #[cfg(unix)]
     {
         if dir.exists() {
@@ -88,20 +77,5 @@ fn main() -> Result<()> {
             }
         }
     }
-
-    println!("Generating new Ed25519 keypair…");
-    let keypair = identity::Keypair::generate_ed25519();
-
-    let peer_id = save_keypair(&dir, &keypair)?;
-    println!("Peer ID: {peer_id}");
-
-    // Sanity check
-    let loaded = load_ed25519(&dir, &peer_id)?;
-    assert_eq!(
-        loaded.public().to_peer_id(),
-        keypair.public().to_peer_id()
-    );
-
-    println!("Keys written to {:?}", dir);
     Ok(())
 }
