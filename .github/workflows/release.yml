@@ -65,10 +65,10 @@ jobs:
         run: |
           v=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
           [ "v$v" = "$GITHUB_REF_NAME" ] || { echo "tag $GITHUB_REF_NAME does not match Cargo.toml version $v"; exit 1; }
-      - uses: cross-platform-actions/action@v0.25.0
+      - uses: cross-platform-actions/action@v1.7.0
         with:
           operating_system: freebsd
-          version: '14.2'
+          version: '14.5'
           # The service and command line only; the window needs X11/Wayland libraries.
           run: |
             sudo pkg install -y rust just
