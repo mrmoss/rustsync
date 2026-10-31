@@ -38,7 +38,7 @@ Four words are all you need:
 | Word | What it means |
 |---|---|
 | **Device** | One machine running rustsync (your laptop, your desktop, a home server). Each has a name. |
-| **Pairing** | Introducing two devices once. One shows a **one-time code**, the other pastes it. After that they trust each other, and no one else. |
+| **Pairing** | Introducing two devices once. One shows a **one-time code** (or a QR code), the other enters or scans it, and you check that both screens show the same short number. After that they trust each other, and no one else. |
 | **Library** | A named folder you sync, e.g. `photos` → `~/Photos`. You can have as many as you like. |
 | **Sharing** | Offering a library to a paired device. The other side **accepts** it and picks a folder for it. Either it **syncs** the files, or (with `--backup`) it only keeps an **encrypted backup** it cannot read. |
 
@@ -108,8 +108,9 @@ You need [Rust](https://rustup.rs) (1.81 or newer).
 | **Linux** | yes | yes (X11 and Wayland) | yes | systemd user service (at login, or at boot) |
 | **macOS** (Apple silicon and Intel) | yes | yes | no | launch agent (at login) |
 | **FreeBSD, OpenBSD, NetBSD** | yes | yes (X11 and Wayland) | yes, on desktops with a tray | login entry for the desktop; cron `@reboot` for servers |
+| **Android** (64-bit ARM phones) | yes, inside the app | the app | no | a notification keeps it running; restarts after a reboot |
 
-Android is not supported yet. Windows is not supported (the service uses Unix sockets).
+The Android app is new and only roughly tested: see [The Android app](#the-android-app). Windows is not supported (the service uses Unix sockets).
 
 Linux is the system this was written on; the macOS and BSD support is newer and has had less
 use, so expect rough edges and please report them. See [Platform notes](#platform-notes) below.
@@ -135,6 +136,14 @@ On a server with no screen, skip the window and its libraries:
 
 ```sh
 cargo build --release --no-default-features
+```
+
+The window can also read a pairing QR code with the camera (Linux and macOS). That part is the
+`camera` feature, on by default. If it gives you trouble to build, leave it out and everything
+else still works (you can type or paste the code instead):
+
+```sh
+cargo build --release --no-default-features --features gui,tray
 ```
 
 Put both programs somewhere on your `PATH` (for example `~/.local/bin`), **next to each other**:
@@ -165,12 +174,22 @@ rustsync invite
 ```
 
 It asks which address the other machine should use to reach this one (a name like `laptop` or an
-address like `192.168.1.20` both work), then prints a **one-time code** and waits. On the desktop,
-paste the code:
+address like `192.168.1.20` both work), then prints a **one-time code** with a **QR code** under
+it, and waits. (Add `--no-qr` to skip the picture, or `--light-terminal` if your terminal has a
+light background; the picture is drawn for dark ones.) On the desktop, paste the code:
 
 ```sh
 rustsync join
 ```
+
+(The command line can show a QR code but not read one. To scan one, use the window or the Android
+app.)
+
+**Both machines now show a short verification code, for example `4821 9035`, and the other
+machine's name and key fingerprint.** Look at the two screens: if the numbers are the same, answer
+yes on both. If they differ, or you did not just start pairing yourself, answer no. Nothing is
+trusted until *both* sides say yes. This is what makes sure you paired the machine you meant to,
+even if someone saw or copied the code. See [Security](#security).
 
 The two machines are now paired.
 
@@ -200,14 +219,19 @@ rustsync status
 ## The desktop window
 
 Prefer clicking? Start the window with `rustsync-gui` (it has a *Start* button if the service isn't
-running yet). It has three pages:
+running yet). It has three pages, and opens on the first:
 
+- **This device**: your name, public key, the address you're listening on, and the switch for
+  starting rustsync automatically.
 - **Libraries**: your libraries, who they're shared with, how much encrypted-backup space is used,
   and offers waiting for you to accept.
 - **Devices**: the machines you've paired and whether they're online, plus *Show a pairing code* and
   *Enter a pairing code* for adding another.
-- **This device**: your name, public key, the address you're listening on, and the switch for
-  starting rustsync automatically.
+
+To pair, *Show a pairing code* on one machine: the window shows the code **and a QR code**. On the
+other machine, *Enter a pairing code* lets you paste the code or press *Scan its QR code with the
+camera* (Linux and macOS; macOS asks permission to use the camera the first time). Then both
+windows show the same verification code: compare, and press *The codes match* on both.
 
 <p align="center">
   <img src="docs/screenshots/libraries.png" width="760" alt="The Libraries page: an offer waiting to be accepted, and libraries with their backup usage bars">
@@ -217,6 +241,9 @@ running yet). It has three pages:
 </p>
 <p align="center">
   <img src="docs/screenshots/this-device.png" width="760" alt="The This device page: name, public key, and the start-automatically switch">
+</p>
+<p align="center">
+  <img src="docs/screenshots/pairing.png" width="760" alt="Pairing: the QR code on one device, and the verification code both devices must agree on">
 </p>
 <p align="center">
   <img src="docs/screenshots/tray.png" width="420" alt="The tray icon in its three states, and its menu">
@@ -246,7 +273,8 @@ Getting going
   uninstall-service   Stop doing that (also stops rustsync now)
 
 Pairing devices
-  invite [--host H]   Show a one-time code and wait for another machine to `join`
+  invite [--host H] [--no-qr] [--light-terminal]
+                      Show a one-time code (and QR code) and wait for another machine to `join`
   join [CODE]         Pair with a machine that is waiting in `invite`
   forget [DEVICE]     Stop syncing with a paired device
 
@@ -340,10 +368,51 @@ to `tray.log` in the state directory. To build without it:
 **macOS** has no tray icon here: use the window (and the launch agent keeps syncing running when
 it is closed).
 
+## The Android app
+
+An Android app (a phone or tablet, Android 8 or newer) lives in [`android/`](android/). It runs
+the same sync service inside the app, so the phone is a full device: pair it, share libraries
+with it, accept ones from the others. It has the same three pages as the window (*This device*
+first), shows a QR code for pairing, and scans one with the camera.
+
+**Get the app.** You don't need to build anything: the `android` GitHub Actions workflow builds an
+APK on every push (open the run, download the `dist-android` artifact), and tagged releases have
+it attached (`rustsync-<version>-android.apk`). Copy it to the phone and open it; Android asks to
+allow installing from that source.
+
+- **Signing key.** Without one, each build is signed with a throw-away key, so a new build can only
+  be installed after uninstalling the old one, which **deletes the phone's rustsync identity and
+  pairings**. To avoid that, make a key once with `just android-keystore` and add the four
+  repository secrets it prints (`ANDROID_KEYSTORE_BASE64`, `ANDROID_KEYSTORE_PASSWORD`,
+  `ANDROID_KEY_ALIAS`, `ANDROID_KEY_PASSWORD`). Keep the `rustsync.jks` file safe; it is not in git.
+- **Folders.** To sync folders like Documents or Pictures the app needs Android's "all files
+  access" (the *This device* page has a button for it). Libraries are then created from any folder
+  you pick.
+- **Staying alive.** The app shows a notification while it runs: that is what lets Android leave it
+  running in the background. Phones that aggressively stop apps (battery savers) may need rustsync
+  set to "unrestricted" battery use.
+- **Reaching the phone.** Other devices connect to the phone, so when you show a pairing code on it
+  the address must be one they can reach (the local Wi-Fi address it suggests works at home).
+  Pairing the other way round (phone enters the code) works from anywhere the phone can reach the
+  other machine.
+
+**Build it yourself** (JDK 17, the Android SDK and NDK, `gradle`, `cargo install cargo-ndk`):
+
+```sh
+just android-apk        # makes dist/rustsync-<version>-android.apk
+```
+
+That builds the Rust core for phones (`cargo ndk ... --lib --no-default-features`), then the app
+around it with Gradle. You can also open the `android/` folder in Android Studio after running
+`just android-core`. The app is Kotlin with Jetpack Compose; `Core.kt` is the only place that
+touches the Rust code, and `Control.kt` speaks the same local JSON protocol as the command line.
+
 ## Platform notes
 
 **macOS**
 
+- Scanning a pairing QR code in the window uses the camera; macOS asks for permission the first
+  time (the app made by `just macos-app` carries the text for that prompt).
 - Install the command line tools (`xcode-select --install`) and Rust, then `cargo build --release`.
   A build on Apple silicon makes an Apple-silicon program; to make an Intel one add
   `--target x86_64-apple-darwin` (after `rustup target add x86_64-apple-darwin`), and the other way
@@ -389,12 +458,14 @@ with `cargo install just`, `brew install just`, or `pkg install just`). Run `jus
 | `just install` | Build and install both programs into `~/.local/bin` (`PREFIX=/usr/local just install` to change it). |
 | `just package` | Make `dist/rustsync-<version>-<os>-<cpu>.tar.gz` with the programs and docs. |
 | `just macos-app` | On a Mac: make `dist/rustsync.app` (with the logo) and a zip of it. |
+| `just android-apk` | Make `dist/rustsync-<version>-android.apk` (see [The Android app](#the-android-app)). |
+| `just android-keystore` | Make the signing key for the Android app, and print the secrets to add on GitHub. |
 | `just clean` | Remove build output and `dist/`. |
 
 To build for the other kind of CPU on a Mac, set the target: `TARGET=x86_64-apple-darwin just macos-app`.
 
 **Releases are made by GitHub Actions.** Pushing a tag builds the programs for Linux (Intel/AMD and
-ARM), macOS (Apple silicon and Intel) and FreeBSD, and puts them in a **draft** release:
+ARM), macOS (Apple silicon and Intel), FreeBSD and Android, and puts them in a **draft** release:
 
 ```sh
 # 1. bump `version` in Cargo.toml and commit it
@@ -506,6 +577,8 @@ different `name` and `server.port`, and pass `-c` to every command.
 | `rustsync is not running for this config` | `rustsync start` (use the same `-c` as before). |
 | The window can't start the service | Put `rustsync` next to `rustsync-gui` or on your `PATH`, or set `RUSTSYNC_BIN=/path/to/rustsync`. |
 | Pairing fails | The code is one-time and only valid while `invite` is still waiting. Check the address you gave to `invite` is reachable from the other machine, and that the port (default 3032) isn't blocked by a firewall. |
+| The two verification codes differ | Answer no on both and start again. A different number means the two machines did not talk to each other directly, or someone else used the code first. |
+| The camera does not open (window) | Use the pasted code instead. On Linux the camera must be a normal video device (`/dev/video0`) your user can open; on macOS allow the camera in System Settings, Privacy & Security. |
 | A device shows as offline | It must be running and reachable at the address it was paired with. Changes sync when it comes back. |
 | Nothing happens after `share` | The other side has to `accept` (look in `rustsync status` or the window for the offer). |
 | A backup stopped accepting data | It reached its size limit: raise it with `rustsync quota`, or free space with `rustsync prune`. |
@@ -515,7 +588,9 @@ different `name` and `server.port`, and pass `-c` to every command.
 ## Security
 
 Pairing is the trust step: only devices you paired can connect, over a Noise-protocol handshake
-(X25519, ChaCha20-Poly1305, BLAKE2s) with an extra per-pair secret. A device you only back up to
+(X25519, ChaCha20-Poly1305, BLAKE2s) with an extra per-pair secret. Pairing needs the one-time code
+(which also carries the inviting machine's key, so the joining machine knows it reached the right
+one) and then a person on **each** machine confirming the same verification code. A device you only back up to
 never sees your files, names or keys. The details, and what is and isn't protected, are in
 [`SECURITY.md`](SECURITY.md).
 

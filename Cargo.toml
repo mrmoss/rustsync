@@ -4,6 +4,13 @@ version = "0.1.0"
 edition = "2021"
 rust-version = "1.81"
 
+# The program is a library (the core, also used by the Android app) plus thin command-line and
+# window front ends.
+[lib]
+name = "rustsync"
+path = "src/lib.rs"
+crate-type = ["lib", "cdylib"]
+
 [dependencies]
 anyhow = "1"
 bincode = "1"
@@ -11,10 +18,13 @@ blake3 = "1"
 chacha20poly1305 = "0.10"
 # the desktop window (rustsync-gui); servers can skip it with --no-default-features
 eframe = { version = "0.31", optional = true }
+rqrr = { version = "0.8", optional = true }
 clap = { version = "4", features = ["derive"] }
 futures-util = "0.3"
 libc = "0.2"
 notify = "6"
+# draws pairing codes as QR codes (the terminal and the window)
+qrcode = { version = "0.14", default-features = false }
 rand = "0.8"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -26,15 +36,26 @@ tracing = "0.1"
 tracing-subscriber = "0.3"
 x25519-dalek = { version = "2", features = ["static_secrets"] }
 
+# Reading a QR code with the camera (window only): Linux and macOS.
+[target.'cfg(any(target_os = "linux", target_os = "macos"))'.dependencies]
+nokhwa = { version = "0.10", default-features = false, features = ["input-native"], optional = true }
+
+# The Android app calls into the library through JNI.
+[target.'cfg(target_os = "android")'.dependencies]
+jni = "0.21"
+
 # system tray icon for rustsync-gui: StatusNotifierItem over D-Bus (pure Rust, no GTK). Linux and
 # the BSDs (any desktop with a D-Bus session and a tray host); macOS has no such tray here.
 [target.'cfg(all(unix, not(any(target_os = "macos", target_os = "ios", target_os = "android"))))'.dependencies]
 ksni = { version = "0.3", features = ["blocking"], optional = true }
 
 [features]
-default = ["gui", "tray"]
+default = ["gui", "tray", "camera"]
 gui = ["dep:eframe"]
 tray = ["dep:ksni"]
+# scan a pairing QR code with the camera in the window (Linux, macOS). If this does not build
+# on your machine, build without it: --no-default-features --features gui,tray
+camera = ["gui", "dep:nokhwa", "dep:rqrr"]
 
 [[bin]]
 name = "rustsync"

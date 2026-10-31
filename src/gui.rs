@@ -18,6 +18,7 @@ use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -31,6 +32,7 @@ enum Request {
     Status,
     Invite { host: String },
     Join { token: String },
+    PairDecision { accept: bool },
     Forget { device: String },
     Create { name: String, folder: String },
     RemoveLibrary { library: String },
@@ -51,6 +53,8 @@ enum Reply {
     Info(StatusInfo),
     Out(String),
     Note(String),
+    /// Pairing: compare `code` with the other device and answer with `PairDecision`.
+    Verify { name: String, fingerprint: String, code: String, joining: bool },
     Done,
     Error(String),
 }
@@ -383,16 +387,33 @@ enum Ev {
     InviteCode(String),
     InviteNote(String),
     InviteEnded(Result<(), String>),
+    /// Pairing reached the point where the person must compare the code.
+    PairVerify(Verify),
+    JoinEnded(Result<(), String>),
+    /// A frame from the camera while scanning a QR code, and what came of the scan.
+    CameraFrame(egui::ColorImage),
+    Scanned(String),
+    ScanFailed(String),
     /// The recovery code of one library (kept out of the status bar on purpose).
     Recovery(Result<String, String>),
+}
+
+/// What the person compares while pairing.
+#[derive(Clone, Debug)]
+struct Verify {
+    name: String,
+    fingerprint: String,
+    code: String,
+    /// True on the device that entered the pairing code.
+    joining: bool,
 }
 
 #[derive(Default, PartialEq, Clone, Copy)]
 enum Page {
     #[default]
+    ThisDevice,
     Libraries,
     Devices,
-    ThisDevice,
 }
 
 #[derive(Default)]
@@ -407,7 +428,7 @@ enum Dialog {
     Recovery { name: String, code: Option<String>, error: Option<String> },
     Restore { code: String, folder: String, device: usize },
     Invite { host: String, code: Option<String>, note: String, error: Option<String>, running: bool, paired: bool },
-    Join { code: String },
+    Join { code: String, running: bool, error: Option<String>, scanning: bool },
     ConfirmForget { key: String, name: String },
     ConfirmRemove { id: String, name: String },
 }
@@ -422,7 +443,10 @@ enum Action {
     Refresh,
     ShowRecovery { id: Option<String>, name: String },
     Restore { code: String, folder: String, device: usize },
-    Join { token: String },
+    StartJoin { token: String },
+    StartScan,
+    StopScan,
+    PairDecide { accept: bool },
     Forget { key: String },
     Remove { id: String },
     StartInvite { host: String },
@@ -442,6 +466,10 @@ struct App {
     dialog: Dialog,
     message: Option<(bool, String)>,
     invite_cancel: Arc<Mutex<Option<UnixStream>>>,
+    /// Set while the person has to compare a pairing code.
+    verify: Option<Verify>,
+    scan_stop: Option<Arc<AtomicBool>>,
+    scan_tex: Option<egui::TextureHandle>,
 }
 
 impl App {
@@ -470,10 +498,13 @@ impl App {
             status: None,
             offline_reason: String::new(),
             starting_since: None,
-            page: Page::Libraries,
+            page: Page::ThisDevice,
             dialog: Dialog::None,
             message: None,
             invite_cancel: Arc::new(Mutex::new(None)),
+            verify: None,
+            scan_stop: None,
+            scan_tex: None,
         }
     }
 
@@ -590,12 +621,66 @@ impl App {
                     let _ = tx.send(Ev::InviteNote(n));
                     ctx.request_repaint();
                 }
+                Reply::Verify { name, fingerprint, code, joining } => {
+                    let _ = tx.send(Ev::PairVerify(Verify { name, fingerprint, code, joining }));
+                    ctx.request_repaint();
+                }
                 _ => {}
             });
             let _ = tx.send(Ev::InviteEnded(res));
             let _ = tx.send(Ev::Status(fetch_status(&sock)));
             ctx.request_repaint();
         });
+    }
+
+    fn start_join(&mut self, token: String) {
+        *self.invite_cancel.lock().unwrap() = None;
+        let (tx, sock, ctx, slot) = (self.tx.clone(), self.sock.clone(), self.ctx.clone(), self.invite_cancel.clone());
+        std::thread::spawn(move || {
+            let mut paired = String::new();
+            let res = call(&sock, &Request::Join { token }, Some(&slot), |r| match r {
+                Reply::Verify { name, fingerprint, code, joining } => {
+                    let _ = tx.send(Ev::PairVerify(Verify { name, fingerprint, code, joining }));
+                    ctx.request_repaint();
+                }
+                Reply::Out(s) => paired = s,
+                _ => {}
+            });
+            if res.is_ok() {
+                let _ = tx.send(Ev::Op { ok: true, msg: paired });
+            }
+            let _ = tx.send(Ev::JoinEnded(res));
+            let _ = tx.send(Ev::Status(fetch_status(&sock)));
+            ctx.request_repaint();
+        });
+    }
+
+    /// Tell the service what the person decided about the pairing code.
+    fn send_decision(&mut self, accept: bool) {
+        self.verify = None;
+        if let Some(stream) = self.invite_cancel.lock().unwrap().as_ref() {
+            let mut w: &UnixStream = stream;
+            if let Ok(line) = serde_json::to_string(&Request::PairDecision { accept }) {
+                let _ = w.write_all(line.as_bytes()).and_then(|_| w.write_all(b"\n"));
+            }
+        }
+        if accept {
+            self.say(true, "Waiting for the other device to confirm too…".to_string());
+        }
+    }
+
+    fn start_scan(&mut self) {
+        self.stop_scan();
+        let stop = Arc::new(AtomicBool::new(false));
+        self.scan_stop = Some(stop.clone());
+        camera::spawn(self.tx.clone(), self.ctx.clone(), stop);
+    }
+
+    fn stop_scan(&mut self) {
+        if let Some(stop) = self.scan_stop.take() {
+            stop.store(true, Ordering::Relaxed);
+        }
+        self.scan_tex = None;
     }
 
     fn cancel_invite(&mut self) {
@@ -641,6 +726,53 @@ impl App {
                     self.say(true, n);
                 }
             }
+            Ev::PairVerify(v) => self.verify = Some(v),
+            Ev::JoinEnded(res) => {
+                self.verify = None;
+                match res {
+                    Ok(()) => {
+                        self.stop_scan();
+                        self.dialog = Dialog::None;
+                    }
+                    Err(e) => {
+                        if let Dialog::Join { running, error, scanning, .. } = &mut self.dialog {
+                            *running = false;
+                            *scanning = false;
+                            *error = Some(e);
+                        } else {
+                            self.say(false, e);
+                        }
+                    }
+                }
+            }
+            Ev::CameraFrame(img) => {
+                if self.scan_stop.is_some() {
+                    if let Some(t) = self.scan_tex.as_mut() {
+                        t.set(img, egui::TextureOptions::LINEAR);
+                    } else {
+                        let t = self.ctx.load_texture("camera", img, egui::TextureOptions::LINEAR);
+                        self.scan_tex = Some(t);
+                    }
+                }
+            }
+            Ev::Scanned(text) => {
+                self.stop_scan();
+                let is_join = matches!(self.dialog, Dialog::Join { .. });
+                if let Dialog::Join { code, scanning, .. } = &mut self.dialog {
+                    *code = text.clone();
+                    *scanning = false;
+                }
+                if is_join {
+                    self.perform(Action::StartJoin { token: text });
+                }
+            }
+            Ev::ScanFailed(msg) => {
+                self.stop_scan();
+                if let Dialog::Join { scanning, error, .. } = &mut self.dialog {
+                    *scanning = false;
+                    *error = Some(msg);
+                }
+            }
             Ev::Recovery(res) => {
                 if let Dialog::Recovery { code, error, .. } = &mut self.dialog {
                     match res {
@@ -650,6 +782,7 @@ impl App {
                 }
             }
             Ev::InviteEnded(res) => {
+                self.verify = None;
                 let was_paired = matches!(&self.dialog, Dialog::Invite { paired: true, .. });
                 match res {
                     Err(e) => {
@@ -697,7 +830,32 @@ impl App {
                     self.run(Request::Restore { code, folder, device });
                 }
             }
-            Action::Join { token } => self.run(Request::Join { token }),
+            Action::StartJoin { token } => {
+                self.stop_scan();
+                if let Dialog::Join { running, error, scanning, .. } = &mut self.dialog {
+                    *running = true;
+                    *error = None;
+                    *scanning = false;
+                }
+                self.start_join(token);
+            }
+            Action::StartScan => {
+                if let Dialog::Join { error, scanning, .. } = &mut self.dialog {
+                    *error = None;
+                    *scanning = true;
+                }
+                self.start_scan();
+            }
+            Action::StopScan => {
+                self.stop_scan();
+                if let Dialog::Join { scanning, .. } = &mut self.dialog {
+                    *scanning = false;
+                }
+            }
+            Action::PairDecide { accept } => {
+                // On "no" the service ends the pairing and reports why.
+                self.send_decision(accept);
+            }
             Action::Forget { key } => self.run(Request::Forget { device: key }),
             Action::Remove { id } => self.run(Request::RemoveLibrary { library: id }),
             Action::StartInvite { host } => {
@@ -800,6 +958,175 @@ fn dot(online: bool) -> RichText {
     RichText::new("●").color(if online { GREEN } else { Color32::from_rgb(110, 120, 138) })
 }
 
+/// Draw `text` as a QR code (black on white, with the quiet zone scanners need).
+fn qr_view(ui: &mut egui::Ui, text: &str, size: f32) {
+    use qrcode::{Color, EcLevel, QrCode};
+    let Ok(code) = QrCode::with_error_correction_level(text.as_bytes(), EcLevel::L) else {
+        ui.label(RichText::new("This code is too long for a QR code; copy it instead.").small().weak());
+        return;
+    };
+    let n = code.width();
+    let quiet = 4usize;
+    let modules = n + 2 * quiet;
+    let cell = (size / modules as f32).floor().max(2.0);
+    let total = cell * modules as f32;
+    let (rect, _) = ui.allocate_exact_size(Vec2::splat(total), egui::Sense::hover());
+    let painter = ui.painter_at(rect);
+    painter.rect_filled(rect, CornerRadius::same(4), Color32::WHITE);
+    let colors = code.to_colors();
+    for y in 0..n {
+        for x in 0..n {
+            if colors[y * n + x] == Color::Dark {
+                let min = rect.min + Vec2::new((x + quiet) as f32 * cell, (y + quiet) as f32 * cell);
+                painter.rect_filled(egui::Rect::from_min_size(min, Vec2::splat(cell)), CornerRadius::ZERO, Color32::BLACK);
+            }
+        }
+    }
+}
+
+/// The pairing check: both people compare this code with the other screen. Returns the answer
+/// once it is given.
+fn verify_window(ctx: &egui::Context, v: &Verify) -> Option<bool> {
+    let mut answer = None;
+    egui::Window::new("Check the pairing code")
+        .collapsible(false)
+        .resizable(false)
+        .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+        .min_width(420.0)
+        .show(ctx, |ui| {
+            ui.label(if v.joining {
+                "The other device must show exactly this code:"
+            } else {
+                "The device that is pairing must show exactly this code:"
+            });
+            ui.add_space(6.0);
+            ui.vertical_centered(|ui| {
+                ui.label(RichText::new(&v.code).monospace().size(38.0).strong().color(BLUE));
+            });
+            ui.add_space(6.0);
+            egui::Grid::new("verify_grid").num_columns(2).spacing([12.0, 4.0]).show(ui, |ui| {
+                ui.label(RichText::new("Device").weak());
+                ui.label(RichText::new(&v.name).strong());
+                ui.end_row();
+                ui.label(RichText::new("Key fingerprint").weak());
+                ui.label(RichText::new(&v.fingerprint).monospace());
+                ui.end_row();
+            });
+            ui.add_space(6.0);
+            ui.label(
+                RichText::new(if v.joining {
+                    "If the codes differ, something is wrong (a wrong or intercepted code): choose “Not the same”."
+                } else {
+                    "If you did not just start pairing on a device of yours, or the codes differ, choose “Not the same”: someone else may have used your code."
+                })
+                .small()
+                .weak(),
+            );
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                if ui.button(RichText::new("The codes match: pair").strong()).clicked() {
+                    answer = Some(true);
+                }
+                if ui.button(RichText::new("Not the same").color(RED)).clicked() {
+                    answer = Some(false);
+                }
+            });
+        });
+    answer
+}
+
+// ---------------------------------------------------------------- scanning a QR code with the camera
+
+#[cfg(all(feature = "camera", any(target_os = "linux", target_os = "macos")))]
+mod camera {
+    use super::Ev;
+    use eframe::egui;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::mpsc::Sender;
+    use std::sync::Arc;
+
+    pub const AVAILABLE: bool = true;
+
+    /// Open the first camera in its own thread, show its frames, and report the first QR code
+    /// that looks like a pairing code.
+    pub fn spawn(tx: Sender<Ev>, ctx: egui::Context, stop: Arc<AtomicBool>) {
+        std::thread::spawn(move || {
+            if let Err(e) = scan(&tx, &ctx, &stop) {
+                if !stop.load(Ordering::Relaxed) {
+                    let _ = tx.send(Ev::ScanFailed(e));
+                    ctx.request_repaint();
+                }
+            }
+        });
+    }
+
+    #[cfg(target_os = "macos")]
+    fn ask_permission() -> Result<(), String> {
+        nokhwa::nokhwa_initialize(|_granted| {});
+        for _ in 0..300 {
+            if nokhwa::nokhwa_check() {
+                return Ok(());
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        Err("camera access was not allowed (System Settings > Privacy & Security > Camera)".to_string())
+    }
+
+    fn scan(tx: &Sender<Ev>, ctx: &egui::Context, stop: &AtomicBool) -> Result<(), String> {
+        use nokhwa::pixel_format::RgbFormat;
+        use nokhwa::utils::{CameraIndex, RequestedFormat, RequestedFormatType};
+        use nokhwa::Camera;
+
+        #[cfg(target_os = "macos")]
+        ask_permission()?;
+        let format = RequestedFormat::new::<RgbFormat>(RequestedFormatType::AbsoluteHighestFrameRate);
+        let mut cam = Camera::new(CameraIndex::Index(0), format)
+            .map_err(|e| format!("cannot open the camera: {}", e))?;
+        cam.open_stream().map_err(|e| format!("cannot start the camera: {}", e))?;
+        while !stop.load(Ordering::Relaxed) {
+            let frame = cam.frame().map_err(|e| format!("camera error: {}", e))?;
+            let img = frame.decode_image::<RgbFormat>().map_err(|e| format!("camera error: {}", e))?;
+            let (w, h) = (img.width() as usize, img.height() as usize);
+            let rgb = img.as_raw();
+            if w == 0 || h == 0 || rgb.len() < w * h * 3 {
+                continue;
+            }
+            let _ = tx.send(Ev::CameraFrame(egui::ColorImage::from_rgb([w, h], &rgb[..w * h * 3])));
+            ctx.request_repaint();
+            let mut prepared = rqrr::PreparedImage::prepare_from_greyscale(w, h, |x, y| {
+                let i = (y * w + x) * 3;
+                ((rgb[i] as u32 * 299 + rgb[i + 1] as u32 * 587 + rgb[i + 2] as u32 * 114) / 1000) as u8
+            });
+            for grid in prepared.detect_grids() {
+                if let Ok((_meta, text)) = grid.decode() {
+                    let text = text.trim().to_string();
+                    if text.contains('@') && text.contains('.') {
+                        let _ = cam.stop_stream();
+                        let _ = tx.send(Ev::Scanned(text));
+                        ctx.request_repaint();
+                        return Ok(());
+                    }
+                }
+            }
+        }
+        let _ = cam.stop_stream();
+        Ok(())
+    }
+}
+
+#[cfg(not(all(feature = "camera", any(target_os = "linux", target_os = "macos"))))]
+mod camera {
+    use super::Ev;
+    use eframe::egui;
+    use std::sync::atomic::AtomicBool;
+    use std::sync::mpsc::Sender;
+    use std::sync::Arc;
+
+    pub const AVAILABLE: bool = false;
+
+    pub fn spawn(_tx: Sender<Ev>, _ctx: egui::Context, _stop: Arc<AtomicBool>) {}
+}
+
 // ---------------------------------------------------------------- screens
 
 impl eframe::App for App {
@@ -859,14 +1186,14 @@ impl eframe::App for App {
                 ui.add_space(16.0);
                 section(ui, "SYNC");
                 ui.add_space(6.0);
+                if nav_button(ui, "⚙", "This device", self.page == Page::ThisDevice) {
+                    self.page = Page::ThisDevice;
+                }
                 if nav_button(ui, "▦", "Libraries", self.page == Page::Libraries) {
                     self.page = Page::Libraries;
                 }
                 if nav_button(ui, "⌂", "Devices", self.page == Page::Devices) {
                     self.page = Page::Devices;
-                }
-                if nav_button(ui, "⚙", "This device", self.page == Page::ThisDevice) {
-                    self.page = Page::ThisDevice;
                 }
                 if let Some(s) = &self.status {
                     let waiting = s.offers.len();
@@ -1127,7 +1454,7 @@ impl App {
                     };
                 }
                 if ui.button("Enter a pairing code").clicked() {
-                    self.dialog = Dialog::Join { code: String::new() };
+                    self.dialog = Dialog::Join { code: String::new(), running: false, error: None, scanning: false };
                 }
             });
         });
@@ -1204,6 +1531,13 @@ impl App {
     // ------------------------------------------------------------ dialogs
 
     fn dialogs(&mut self, ctx: &egui::Context) {
+        // Comparing the pairing code comes before everything else.
+        if let Some(v) = self.verify.clone() {
+            if let Some(accept) = verify_window(ctx, &v) {
+                self.perform(Action::PairDecide { accept });
+            }
+            return;
+        }
         let mut dialog = std::mem::take(&mut self.dialog);
         let devices: Vec<DeviceInfo> = self.status.as_ref().map(|s| s.devices.clone()).unwrap_or_default();
         let mut action: Option<Action> = None;
@@ -1359,6 +1693,16 @@ impl App {
                                         .desired_rows(3)
                                         .desired_width(f32::INFINITY),
                                 );
+                                ui.add_space(6.0);
+                                ui.vertical_centered(|ui| {
+                                    qr_view(ui, &c, 230.0);
+                                    ui.label(
+                                        RichText::new("or scan this with the rustsync app on the other device")
+                                            .small()
+                                            .weak(),
+                                    );
+                                });
+                                ui.add_space(6.0);
                                 ui.horizontal(|ui| {
                                     if ui.button("Copy code").clicked() {
                                         ui.ctx().copy_text(c.clone());
@@ -1491,20 +1835,56 @@ impl App {
                 });
             }
 
-            Dialog::Join { code } => {
+            Dialog::Join { code, running, error, scanning } => {
                 window("Enter a pairing code").show(ctx, |ui| {
-                    ui.label("Paste the code shown on the other machine (“Show a pairing code”):");
+                    if *running {
+                        ui.horizontal(|ui| {
+                            ui.spinner();
+                            ui.label("Contacting the other device…");
+                        });
+                        if ui.button("Cancel").clicked() {
+                            action = Some(Action::CancelInvite);
+                            close = true;
+                        }
+                        return;
+                    }
+                    if *scanning {
+                        ui.label("Point the camera at the QR code on the other device.");
+                        match &self.scan_tex {
+                            Some(tex) => {
+                                let w = ui.available_width().min(380.0);
+                                let ratio = tex.size()[1] as f32 / tex.size()[0].max(1) as f32;
+                                ui.add(egui::Image::new(tex).fit_to_exact_size(Vec2::new(w, w * ratio)));
+                            }
+                            None => {
+                                ui.horizontal(|ui| {
+                                    ui.spinner();
+                                    ui.label("Starting the camera…");
+                                });
+                            }
+                        }
+                        if ui.button("Stop scanning").clicked() {
+                            action = Some(Action::StopScan);
+                        }
+                        return;
+                    }
+                    ui.label("Paste the code shown on the other device (“Show a pairing code”):");
                     ui.add(
                         egui::TextEdit::multiline(code)
                             .font(egui::TextStyle::Monospace)
                             .desired_rows(3)
                             .desired_width(f32::INFINITY),
                     );
+                    if camera::AVAILABLE && ui.button("Scan its QR code with the camera").clicked() {
+                        action = Some(Action::StartScan);
+                    }
+                    if let Some(e) = error {
+                        ui.label(RichText::new(e.as_str()).color(RED));
+                    }
                     ui.horizontal(|ui| {
                         let ok = !code.trim().is_empty();
                         if ui.add_enabled(ok, egui::Button::new(RichText::new("Pair").strong())).clicked() {
-                            action = Some(Action::Join { token: code.trim().to_string() });
-                            close = true;
+                            action = Some(Action::StartJoin { token: code.trim().to_string() });
                         }
                         if ui.button("Cancel").clicked() {
                             close = true;
@@ -1576,6 +1956,9 @@ impl App {
         }
 
         // Keep the dialog open unless it asked to close (an invite keeps its dialog while it waits).
+        if close {
+            self.stop_scan();
+        }
         if !close {
             self.dialog = dialog;
         }

@@ -5,6 +5,20 @@
 - **Pairing is the trust step.** Only devices you paired (one-time code, then a per-pair secret
   mixed into a Noise XX handshake with X25519 + ChaCha20-Poly1305 + BLAKE2s) can connect.
   Strangers are dropped during the handshake.
+- **How pairing is protected.** The pairing code (also shown as a QR code) holds the inviting
+  device's public key, a random one-time secret and its address. The joining device only goes on
+  if the machine it reaches proves it owns that key, so it cannot be tricked into pairing with an
+  impostor. The secret is single-use and expires after 10 minutes. But anyone who *sees* the code
+  (a screenshot, a shoulder-surfer, a chat it was pasted into) could use it first, so nothing is
+  trusted on the code alone: both devices derive an 8-digit verification code from the secret and
+  both public keys, show it with the other device's name and key fingerprint, and **a person on
+  each side must confirm they match** before the per-pair secret is handed over or any device is
+  stored. An uninvited joiner shows up on the inviting device as a request that has no matching
+  code on any screen of yours, and the answer is no. Treat the code like a password until it has
+  been used, do not post it anywhere, and answer no whenever you did not just start pairing yourself.
+  Limits: the 8 digits are a guard for a person comparing two screens, not a secret, and a person
+  who clicks yes without looking defeats it. Pairing messages changed (all your devices need the
+  new version to pair again; already paired devices keep working).
 - **A device you share a library with, for syncing, can change that library's files on this
   machine.** That is what syncing means. A device that only keeps an *encrypted backup*
   (`share --backup`) has no write access to your files at all: it never receives the key, the
@@ -61,3 +75,13 @@
 - Files larger than 16 GiB are skipped (with a warning).
 - Conflict resolution is last-writer-wins on wall-clock time; keep clocks in sync (NTP).
 - Dependencies are not audited here: commit `Cargo.lock` and run `cargo audit` regularly.
+- **Android.** The app keeps its keys in its private storage (not in the phone's hardware key store), and
+  turns off Android's cloud backup for them. Syncing folders outside the app needs "all files access",
+  which lets the app (and so anything that can drive it) read and write every file on shared storage:
+  only share libraries you mean to. Unless you set your own signing key (see the README), builds are
+  signed with a throw-away key and cannot be told apart from a tampered copy by their signature, so
+  take the APK from your own repository's builds or releases.
+- **QR codes and the camera.** The QR code is the pairing code, so a photo or screenshot of it is as
+  sensitive as the text (it works once, and needs a person's approval on both devices, but do not
+  post it). The camera reader (window and Android app) only takes a picture while the scan screen is
+  open, decodes it locally, and does nothing with the picture afterwards.

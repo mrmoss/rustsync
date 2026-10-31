@@ -1,0 +1,8 @@
+.gradle/
+build/
+app/build/
+local.properties
+*.jks
+*.keystore
+# the Rust core, built by `just android-apk` or the android workflow
+app/src/main/jniLibs/

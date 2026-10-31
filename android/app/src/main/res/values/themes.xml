@@ -1,0 +1,3 @@
+<resources>
+    <style name="Theme.Rustsync" parent="android:Theme.DeviceDefault.NoActionBar" />
+</resources>

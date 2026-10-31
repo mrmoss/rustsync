@@ -1,0 +1,72 @@
+# Builds the Android app (an APK): the Rust core for phones, then the Kotlin app around it.
+# Runs on pushes that touch it, and is also called by the release workflow.
+#
+# The APK is signed with a throw-away key unless you add the repository secrets described in
+# the README (ANDROID_KEYSTORE_BASE64 and friends); with a stable key, updates install over the
+# old version.
+#
+# NOTE: written without being able to run it. If a runner image, action or Android tool version
+# has moved on, the fix is usually just bumping it here or in android/build.gradle.kts.
+name: android
+
+on:
+  push:
+    paths: ['android/**', 'src/**', 'Cargo.toml', '.github/workflows/android.yml']
+  pull_request:
+    paths: ['android/**', 'src/**', 'Cargo.toml', '.github/workflows/android.yml']
+  workflow_call:
+
+jobs:
+  apk:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android,x86_64-linux-android
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-ndk
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.10.2'
+
+      - name: Rust core for Android (64-bit ARM phones, and x86_64 emulators)
+        env:
+          # newer phones use 16 KB memory pages
+          RUSTFLAGS: -C link-arg=-Wl,-z,max-page-size=16384
+        run: cargo ndk -t arm64-v8a -t x86_64 -o android/app/src/main/jniLibs build --release --lib --no-default-features
+
+      - name: Signing key (only if the secret exists)
+        env:
+          KEYSTORE_B64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+        run: |
+          if [ -n "$KEYSTORE_B64" ]; then
+            echo "$KEYSTORE_B64" | base64 -d > "$RUNNER_TEMP/rustsync.jks"
+            echo "ANDROID_KEYSTORE_FILE=$RUNNER_TEMP/rustsync.jks" >> "$GITHUB_ENV"
+          else
+            echo "No signing key set: the APK gets a throw-away key (see the README)."
+          fi
+
+      - name: Build the APK
+        working-directory: android
+        env:
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          v=$(grep -m1 '^version' ../Cargo.toml | cut -d'"' -f2)
+          gradle assembleRelease --no-daemon -PappVersion="$v"
+          mkdir -p ../dist
+          cp app/build/outputs/apk/release/app-release.apk "../dist/rustsync-$v-android.apk"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-android
+          path: dist/*.apk
+          if-no-files-found: error

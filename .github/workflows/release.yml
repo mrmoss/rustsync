@@ -79,9 +79,13 @@ jobs:
           path: dist/*.tar.gz
           if-no-files-found: error
 
+  android:
+    uses: ./.github/workflows/android.yml
+    secrets: inherit
+
   release:
     name: draft release
-    needs: [build, freebsd]
+    needs: [build, freebsd, android]
     # Still make the draft if one platform failed, so the others are not lost.
     if: ${{ !cancelled() }}
     runs-on: ubuntu-latest
@@ -109,6 +113,9 @@ jobs:
           - **macOS:** `rustsync-<version>-macos-<cpu>.app.zip` is the app; the `.tar.gz` is just the programs. The builds are
             unsigned, so the first time, right-click the app and choose Open (or allow it in System Settings, Privacy & Security).
           - **FreeBSD:** `rustsync-<version>-freebsd-x86_64.tar.gz` has the service and command line only (no window).
+          - **Android:** `rustsync-<version>-android.apk` (64-bit ARM phones). Allow installing from your browser or file manager
+            when Android asks. Unless the project has its own signing key set up, a new build can only be installed over an
+            older one after uninstalling it first.
 
           See the README for how to set up and pair your machines.
           NOTES

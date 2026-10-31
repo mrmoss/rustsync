@@ -86,12 +86,44 @@ macos-app: build
       <key>CFBundleShortVersionString</key><string>{{version}}</string>
       <key>CFBundleVersion</key><string>{{version}}</string>
       <key>NSHighResolutionCapable</key><true/>
+      <key>NSCameraUsageDescription</key><string>rustsync uses the camera to read the QR code that pairs two devices.</string>
     </dict></plist>
     PLIST
     # Not signed by a developer, but sign it "ad hoc" so macOS accepts the pieces as one app.
     codesign --force --deep --sign - "$app"
     ditto -c -k --keepParent "$app" "dist/rustsync-{{version}}-macos-{{cpu}}.app.zip"
     echo "made $app and dist/rustsync-{{version}}-macos-{{cpu}}.app.zip"
+
+# Android: build the Rust core for phones (needs the Android NDK and `cargo install cargo-ndk`)
+android-core:
+    rustup target add aarch64-linux-android x86_64-linux-android
+    cargo ndk -t arm64-v8a -t x86_64 -o android/app/src/main/jniLibs build --release --lib --no-default-features
+
+# Android: make dist/rustsync-<version>-android.apk (needs JDK 17, the Android SDK and `gradle`)
+android-apk: android-core
+    #!/bin/sh
+    set -eu
+    cd android
+    gradle assembleRelease -PappVersion={{version}}
+    cd ..
+    mkdir -p dist
+    cp android/app/build/outputs/apk/release/app-release.apk "dist/rustsync-{{version}}-android.apk"
+    echo "made dist/rustsync-{{version}}-android.apk"
+
+# Android: make a signing key, so that new versions of the app install over old ones
+android-keystore:
+    #!/bin/sh
+    set -eu
+    [ ! -e rustsync.jks ] || { echo "rustsync.jks already exists"; exit 1; }
+    keytool -genkeypair -v -keystore rustsync.jks -alias rustsync -keyalg RSA -keysize 4096 -validity 10000
+    echo
+    echo "Made rustsync.jks. KEEP IT SAFE (it is not in git): whoever has it can sign updates."
+    echo "For GitHub builds, add these repository secrets (Settings > Secrets and variables > Actions):"
+    echo "  ANDROID_KEYSTORE_BASE64   the output of:  base64 < rustsync.jks | tr -d '\\n'"
+    echo "  ANDROID_KEYSTORE_PASSWORD the keystore password you just typed"
+    echo "  ANDROID_KEY_ALIAS         rustsync"
+    echo "  ANDROID_KEY_PASSWORD      the key password (the same, if you pressed enter)"
+    echo "For a local build:  ANDROID_KEYSTORE_FILE=\$PWD/rustsync.jks ANDROID_KEYSTORE_PASSWORD=... ANDROID_KEY_ALIAS=rustsync ANDROID_KEY_PASSWORD=... just android-apk"
 
 # Format the code
 fmt:
