@@ -1,4 +1,12 @@
-Cargo.lock
-target
-test
+/target
+*.state/
+*.log
+.invite*.txt
+/testing
+/docker-data
+*.yaml
+*.yml
+*.sh
 .vscode
+.dockerignore
+Dockerfile

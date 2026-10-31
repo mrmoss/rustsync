@@ -1,37 +1,45 @@
-[[bin]]
-name = "filesync"
-path = "src/bin/main.rs"
-
-[[bin]]
-name = "key-gen"
-path = "src/bin/keygen.rs"
-
-[[bin]]
-name = "p2p-test"
-path = "src/bin/p2ptest.rs"
-
 [package]
 name = "rustsync"
-version = "2025.1.17"
+version = "0.1.0"
 edition = "2021"
+rust-version = "1.81"
 
 [dependencies]
+anyhow = "1"
+bincode = "1"
+blake3 = "1"
+chacha20poly1305 = "0.10"
+# the desktop window (rustsync-gui); servers can skip it with --no-default-features
+eframe = { version = "0.31", optional = true }
 clap = { version = "4", features = ["derive"] }
-dirs = "5"
-filetime = "0.2"
+futures-util = "0.3"
 libc = "0.2"
 notify = "6"
-libp2p = { version = "0.56", features = [
-    "tokio",      # async runtime support
-    "quic",       # QUIC transport
-    "ed25519",    # Ed25519 identity keys
-    "noise",      # optional Noise security protocol
-    "tcp",        # TCP transport if you want it too
-] }
-tokio = { version = "1", features = ["full"] }
-futures = "0.3"
-anyhow = "1.0"
+rand = "0.8"
 serde = { version = "1", features = ["derive"] }
-serde_json = "1.0"
-walkdir = "2"
-async-trait = "0.1"
+serde_json = "1"
+serde_yaml = "0.9"
+snow = "0.9"
+tokio = { version = "1", features = ["full"] }
+tokio-util = "0.7"
+tracing = "0.1"
+tracing-subscriber = "0.3"
+x25519-dalek = { version = "2", features = ["static_secrets"] }
+
+# system tray icon for rustsync-gui: StatusNotifierItem over D-Bus (pure Rust, no GTK)
+[target.'cfg(target_os = "linux")'.dependencies]
+ksni = { version = "0.3", features = ["blocking"], optional = true }
+
+[features]
+default = ["gui", "tray"]
+gui = ["dep:eframe"]
+tray = ["dep:ksni"]
+
+[[bin]]
+name = "rustsync"
+path = "src/main.rs"
+
+[[bin]]
+name = "rustsync-gui"
+path = "src/gui.rs"
+required-features = ["gui"]
