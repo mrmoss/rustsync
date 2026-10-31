@@ -1,0 +1,29 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512">
+  <title>rustsync</title>
+  <defs>
+    <linearGradient id="bg" x1="0.15" y1="0" x2="0.85" y2="1">
+      <stop offset="0" stop-color="#FF8A4C"/>
+      <stop offset="0.55" stop-color="#E4572E"/>
+      <stop offset="1" stop-color="#A63A1A"/>
+    </linearGradient>
+    <radialGradient id="glow" cx="0.3" cy="0.12" r="0.8">
+      <stop offset="0" stop-color="#FFFFFF" stop-opacity="0.35"/>
+      <stop offset="1" stop-color="#FFFFFF" stop-opacity="0"/>
+    </radialGradient>
+    <filter id="soft" x="-20%" y="-20%" width="140%" height="150%">
+      <feDropShadow dx="0" dy="10" stdDeviation="10" flood-color="#5A1A08" flood-opacity="0.35"/>
+    </filter>
+  </defs>
+  <rect x="16" y="16" width="480" height="480" rx="112" fill="url(#bg)"/>
+  <rect x="16" y="16" width="480" height="480" rx="112" fill="url(#glow)"/>
+  <g filter="url(#soft)" stroke-linecap="round" stroke-linejoin="round" fill="none">
+    <!-- upper arrow: right -->
+    <path d="M132 198 H360" stroke="#FFFFFF" stroke-width="44"/>
+    <path d="M316 142 L376 198 L316 254" stroke="#FFFFFF" stroke-width="44"/>
+    <!-- lower arrow: left, softer (opacity on the group so the joint has no seam) -->
+    <g opacity="0.62">
+      <path d="M380 322 H152" stroke="#FFFFFF" stroke-width="44"/>
+      <path d="M196 266 L136 322 L196 378" stroke="#FFFFFF" stroke-width="44"/>
+    </g>
+  </g>
+</svg>

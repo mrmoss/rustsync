@@ -1555,6 +1555,65 @@ impl App {
 // "Open" starts the window as its own process; closing the window leaves the icon running.
 // Start the icon hidden at login with `rustsync-gui --tray` (the icon's menu can set that up).
 
+// The logo (see assets/): raw RGBA for the window and the tray, the PNG for the launcher entry.
+const ICON_128: &[u8] = include_bytes!("../assets/icon-128.rgba");
+#[cfg(all(feature = "tray", target_os = "linux"))]
+const ICON_64: &[u8] = include_bytes!("../assets/icon-64.rgba");
+#[cfg(all(feature = "tray", target_os = "linux"))]
+const ICON_32: &[u8] = include_bytes!("../assets/icon-32.rgba");
+const ICON_PNG: &[u8] = include_bytes!("../assets/icon-256.png");
+
+fn window_icon() -> egui::IconData {
+    egui::IconData { rgba: ICON_128.to_vec(), width: 128, height: 128 }
+}
+
+/// A path as a quoted .desktop Exec argument; None if it holds characters that need escaping
+/// rules we do not want to get wrong.
+fn desktop_quote(s: &str) -> Option<String> {
+    if s.chars().any(|c| matches!(c, '"' | '`' | '$' | '\\' | '%' | '\n')) {
+        None
+    } else {
+        Some(format!("\"{}\"", s))
+    }
+}
+
+fn write_if_changed(path: &Path, bytes: &[u8]) {
+    if std::fs::read(path).ok().as_deref() == Some(bytes) {
+        return;
+    }
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let _ = std::fs::write(path, bytes);
+}
+
+/// Put rustsync (with its icon) in the desktop's application menu, and let the window use that
+/// icon on Wayland, which takes it from this launcher entry rather than from the window.
+fn ensure_launcher(config: &Path) {
+    let data = match std::env::var("XDG_DATA_HOME") {
+        Ok(d) if !d.is_empty() => PathBuf::from(d),
+        _ => home().join(".local").join("share"),
+    };
+    let icon = data.join("icons").join("hicolor").join("256x256").join("apps").join("rustsync.png");
+    let desktop = data.join("applications").join("rustsync.desktop");
+    let Ok(exe) = std::env::current_exe() else { return };
+    let (Some(exe_q), Some(cfg_q)) =
+        (desktop_quote(&exe.to_string_lossy()), desktop_quote(&config.to_string_lossy()))
+    else {
+        return;
+    };
+    let icon_s = icon.to_string_lossy().to_string();
+    if icon_s.contains('\n') {
+        return;
+    }
+    let text = format!(
+        "[Desktop Entry]\nType=Application\nName=rustsync\nComment=Simple encrypted file sync\nExec={} -c {}\nIcon={}\nTerminal=false\nCategories=Network;FileTransfer;\nStartupWMClass=rustsync\n",
+        exe_q, cfg_q, icon_s
+    );
+    write_if_changed(&icon, ICON_PNG);
+    write_if_changed(&desktop, text.as_bytes());
+}
+
 fn tray_lock_path(config: &Path) -> PathBuf {
     state_dir(config).join("tray.lock")
 }
@@ -1690,24 +1749,38 @@ mod tray {
         service: bool,
     }
 
-    /// A round dot: green = running, amber = offers waiting, grey = service not running.
-    fn dot_icon(online: bool, attention: bool) -> ksni::Icon {
-        let (r, g, b) = if !online {
-            (145u8, 165u8, 192u8)
-        } else if attention {
-            (235, 185, 90)
-        } else {
-            (105, 210, 155)
-        };
-        let size = 22i32;
-        let c = (size as f32 - 1.0) / 2.0;
-        let radius = 9.0f32;
-        let mut data = Vec::with_capacity((size * size * 4) as usize);
-        for y in 0..size {
-            for x in 0..size {
-                let d = ((x as f32 - c).powi(2) + (y as f32 - c).powi(2)).sqrt();
-                let a = ((radius + 0.5 - d).clamp(0.0, 1.0) * 255.0) as u8;
-                data.extend_from_slice(&[a, r, g, b]); // ARGB, as the tray protocol wants
+    /// The logo, as the tray protocol wants it (ARGB). Grey and faded when the service is not
+    /// running; a blue badge when libraries are being offered to you.
+    fn tray_icon(rgba: &[u8], size: i32, online: bool, attention: bool) -> ksni::Icon {
+        let n = size as usize;
+        let mut data = Vec::with_capacity(rgba.len());
+        for px in rgba.chunks_exact(4) {
+            let (mut r, mut g, mut b, mut a) = (px[0], px[1], px[2], px[3]);
+            if !online {
+                let l = ((r as u32 * 30 + g as u32 * 59 + b as u32 * 11) / 100) as u8;
+                (r, g, b, a) = (l, l, l, (a as u32 * 55 / 100) as u8);
+            }
+            data.extend_from_slice(&[a, r, g, b]);
+        }
+        if attention {
+            let (cx, cy) = (n as f32 * 0.76, n as f32 * 0.24);
+            let (ring, dot) = (n as f32 * 0.21, n as f32 * 0.15);
+            for y in 0..n {
+                for x in 0..n {
+                    let d = ((x as f32 + 0.5 - cx).powi(2) + (y as f32 + 0.5 - cy).powi(2)).sqrt();
+                    let px = [255u8, 255, 255, 255];
+                    let color = if d <= dot {
+                        Some([255u8, 45, 156, 255])
+                    } else if d <= ring {
+                        Some(px)
+                    } else {
+                        None
+                    };
+                    if let Some(c) = color {
+                        let i = (y * n + x) * 4;
+                        data[i..i + 4].copy_from_slice(&c);
+                    }
+                }
             }
         }
         ksni::Icon { width: size, height: size, data }
@@ -1729,7 +1802,11 @@ mod tray {
         }
 
         fn icon_pixmap(&self) -> Vec<ksni::Icon> {
-            vec![dot_icon(self.online, self.offers > 0)]
+            let attention = self.offers > 0;
+            vec![
+                tray_icon(ICON_64, 64, self.online, attention),
+                tray_icon(ICON_32, 32, self.online, attention),
+            ]
         }
 
         // Left click.
@@ -1836,16 +1913,6 @@ mod tray {
             _ => home().join(".config"),
         };
         base.join("autostart").join("rustsync-tray.desktop")
-    }
-
-    /// A path as a quoted .desktop Exec argument; None if it holds characters that need
-    /// escaping rules we do not want to get wrong.
-    fn desktop_quote(s: &str) -> Option<String> {
-        if s.chars().any(|c| matches!(c, '"' | '`' | '$' | '\\' | '%' | '\n')) {
-            None
-        } else {
-            Some(format!("\"{}\"", s))
-        }
     }
 
     fn toggle_autostart(config: &Path) {
@@ -2014,10 +2081,13 @@ fn main() -> eframe::Result<()> {
     }
     let ctx_slot: Arc<Mutex<Option<egui::Context>>> = Arc::new(Mutex::new(None));
     start_raise_listener(&config, ctx_slot.clone());
+    ensure_launcher(&config);
 
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("rustsync")
+            .with_app_id("rustsync")
+            .with_icon(window_icon())
             .with_inner_size([900.0, 620.0])
             .with_min_inner_size([700.0, 480.0]),
         ..Default::default()

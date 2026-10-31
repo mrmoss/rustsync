@@ -1,6 +1,8 @@
-# rustsync
+<p align="center"><img src="assets/rustsync-icon.svg" width="128" alt="rustsync logo"></p>
 
-!!!VIBECODED CLANKER CODE!!!
+# !!!VIBE CODED CLANKER CODE!!!
+
+# rustsync
 
 Simple, end-to-end encrypted file sync. Two programs are built from this one package:
 
@@ -23,6 +25,13 @@ the GUI binary first (where `cargo build` puts it), then on your `PATH` (or set 
 Linux and macOS (the service uses a Unix socket). See `SECURITY.md` for the threat model.
 
 ## Starting at boot, and the tray icon (Linux)
+
+The logo lives in `assets/` (`rustsync-icon.svg`, plus a single-colour `rustsync-symbolic.svg`); the
+window, the tray icon and the application-menu entry all use it. The tray shows it in colour when
+rustsync is running, greyed out when it is not, and with a blue badge when libraries are offered to
+you. The first time the window opens it adds a `rustsync.desktop` launcher and the icon under
+`~/.local/share`, so the app shows up in your menu with its icon (on Wayland that entry is also
+what gives the window its icon).
 
     rustsync install-service        # start rustsync by itself (a systemd *user* service)
     rustsync uninstall-service      # stop doing that (also stops rustsync now)
