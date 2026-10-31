@@ -24,7 +24,7 @@ identical. Nothing goes through anybody's cloud.
 Contents: [How it works](#how-it-works-in-one-minute) ·
 [Install](#install) · [Quick start](#quick-start-two-machines-one-folder) ·
 [The desktop window](#the-desktop-window) · [All commands](#all-commands) ·
-[Start at boot and the tray icon](#start-at-boot-and-the-tray-icon-linux) ·
+[Starting by itself and the tray icon](#starting-by-itself-and-the-tray-icon) · [Platform notes](#platform-notes) ·
 [Encrypted backups](#encrypted-backups-for-a-server-or-if-everything-is-lost) ·
 [Troubleshooting](#troubleshooting)
 
@@ -54,8 +54,20 @@ syncing carries on.
 
 ## Install
 
-You need [Rust](https://rustup.rs) (1.81 or newer). Linux and macOS are supported (the service
-talks to the tools over a Unix socket); the tray icon and start-at-boot are Linux-only.
+You need [Rust](https://rustup.rs) (1.81 or newer).
+
+**Where it runs** (64-bit Intel/AMD `x86_64` and ARM `aarch64`):
+
+| | Sync service and command line | Window | Tray icon | Starts by itself |
+|---|---|---|---|---|
+| **Linux** | yes | yes (X11 and Wayland) | yes | systemd user service (at login, or at boot) |
+| **macOS** (Apple silicon and Intel) | yes | yes | no | launch agent (at login) |
+| **FreeBSD, OpenBSD, NetBSD** | yes | yes (X11 and Wayland) | yes, on desktops with a tray | login entry for the desktop; cron `@reboot` for servers |
+
+Android is not supported yet. Windows is not supported (the service uses Unix sockets).
+
+Linux is the system this was written on; the macOS and BSD support is newer and has had less
+use, so expect rough edges and please report them. See [Platform notes](#platform-notes) below.
 
 ```sh
 git clone https://github.com/mrmoss/rustsync
@@ -181,7 +193,7 @@ Getting going
   start               Start the service in the background
   stop                Stop it
   status              Show this device, paired devices, libraries and waiting offers
-  install-service     Start rustsync by itself at login / boot (Linux, systemd)
+  install-service     Start rustsync by itself at login (and at boot, on Linux)
   uninstall-service   Stop doing that (also stops rustsync now)
 
 Pairing devices
@@ -217,7 +229,7 @@ Handy things to know:
   for watching what it does); `rustsync --show-key` prints this device's public key.
 - **Sizes** are written like `500G` or `2T` (decimal: 1 G = 1,000,000,000 bytes), or `none`.
 
-## Start at boot and the tray icon (Linux)
+## Starting by itself, and the tray icon
 
 The logo lives in `assets/` (`rustsync-icon.svg`, plus a single-colour `rustsync-symbolic.svg`);
 the window, the tray icon and the application-menu entry all use it.
@@ -225,18 +237,31 @@ the window, the tray icon and the application-menu entry all use it.
 ### Starting by itself
 
 ```sh
-rustsync install-service        # start rustsync by itself (a systemd *user* service)
+rustsync install-service        # start rustsync by itself
 rustsync uninstall-service      # stop doing that (also stops rustsync now)
 ```
 
-`install-service` writes `~/.config/systemd/user/rustsync.service` (other configs get their own
-name), enables it and starts it. It restarts rustsync if it crashes, and logs to the usual
-`daemon.log`. It then offers `loginctl enable-linger`, which is what makes it start at **boot**
-instead of when you log in (`--yes` accepts). The first time you run `rustsync start` in a terminal
-it offers this too (once). With the service installed, `start` and `stop` simply work with it. The
-window's *This device* page and the tray menu have the same switch.
+The first time you run `rustsync start` in a terminal it offers this too (once). With it set up,
+`start` and `stop` simply work with it. The window's *This device* page has the same switch.
 
-### The tray icon
+- **Linux:** a systemd *user* service, `~/.config/systemd/user/rustsync.service` (other configs get
+  their own name). It restarts rustsync if it crashes and logs to the usual `daemon.log`.
+  `install-service` then offers `loginctl enable-linger`, which is what makes it start at **boot**
+  instead of when you log in (`--yes` accepts).
+- **macOS:** a launch agent, `~/Library/LaunchAgents/com.rustsync.daemon.plist`. It starts when you
+  **log in** and is restarted if it crashes. (Starting before anyone logs in would need a system
+  launch daemon, which needs administrator rights; that isn't set up for you.)
+- **FreeBSD, OpenBSD, NetBSD:** there is no per-user service manager, so `install-service` adds a
+  login entry (`~/.config/autostart/rustsync-daemon.desktop`) that starts rustsync when you log in
+  to the desktop. On a **server** with no desktop, the simplest way is cron: run `crontab -e` and add
+
+  ```
+  @reboot /usr/local/bin/rustsync -c /home/me/.config/rustsync/config.yaml start
+  ```
+
+  (use your own paths, and run `rustsync start` once by hand first so the config exists).
+
+### The tray icon (Linux and BSD desktops)
 
 `rustsync-gui` puts an icon in the system tray (StatusNotifierItem over D-Bus). It is in colour
 when rustsync is running, **greyed out** when it is not, and gets a **blue badge** when libraries
@@ -262,6 +287,71 @@ that shows tray icons: KDE, Cinnamon, LXQt, Ubuntu's GNOME and sway/waybar do; p
 works as before. At login it waits a few minutes for the panel to be ready; what it did is written
 to `tray.log` in the state directory. To build without it:
 `cargo build --release --no-default-features --features gui`.
+
+**macOS** has no tray icon here: use the window (and the launch agent keeps syncing running when
+it is closed).
+
+## Platform notes
+
+**macOS**
+
+- Install the command line tools (`xcode-select --install`) and Rust, then `cargo build --release`.
+  A build on Apple silicon makes an Apple-silicon program; to make an Intel one add
+  `--target x86_64-apple-darwin` (after `rustup target add x86_64-apple-darwin`), and the other way
+  round on an Intel Mac.
+- To get a double-clickable app with the logo, put the two programs and an icon in a bundle:
+
+  ```sh
+  mkdir -p rustsync.app/Contents/MacOS rustsync.app/Contents/Resources
+  cp target/release/rustsync target/release/rustsync-gui rustsync.app/Contents/MacOS/
+
+  mkdir rustsync.iconset
+  sips -z 16 16     assets/icon-256.png --out rustsync.iconset/icon_16x16.png
+  sips -z 32 32     assets/icon-256.png --out rustsync.iconset/icon_16x16@2x.png
+  sips -z 32 32     assets/icon-256.png --out rustsync.iconset/icon_32x32.png
+  sips -z 64 64     assets/icon-256.png --out rustsync.iconset/icon_32x32@2x.png
+  sips -z 128 128   assets/icon-256.png --out rustsync.iconset/icon_128x128.png
+  sips -z 256 256   assets/icon-256.png --out rustsync.iconset/icon_128x128@2x.png
+  sips -z 256 256   assets/icon-256.png --out rustsync.iconset/icon_256x256.png
+  iconutil -c icns rustsync.iconset -o rustsync.app/Contents/Resources/rustsync.icns
+
+  cat > rustsync.app/Contents/Info.plist <<'EOF'
+  <?xml version="1.0" encoding="UTF-8"?>
+  <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+  <plist version="1.0"><dict>
+    <key>CFBundleName</key><string>rustsync</string>
+    <key>CFBundleIdentifier</key><string>com.rustsync.gui</string>
+    <key>CFBundleExecutable</key><string>rustsync-gui</string>
+    <key>CFBundleIconFile</key><string>rustsync</string>
+    <key>CFBundlePackageType</key><string>APPL</string>
+    <key>CFBundleVersion</key><string>0.1.0</string>
+    <key>NSHighResolutionCapable</key><true/>
+  </dict></plist>
+  EOF
+  ```
+
+  The app is not signed. An app you built yourself opens normally; one you copy from elsewhere needs
+  a right-click, *Open*, the first time.
+- macOS asks whether `rustsync` may accept incoming connections the first time it runs: allow it,
+  or other machines cannot reach this one.
+- The Mac's file system is usually **case-insensitive**, so two files whose names differ only in
+  case (`Notes.txt` and `notes.txt`) cannot both exist there. Sync with a Linux machine can
+  therefore overwrite one with the other. Also, macOS creates `.DS_Store` files in folders you open
+  in Finder, and those get synced like any other file.
+- Unix sockets have a shorter path limit on macOS and the BSDs (about 100 characters), so avoid very
+  long `state_dir` paths.
+
+**FreeBSD, OpenBSD, NetBSD**
+
+- Install Rust and a C toolchain from your package system (for example `pkg install rust` on
+  FreeBSD). The window needs the X11 and/or Wayland and OpenGL development libraries; if the build
+  complains about missing ones, install them. On a server, skip all of that with
+  `cargo build --release --no-default-features`.
+- One safety check works only on Linux and macOS: confirming, through the open file, that it really
+  lies inside the library folder. On the BSDs rustsync still refuses symlinks and checks every
+  folder on the way, but cannot do that last check, so do not let untrusted local users write to a
+  synced folder. See [`SECURITY.md`](SECURITY.md).
+- Same case-insensitivity and socket-path notes as above if you use such a file system.
 
 ## Encrypted backups (for a server, or if everything is lost)
 

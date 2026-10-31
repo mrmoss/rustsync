@@ -9,6 +9,9 @@
 //!   --no-tray  window only; do not start the tray icon
 //! (default config: ~/.config/rustsync/config.yaml, like the command line)
 
+// Some helpers (the tray icon, the XDG launcher) are only used on some systems.
+#![allow(dead_code)]
+
 use eframe::egui::{self, Align, Color32, CornerRadius, Layout, RichText, Stroke, Vec2};
 use serde::{Deserialize, Serialize};
 use std::io::{BufRead, BufReader, Write};
@@ -234,11 +237,12 @@ fn default_config() -> PathBuf {
     home().join(".config").join("rustsync").join("config.yaml")
 }
 
-/// Name of the systemd user service for this config (the same rule as `rustsync install-service`).
-fn unit_name(config: &Path) -> String {
+/// None for the default config, otherwise a short name made from its path (the same rule as
+/// `rustsync install-service`, so that each config can have its own service).
+fn service_slug(config: &Path) -> Option<String> {
     let abs = absolute(config);
     if abs == default_config() {
-        return "rustsync.service".to_string();
+        return None;
     }
     let slug: String = abs
         .with_extension("")
@@ -246,17 +250,52 @@ fn unit_name(config: &Path) -> String {
         .chars()
         .map(|c| if c.is_ascii_alphanumeric() || c == '_' { c } else { '-' })
         .collect();
-    format!("rustsync-{}.service", slug.trim_matches('-'))
+    Some(slug.trim_matches('-').to_string())
 }
 
-/// Is rustsync set to start by itself (a systemd user service)?
-fn service_installed(config: &Path) -> bool {
-    let base = match std::env::var("XDG_CONFIG_HOME") {
+/// `~/.config` (or $XDG_CONFIG_HOME).
+#[cfg(not(target_os = "macos"))]
+fn config_home() -> PathBuf {
+    match std::env::var("XDG_CONFIG_HOME") {
         Ok(d) if !d.is_empty() => PathBuf::from(d),
         _ => home().join(".config"),
-    };
-    base.join("systemd").join("user").join(unit_name(config)).exists()
+    }
 }
+
+/// Is rustsync set to start by itself? (A systemd user service on Linux, a launch agent on macOS,
+/// a login entry on the BSDs.)
+#[cfg(target_os = "linux")]
+fn service_installed(config: &Path) -> bool {
+    let name = match service_slug(config) {
+        None => "rustsync.service".to_string(),
+        Some(slug) => format!("rustsync-{}.service", slug),
+    };
+    config_home().join("systemd").join("user").join(name).exists()
+}
+
+#[cfg(target_os = "macos")]
+fn service_installed(config: &Path) -> bool {
+    let label = match service_slug(config) {
+        None => "com.rustsync.daemon".to_string(),
+        Some(slug) => format!("com.rustsync.daemon.{}", slug),
+    };
+    home().join("Library").join("LaunchAgents").join(format!("{}.plist", label)).exists()
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn service_installed(config: &Path) -> bool {
+    let name = match service_slug(config) {
+        None => "rustsync-daemon.desktop".to_string(),
+        Some(slug) => format!("rustsync-daemon-{}.desktop", slug),
+    };
+    config_home().join("autostart").join(name).exists()
+}
+
+/// The wording of the "start automatically" switch on this system.
+#[cfg(target_os = "linux")]
+const AUTOSTART_LABEL: &str = "Start rustsync automatically (when you log in, or at boot)";
+#[cfg(not(target_os = "linux"))]
+const AUTOSTART_LABEL: &str = "Start rustsync automatically (when you log in)";
 
 /// Turn "start by itself" on or off through the `rustsync` program.
 fn set_service_blocking(config: &Path, on: bool) -> Result<(), String> {
@@ -1150,7 +1189,7 @@ impl App {
             ui.label("Syncing continues in the background when you close this window.");
             let mut auto = service_installed(&self.config);
             if ui
-                .checkbox(&mut auto, "Start rustsync automatically (when you log in, or at boot)")
+                .checkbox(&mut auto, AUTOSTART_LABEL)
                 .on_hover_text("A systemd user service. Turning it off also stops rustsync now.")
                 .changed()
             {
@@ -1557,10 +1596,11 @@ impl App {
 
 // The logo (see assets/): raw RGBA for the window and the tray, the PNG for the launcher entry.
 const ICON_128: &[u8] = include_bytes!("../assets/icon-128.rgba");
-#[cfg(all(feature = "tray", target_os = "linux"))]
+#[cfg(all(feature = "tray", unix, not(any(target_os = "macos", target_os = "ios", target_os = "android"))))]
 const ICON_64: &[u8] = include_bytes!("../assets/icon-64.rgba");
-#[cfg(all(feature = "tray", target_os = "linux"))]
+#[cfg(all(feature = "tray", unix, not(any(target_os = "macos", target_os = "ios", target_os = "android"))))]
 const ICON_32: &[u8] = include_bytes!("../assets/icon-32.rgba");
+#[cfg(not(target_os = "macos"))]
 const ICON_PNG: &[u8] = include_bytes!("../assets/icon-256.png");
 
 fn window_icon() -> egui::IconData {
@@ -1569,6 +1609,7 @@ fn window_icon() -> egui::IconData {
 
 /// A path as a quoted .desktop Exec argument; None if it holds characters that need escaping
 /// rules we do not want to get wrong.
+#[cfg(not(target_os = "macos"))]
 fn desktop_quote(s: &str) -> Option<String> {
     if s.chars().any(|c| matches!(c, '"' | '`' | '$' | '\\' | '%' | '\n')) {
         None
@@ -1577,6 +1618,7 @@ fn desktop_quote(s: &str) -> Option<String> {
     }
 }
 
+#[cfg(not(target_os = "macos"))]
 fn write_if_changed(path: &Path, bytes: &[u8]) {
     if std::fs::read(path).ok().as_deref() == Some(bytes) {
         return;
@@ -1587,8 +1629,13 @@ fn write_if_changed(path: &Path, bytes: &[u8]) {
     let _ = std::fs::write(path, bytes);
 }
 
+/// macOS has its own app bundles (see the README), so there is nothing to write there.
+#[cfg(target_os = "macos")]
+fn ensure_launcher(_config: &Path) {}
+
 /// Put rustsync (with its icon) in the desktop's application menu, and let the window use that
 /// icon on Wayland, which takes it from this launcher entry rather than from the window.
+#[cfg(not(target_os = "macos"))]
 fn ensure_launcher(config: &Path) {
     let data = match std::env::var("XDG_DATA_HOME") {
         Ok(d) if !d.is_empty() => PathBuf::from(d),
@@ -1687,17 +1734,17 @@ fn open_window(config: &Path) {
     }
 }
 
-#[cfg(not(all(feature = "tray", target_os = "linux")))]
+#[cfg(not(all(feature = "tray", unix, not(any(target_os = "macos", target_os = "ios", target_os = "android")))))]
 fn run_tray(_config: &Path) -> i32 {
-    eprintln!("rustsync-gui: this build has no tray icon support (it is Linux-only, feature \"tray\")");
+    eprintln!("rustsync-gui: this build has no tray icon support (macOS has none; elsewhere build with the \"tray\" feature)");
     1
 }
 
-#[cfg(not(all(feature = "tray", target_os = "linux")))]
+#[cfg(not(all(feature = "tray", unix, not(any(target_os = "macos", target_os = "ios", target_os = "android")))))]
 fn ensure_tray_running(_config: &Path) {}
 
 /// Start the tray icon process if it is not running (the window does this when it opens).
-#[cfg(all(feature = "tray", target_os = "linux"))]
+#[cfg(all(feature = "tray", unix, not(any(target_os = "macos", target_os = "ios", target_os = "android"))))]
 fn ensure_tray_running(config: &Path) {
     use std::os::unix::process::CommandExt;
     match lock_file(&tray_lock_path(config)) {
@@ -1717,12 +1764,12 @@ fn ensure_tray_running(config: &Path) {
     }
 }
 
-#[cfg(all(feature = "tray", target_os = "linux"))]
+#[cfg(all(feature = "tray", unix, not(any(target_os = "macos", target_os = "ios", target_os = "android"))))]
 fn run_tray(config: &Path) -> i32 {
     tray::run(config)
 }
 
-#[cfg(all(feature = "tray", target_os = "linux"))]
+#[cfg(all(feature = "tray", unix, not(any(target_os = "macos", target_os = "ios", target_os = "android"))))]
 mod tray {
     use super::*;
     use ksni::blocking::TrayMethods;

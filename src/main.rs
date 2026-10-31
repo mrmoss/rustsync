@@ -36,8 +36,8 @@ pub enum Cmd {
     Start,
     /// Stop the daemon
     Stop,
-    /// Start rustsync by itself whenever you log in (a systemd user service; Linux). Offers to
-    /// also start it at boot, before you log in
+    /// Start rustsync by itself whenever you log in (a systemd user service on Linux, a launch
+    /// agent on macOS, a login entry on the BSDs). On Linux it offers to also start it at boot
     InstallService {
         /// Do not ask: also start it at boot
         #[arg(short, long)]
@@ -339,8 +339,27 @@ mod config {
             .ok()
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty())
+            .or_else(os_hostname)
             .or_else(|| std::env::var("HOSTNAME").ok())
             .unwrap_or_else(|| "device".to_string())
+    }
+
+    /// What the operating system calls this machine (macOS and the BSDs have no /etc/hostname),
+    /// without the domain part: "Marks-MacBook.local" -> "Marks-MacBook".
+    fn os_hostname() -> Option<String> {
+        let mut buf = [0u8; 256];
+        // SAFETY: gethostname writes at most buf.len() bytes.
+        if unsafe { libc::gethostname(buf.as_mut_ptr() as *mut libc::c_char, buf.len()) } != 0 {
+            return None;
+        }
+        let n = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+        let full = String::from_utf8_lossy(&buf[..n]).trim().to_string();
+        let first = full.split('.').next().unwrap_or("").to_string();
+        if first.is_empty() {
+            None
+        } else {
+            Some(first)
+        }
     }
 
     /// `<config path without extension>.state`, e.g. alpha.yaml -> alpha.state
@@ -1109,8 +1128,11 @@ mod index {
         Ok(f)
     }
 
-    /// Is the file behind this open descriptor located under `root`? Linux can tell us through
-    /// /proc; elsewhere this cannot be checked and we rely on the other safeguards.
+    /// Is the file behind this open descriptor located under `root`? This is the check that catches a
+    /// folder being swapped for a symlink between our checks and the open. Linux and macOS can tell us
+    /// where an open descriptor really is; on the BSDs there is no portable way, so we rely on the
+    /// other safeguards there (O_NOFOLLOW and the ancestor checks).
+    #[cfg(target_os = "linux")]
     pub fn fd_inside(fd: std::os::fd::RawFd, root: &Path) -> bool {
         let proc_fd = Path::new("/proc/self/fd");
         if !proc_fd.is_dir() {
@@ -1123,6 +1145,25 @@ mod index {
             }
             Err(_) => false,
         }
+    }
+
+    #[cfg(target_os = "macos")]
+    pub fn fd_inside(fd: std::os::fd::RawFd, root: &Path) -> bool {
+        use std::os::unix::ffi::OsStrExt;
+        let mut buf = [0u8; libc::PATH_MAX as usize];
+        // SAFETY: F_GETPATH writes a NUL-terminated path of at most PATH_MAX bytes into the buffer.
+        if unsafe { libc::fcntl(fd, libc::F_GETPATH, buf.as_mut_ptr()) } == -1 {
+            return false;
+        }
+        let len = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+        let real = Path::new(std::ffi::OsStr::from_bytes(&buf[..len]));
+        let root = fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+        real.starts_with(&root)
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    pub fn fd_inside(_fd: std::os::fd::RawFd, _root: &Path) -> bool {
+        true
     }
 
     pub fn under(p: &str, root: &str) -> bool {
@@ -5476,94 +5517,69 @@ mod cli {
 
     // ---------------------------------------------------------------- start (background)
 
-    // ---------------------------------------------------------------- start by itself (systemd)
+    // ---------------------------------------------------------------- start by itself
+    //
+    // Linux uses a systemd user service, macOS a launchd agent, and the BSDs (which have no per-user
+    // service manager) an entry that starts rustsync when you log in to the desktop. Each lives in its
+    // own `svc` module below; only one is compiled.
 
-    /// Name of the systemd user service for a config: `rustsync` for the default config, else
-    /// `rustsync-<path of the config>` (the GUI computes the same name).
-    fn unit_name(config_path: &Path) -> String {
+    async fn wait_socket(cfg: &Config, up: bool, tenths: u32) -> bool {
+        for _ in 0..tenths {
+            if UnixStream::connect(cfg.socket_path()).await.is_ok() == up {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        false
+    }
+
+    /// `~/.config` (or $XDG_CONFIG_HOME).
+    #[cfg(not(target_os = "macos"))]
+    fn config_home() -> PathBuf {
+        match std::env::var("XDG_CONFIG_HOME") {
+            Ok(d) if !d.is_empty() => PathBuf::from(d),
+            _ => match std::env::var("HOME") {
+                Ok(h) if !h.is_empty() => PathBuf::from(h).join(".config"),
+                _ => PathBuf::from(".config"),
+            },
+        }
+    }
+
+    /// None for the default config, otherwise a short name made from its path (so that several
+    /// configs can each have their own service). The GUI computes the same thing.
+    fn service_slug(config_path: &Path) -> Option<String> {
         let abs = std::path::absolute(config_path).unwrap_or_else(|_| config_path.to_path_buf());
         if abs == config::default_config_path() {
-            return "rustsync.service".to_string();
+            return None;
         }
-        let no_ext = abs.with_extension("");
-        let slug: String = no_ext
+        let slug: String = abs
+            .with_extension("")
             .to_string_lossy()
             .chars()
             .map(|c| if c.is_ascii_alphanumeric() || c == '_' { c } else { '-' })
             .collect();
-        format!("rustsync-{}.service", slug.trim_matches('-'))
+        Some(slug.trim_matches('-').to_string())
     }
 
-    fn unit_path(name: &str) -> PathBuf {
-        let base = match std::env::var("XDG_CONFIG_HOME") {
-            Ok(d) if !d.is_empty() => PathBuf::from(d),
-            _ => match std::env::var("HOME") {
-                Ok(h) if !h.is_empty() => PathBuf::from(h).join(".config"),
-                _ => PathBuf::from(".config"),
-            },
-        };
-        base.join("systemd").join("user").join(name)
-    }
-
-    /// Run `systemctl --user ...`; Ok(true) if it succeeded.
-    fn systemctl(args: &[&str]) -> Result<bool> {
-        let status = std::process::Command::new("systemctl")
-            .arg("--user")
-            .args(args)
-            .stdin(std::process::Stdio::null())
-            .status()
-            .context("cannot run systemctl")?;
-        Ok(status.success())
-    }
-
-    /// Is there a systemd user manager to talk to?
-    fn systemd_available() -> bool {
-        std::process::Command::new("systemctl")
-            .args(["--user", "show-environment"])
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false)
-    }
-
-    fn service_installed(config_path: &Path) -> bool {
-        unit_path(&unit_name(config_path)).exists()
-    }
-
-    /// A word in a systemd unit's command line.
-    fn unit_quote(s: &str) -> Result<String> {
-        if s.contains('\n') {
-            bail!("a path contains a line break; cannot put it in a service file");
+    /// A path as a quoted .desktop `Exec` argument; None if it holds characters that need escaping
+    /// rules we do not want to get wrong.
+    #[cfg(not(target_os = "macos"))]
+    fn desktop_quote(s: &str) -> Option<String> {
+        if s.chars().any(|c| matches!(c, '"' | '`' | '$' | '\\' | '%' | '\n')) {
+            None
+        } else {
+            Some(format!("\"{}\"", s))
         }
-        let mut out = String::from("\"");
-        for c in s.chars() {
-            match c {
-                '\\' => out.push_str("\\\\"),
-                '"' => out.push_str("\\\""),
-                '%' => out.push_str("%%"),
-                '$' => out.push_str("$$"),
-                c => out.push(c),
-            }
-        }
-        out.push('"');
-        Ok(out)
     }
 
+    #[cfg(not(target_os = "macos"))]
     fn tray_autostart_path() -> PathBuf {
-        let base = match std::env::var("XDG_CONFIG_HOME") {
-            Ok(d) if !d.is_empty() => PathBuf::from(d),
-            _ => match std::env::var("HOME") {
-                Ok(h) if !h.is_empty() => PathBuf::from(h).join(".config"),
-                _ => PathBuf::from(".config"),
-            },
-        };
-        base.join("autostart").join("rustsync-tray.desktop")
+        config_home().join("autostart").join("rustsync-tray.desktop")
     }
 
     /// Make the tray icon (`rustsync-gui --tray`) start when you log in to the desktop. Does
     /// nothing if the GUI program is not installed next to this one. Returns true if it is set up.
+    #[cfg(not(target_os = "macos"))]
     fn install_tray_autostart(config_path: &Path) -> bool {
         let Ok(exe) = std::env::current_exe() else { return false };
         let gui = exe.with_file_name("rustsync-gui");
@@ -5571,14 +5587,7 @@ mod cli {
             return false;
         }
         let Ok(abs) = std::path::absolute(config_path) else { return false };
-        let quote = |s: &str| -> Option<String> {
-            if s.chars().any(|c| matches!(c, '"' | '`' | '$' | '\\' | '%' | '\n')) {
-                None
-            } else {
-                Some(format!("\"{}\"", s))
-            }
-        };
-        let (Some(g), Some(c)) = (quote(&gui.to_string_lossy()), quote(&abs.to_string_lossy())) else {
+        let (Some(g), Some(c)) = (desktop_quote(&gui.to_string_lossy()), desktop_quote(&abs.to_string_lossy())) else {
             return false;
         };
         let path = tray_autostart_path();
@@ -5592,148 +5601,8 @@ mod cli {
         std::fs::write(&path, text).is_ok()
     }
 
-    fn linger_enabled() -> bool {
-        // SAFETY: getuid cannot fail.
-        let uid = unsafe { libc::getuid() }.to_string();
-        std::process::Command::new("loginctl")
-            .args(["show-user", &uid, "-p", "Linger", "--value"])
-            .stdin(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .output()
-            .map(|o| String::from_utf8_lossy(&o.stdout).trim() == "yes")
-            .unwrap_or(false)
-    }
-
-    async fn wait_socket(cfg: &Config, up: bool, tenths: u32) -> bool {
-        for _ in 0..tenths {
-            if UnixStream::connect(cfg.socket_path()).await.is_ok() == up {
-                return true;
-            }
-            tokio::time::sleep(Duration::from_millis(100)).await;
-        }
-        false
-    }
-
-    async fn install_service(config_path: &Path, cfg: &Config, yes: bool) -> Result<()> {
-        if !cfg!(target_os = "linux") || !systemd_available() {
-            bail!("this needs systemd (a Linux desktop or server with a systemd user session)");
-        }
-        cfg.ensure_dir()?;
-        let abs = std::path::absolute(config_path)?;
-        let exe = std::env::current_exe()?;
-        let name = unit_name(config_path);
-        let path = unit_path(&name);
-        let log = cfg.log_path();
-        let log_esc = log.to_string_lossy().replace('%', "%%");
-        let unit = format!(
-            "[Unit]\nDescription=rustsync file sync ({})\n\n[Service]\nExecStart={} -c {}\nRestart=on-failure\nRestartSec=5\nStandardOutput=append:{}\nStandardError=append:{}\n\n[Install]\nWantedBy=default.target\n",
-            abs.display().to_string().replace(['\n', '%'], " "),
-            unit_quote(&exe.to_string_lossy())?,
-            unit_quote(&abs.to_string_lossy())?,
-            log_esc,
-            log_esc,
-        );
-        if let Some(dir) = path.parent() {
-            std::fs::create_dir_all(dir)?;
-        }
-        std::fs::write(&path, unit).with_context(|| format!("cannot write {}", path.display()))?;
-        println!("Wrote {}", path.display());
-
-        // A copy started with `start` would fight the service for the socket: stop it first.
-        if UnixStream::connect(cfg.socket_path()).await.is_ok() {
-            let ctl = Ctl { sock: cfg.socket_path(), config: config_path.to_path_buf() };
-            let _ = call(&ctl, &Request::Stop).await;
-            wait_socket(cfg, false, 50).await;
-        }
-        if !systemctl(&["daemon-reload"])? || !systemctl(&["enable", "--now", &name])? {
-            bail!("systemctl could not enable {}; see the messages above", name);
-        }
-        if wait_socket(cfg, true, 100).await {
-            println!("rustsync is running and will start by itself when you log in.");
-        } else {
-            println!(
-                "The service is enabled but rustsync has not answered yet; check:  systemctl --user status {}",
-                name
-            );
-        }
-
-        if install_tray_autostart(config_path) {
-            println!(
-                "The tray icon will appear when you log in to the desktop ({}).",
-                tray_autostart_path().display()
-            );
-        }
-
-        if !linger_enabled() {
-            let want = yes
-                || (std::io::stdin().is_terminal()
-                    && confirm("Also start it when the machine boots, before you log in?", true)?);
-            if want {
-                let ok = std::process::Command::new("loginctl")
-                    .arg("enable-linger")
-                    .stdin(std::process::Stdio::null())
-                    .status()
-                    .map(|s| s.success())
-                    .unwrap_or(false);
-                if ok {
-                    println!("rustsync will also start at boot.");
-                } else {
-                    println!("Could not enable that. Ask an administrator to run:  loginctl enable-linger $USER");
-                }
-            } else {
-                println!("It starts when you log in. For starting at boot instead:  loginctl enable-linger $USER");
-            }
-        }
-        Ok(())
-    }
-
-    async fn uninstall_service(config_path: &Path, cfg: &Config) -> Result<()> {
-        let name = unit_name(config_path);
-        let path = unit_path(&name);
-        if !path.exists() {
-            println!("rustsync is not set to start by itself.");
-            return Ok(());
-        }
-        if systemd_available() {
-            let _ = systemctl(&["disable", "--now", &name]);
-        }
-        std::fs::remove_file(&path).with_context(|| format!("cannot remove {}", path.display()))?;
-        if systemd_available() {
-            let _ = systemctl(&["daemon-reload"]);
-        }
-        wait_socket(cfg, false, 50).await;
-        println!("rustsync no longer starts by itself, and has been stopped. Start it with:  rustsync -c {} start", config_path.display());
-        Ok(())
-    }
-
-    async fn start(config_path: &Path, cfg: &Config) -> Result<()> {
-        if UnixStream::connect(cfg.socket_path()).await.is_ok() {
-            println!("rustsync is already running.");
-            return Ok(());
-        }
-        cfg.ensure_dir()?;
-
-        // Set up to start by itself: use the service rather than a second copy.
-        if service_installed(config_path) && systemd_available() {
-            let name = unit_name(config_path);
-            if systemctl(&["start", &name])? && wait_socket(cfg, true, 100).await {
-                println!("rustsync started (systemd service {}).", name);
-                return Ok(());
-            }
-            bail!("the service {} did not start; see systemctl --user status {}", name, name);
-        }
-        // First time at a terminal: offer to start by itself in the future.
-        let marker = cfg.dir.join("service-offered");
-        if cfg!(target_os = "linux")
-            && std::io::stdin().is_terminal()
-            && !marker.exists()
-            && systemd_available()
-        {
-            let _ = std::fs::write(&marker, "asked once; rustsync install-service does it later\n");
-            if confirm("Start rustsync automatically when you log in (and optionally at boot)?", true)? {
-                return install_service(config_path, cfg, false).await;
-            }
-        }
+    /// Start the daemon in the background (a copy of this program, detached) and wait for it.
+    async fn spawn_daemon(config_path: &Path, cfg: &Config) -> Result<()> {
         let log_path = cfg.log_path();
         let log = std::fs::OpenOptions::new().create(true).append(true).open(&log_path)?;
         let log2 = log.try_clone()?;
@@ -5746,14 +5615,433 @@ mod cli {
             .stderr(std::process::Stdio::from(log2))
             .process_group(0);
         cmd.spawn().context("cannot start rustsync")?;
-        for _ in 0..50 {
-            tokio::time::sleep(Duration::from_millis(100)).await;
-            if UnixStream::connect(cfg.socket_path()).await.is_ok() {
-                println!("rustsync started in the background. Log: {}", log_path.display());
-                return Ok(());
-            }
+        if wait_socket(cfg, true, 50).await {
+            println!("rustsync started in the background. Log: {}", log_path.display());
+            return Ok(());
         }
         bail!("rustsync did not start; see {}", log_path.display())
+    }
+
+    /// Stop a daemon that was started by hand, so a service can take over its socket.
+    async fn stop_running(config_path: &Path, cfg: &Config) {
+        if UnixStream::connect(cfg.socket_path()).await.is_ok() {
+            let ctl = Ctl { sock: cfg.socket_path(), config: config_path.to_path_buf() };
+            let _ = call(&ctl, &Request::Stop).await;
+            wait_socket(cfg, false, 50).await;
+        }
+    }
+
+    // ---- Linux: a systemd user service
+
+    #[cfg(target_os = "linux")]
+    mod svc {
+        use super::*;
+
+        /// The question `start` asks, once, at a terminal.
+        pub const OFFER: &str = "Start rustsync automatically when you log in (and optionally at boot)?";
+
+        fn unit_name(config_path: &Path) -> String {
+            match service_slug(config_path) {
+                None => "rustsync.service".to_string(),
+                Some(slug) => format!("rustsync-{}.service", slug),
+            }
+        }
+
+        fn unit_path(name: &str) -> PathBuf {
+            config_home().join("systemd").join("user").join(name)
+        }
+
+        /// Run `systemctl --user ...`; Ok(true) if it succeeded.
+        fn systemctl(args: &[&str]) -> Result<bool> {
+            let status = std::process::Command::new("systemctl")
+                .arg("--user")
+                .args(args)
+                .stdin(std::process::Stdio::null())
+                .status()
+                .context("cannot run systemctl")?;
+            Ok(status.success())
+        }
+
+        /// Is there a systemd user manager to talk to?
+        pub fn supported() -> bool {
+            std::process::Command::new("systemctl")
+                .args(["--user", "show-environment"])
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false)
+        }
+
+        pub fn installed(config_path: &Path) -> bool {
+            unit_path(&unit_name(config_path)).exists()
+        }
+
+        /// A word in a systemd unit's command line.
+        fn unit_quote(s: &str) -> Result<String> {
+            if s.contains('\n') {
+                bail!("a path contains a line break; cannot put it in a service file");
+            }
+            let mut out = String::from("\"");
+            for c in s.chars() {
+                match c {
+                    '\\' => out.push_str("\\\\"),
+                    '"' => out.push_str("\\\""),
+                    '%' => out.push_str("%%"),
+                    '$' => out.push_str("$$"),
+                    c => out.push(c),
+                }
+            }
+            out.push('"');
+            Ok(out)
+        }
+
+        fn linger_enabled() -> bool {
+            // SAFETY: getuid cannot fail.
+            let uid = unsafe { libc::getuid() }.to_string();
+            std::process::Command::new("loginctl")
+                .args(["show-user", &uid, "-p", "Linger", "--value"])
+                .stdin(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .output()
+                .map(|o| String::from_utf8_lossy(&o.stdout).trim() == "yes")
+                .unwrap_or(false)
+        }
+
+        /// With the service installed, start it through systemd. Ok(false): not applicable.
+        pub async fn start(config_path: &Path, cfg: &Config) -> Result<bool> {
+            if !installed(config_path) || !supported() {
+                return Ok(false);
+            }
+            let name = unit_name(config_path);
+            if systemctl(&["start", &name])? && wait_socket(cfg, true, 100).await {
+                println!("rustsync started (systemd service {}).", name);
+                return Ok(true);
+            }
+            bail!("the service {} did not start; see systemctl --user status {}", name, name)
+        }
+
+        pub async fn install(config_path: &Path, cfg: &Config, yes: bool) -> Result<()> {
+            if !supported() {
+                bail!("this needs systemd (a Linux desktop or server with a systemd user session)");
+            }
+            cfg.ensure_dir()?;
+            let abs = std::path::absolute(config_path)?;
+            let exe = std::env::current_exe()?;
+            let name = unit_name(config_path);
+            let path = unit_path(&name);
+            let log = cfg.log_path();
+            let log_esc = log.to_string_lossy().replace('%', "%%");
+            let unit = format!(
+                "[Unit]\nDescription=rustsync file sync ({})\n\n[Service]\nExecStart={} -c {}\nRestart=on-failure\nRestartSec=5\nStandardOutput=append:{}\nStandardError=append:{}\n\n[Install]\nWantedBy=default.target\n",
+                abs.display().to_string().replace(['\n', '%'], " "),
+                unit_quote(&exe.to_string_lossy())?,
+                unit_quote(&abs.to_string_lossy())?,
+                log_esc,
+                log_esc,
+            );
+            if let Some(dir) = path.parent() {
+                std::fs::create_dir_all(dir)?;
+            }
+            std::fs::write(&path, unit).with_context(|| format!("cannot write {}", path.display()))?;
+            println!("Wrote {}", path.display());
+
+            // A copy started with `start` would fight the service for the socket: stop it first.
+            stop_running(config_path, cfg).await;
+            if !systemctl(&["daemon-reload"])? || !systemctl(&["enable", "--now", &name])? {
+                bail!("systemctl could not enable {}; see the messages above", name);
+            }
+            if wait_socket(cfg, true, 100).await {
+                println!("rustsync is running and will start by itself when you log in.");
+            } else {
+                println!(
+                    "The service is enabled but rustsync has not answered yet; check:  systemctl --user status {}",
+                    name
+                );
+            }
+
+            if install_tray_autostart(config_path) {
+                println!(
+                    "The tray icon will appear when you log in to the desktop ({}).",
+                    tray_autostart_path().display()
+                );
+            }
+
+            if !linger_enabled() {
+                let want = yes
+                    || (std::io::stdin().is_terminal()
+                        && confirm("Also start it when the machine boots, before you log in?", true)?);
+                if want {
+                    let ok = std::process::Command::new("loginctl")
+                        .arg("enable-linger")
+                        .stdin(std::process::Stdio::null())
+                        .status()
+                        .map(|s| s.success())
+                        .unwrap_or(false);
+                    if ok {
+                        println!("rustsync will also start at boot.");
+                    } else {
+                        println!("Could not enable that. Ask an administrator to run:  loginctl enable-linger $USER");
+                    }
+                } else {
+                    println!("It starts when you log in. For starting at boot instead:  loginctl enable-linger $USER");
+                }
+            }
+            Ok(())
+        }
+
+        pub async fn uninstall(config_path: &Path, cfg: &Config) -> Result<()> {
+            let name = unit_name(config_path);
+            let path = unit_path(&name);
+            if !path.exists() {
+                println!("rustsync is not set to start by itself.");
+                return Ok(());
+            }
+            if supported() {
+                let _ = systemctl(&["disable", "--now", &name]);
+            }
+            std::fs::remove_file(&path).with_context(|| format!("cannot remove {}", path.display()))?;
+            if supported() {
+                let _ = systemctl(&["daemon-reload"]);
+            }
+            wait_socket(cfg, false, 50).await;
+            println!(
+                "rustsync no longer starts by itself, and has been stopped. Start it with:  rustsync -c {} start",
+                config_path.display()
+            );
+            Ok(())
+        }
+    }
+
+    // ---- macOS: a launchd agent (runs when you log in)
+
+    #[cfg(target_os = "macos")]
+    mod svc {
+        use super::*;
+
+        pub const OFFER: &str = "Start rustsync automatically when you log in?";
+
+        fn label(config_path: &Path) -> String {
+            match service_slug(config_path) {
+                None => "com.rustsync.daemon".to_string(),
+                Some(slug) => format!("com.rustsync.daemon.{}", slug),
+            }
+        }
+
+        fn plist_path(label: &str) -> PathBuf {
+            let home = std::env::var("HOME").map(PathBuf::from).unwrap_or_default();
+            home.join("Library").join("LaunchAgents").join(format!("{}.plist", label))
+        }
+
+        fn domain() -> String {
+            // SAFETY: getuid cannot fail.
+            format!("gui/{}", unsafe { libc::getuid() })
+        }
+
+        fn launchctl(args: &[&str]) -> bool {
+            std::process::Command::new("launchctl")
+                .args(args)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false)
+        }
+
+        pub fn supported() -> bool {
+            std::process::Command::new("launchctl")
+                .arg("version")
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false)
+        }
+
+        pub fn installed(config_path: &Path) -> bool {
+            plist_path(&label(config_path)).exists()
+        }
+
+        fn xml(s: &str) -> String {
+            s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;")
+        }
+
+        pub async fn start(config_path: &Path, cfg: &Config) -> Result<bool> {
+            if !installed(config_path) {
+                return Ok(false);
+            }
+            let label = label(config_path);
+            let target = format!("{}/{}", domain(), label);
+            // Loaded already? Kick it. Otherwise load it first.
+            if !launchctl(&["kickstart", &target]) {
+                launchctl(&["bootstrap", &domain(), &plist_path(&label).to_string_lossy()]);
+                launchctl(&["kickstart", &target]);
+            }
+            if wait_socket(cfg, true, 100).await {
+                println!("rustsync started (launch agent {}).", label);
+                return Ok(true);
+            }
+            bail!("the launch agent {} did not start; see {}", label, cfg.log_path().display())
+        }
+
+        pub async fn install(config_path: &Path, cfg: &Config, _yes: bool) -> Result<()> {
+            if !supported() {
+                bail!("launchctl is not available");
+            }
+            cfg.ensure_dir()?;
+            let abs = std::path::absolute(config_path)?;
+            let exe = std::env::current_exe()?;
+            let label = label(config_path);
+            let path = plist_path(&label);
+            let log = xml(&cfg.log_path().to_string_lossy());
+            let plist = format!(
+                "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n<plist version=\"1.0\">\n<dict>\n  <key>Label</key><string>{}</string>\n  <key>ProgramArguments</key>\n  <array><string>{}</string><string>-c</string><string>{}</string></array>\n  <key>RunAtLoad</key><true/>\n  <key>KeepAlive</key><dict><key>SuccessfulExit</key><false/></dict>\n  <key>ProcessType</key><string>Background</string>\n  <key>StandardOutPath</key><string>{}</string>\n  <key>StandardErrorPath</key><string>{}</string>\n</dict>\n</plist>\n",
+                xml(&label),
+                xml(&exe.to_string_lossy()),
+                xml(&abs.to_string_lossy()),
+                log,
+                log,
+            );
+            if let Some(dir) = path.parent() {
+                std::fs::create_dir_all(dir)?;
+            }
+            std::fs::write(&path, plist).with_context(|| format!("cannot write {}", path.display()))?;
+            println!("Wrote {}", path.display());
+
+            stop_running(config_path, cfg).await;
+            let target = format!("{}/{}", domain(), label);
+            launchctl(&["bootout", &target]); // forget an older copy, if any (fails when none)
+            if !launchctl(&["bootstrap", &domain(), &path.to_string_lossy()]) {
+                bail!("launchctl could not load {}; try:  launchctl bootstrap {} {}", label, domain(), path.display());
+            }
+            if wait_socket(cfg, true, 100).await {
+                println!("rustsync is running and will start by itself when you log in.");
+            } else {
+                println!("The launch agent is loaded but rustsync has not answered yet; see {}", cfg.log_path().display());
+            }
+            Ok(())
+        }
+
+        pub async fn uninstall(config_path: &Path, cfg: &Config) -> Result<()> {
+            let label = label(config_path);
+            let path = plist_path(&label);
+            if !path.exists() {
+                println!("rustsync is not set to start by itself.");
+                return Ok(());
+            }
+            launchctl(&["bootout", &format!("{}/{}", domain(), label)]);
+            std::fs::remove_file(&path).with_context(|| format!("cannot remove {}", path.display()))?;
+            wait_socket(cfg, false, 50).await;
+            println!(
+                "rustsync no longer starts by itself, and has been stopped. Start it with:  rustsync -c {} start",
+                config_path.display()
+            );
+            Ok(())
+        }
+    }
+
+    // ---- FreeBSD, OpenBSD, NetBSD, ...: start at login to the desktop (an XDG autostart entry)
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    mod svc {
+        use super::*;
+
+        pub const OFFER: &str = "Start rustsync automatically when you log in to the desktop?";
+
+        fn entry_path(config_path: &Path) -> PathBuf {
+            let name = match service_slug(config_path) {
+                None => "rustsync-daemon.desktop".to_string(),
+                Some(slug) => format!("rustsync-daemon-{}.desktop", slug),
+            };
+            config_home().join("autostart").join(name)
+        }
+
+        pub fn supported() -> bool {
+            std::env::var("HOME").map(|h| !h.is_empty()).unwrap_or(false)
+        }
+
+        pub fn installed(config_path: &Path) -> bool {
+            entry_path(config_path).exists()
+        }
+
+        /// There is no service manager to ask: `start` just starts it (Ok(false)).
+        pub async fn start(_config_path: &Path, _cfg: &Config) -> Result<bool> {
+            Ok(false)
+        }
+
+        pub async fn install(config_path: &Path, cfg: &Config, _yes: bool) -> Result<()> {
+            cfg.ensure_dir()?;
+            let abs = std::path::absolute(config_path)?;
+            let exe = std::env::current_exe()?;
+            let (Some(e), Some(c)) = (desktop_quote(&exe.to_string_lossy()), desktop_quote(&abs.to_string_lossy())) else {
+                bail!("the program or config path has characters that cannot go in a login entry");
+            };
+            let path = entry_path(config_path);
+            let text = format!(
+                "[Desktop Entry]\nType=Application\nName=rustsync service\nComment=Starts the rustsync background service\nExec={} -c {} start\nTerminal=false\nX-GNOME-Autostart-enabled=true\n",
+                e, c
+            );
+            if let Some(dir) = path.parent() {
+                std::fs::create_dir_all(dir)?;
+            }
+            std::fs::write(&path, text).with_context(|| format!("cannot write {}", path.display()))?;
+            println!("Wrote {}", path.display());
+            println!("rustsync will start when you log in to the desktop. (On a server with no desktop, start it from an rc script instead; see the README.)");
+            if install_tray_autostart(config_path) {
+                println!("The tray icon will appear then too ({}).", tray_autostart_path().display());
+            }
+            if UnixStream::connect(cfg.socket_path()).await.is_err() {
+                spawn_daemon(config_path, cfg).await?;
+            }
+            Ok(())
+        }
+
+        pub async fn uninstall(config_path: &Path, _cfg: &Config) -> Result<()> {
+            let path = entry_path(config_path);
+            if !path.exists() {
+                println!("rustsync is not set to start by itself.");
+                return Ok(());
+            }
+            std::fs::remove_file(&path).with_context(|| format!("cannot remove {}", path.display()))?;
+            println!(
+                "rustsync no longer starts at login. It is still running now; stop it with:  rustsync -c {} stop",
+                config_path.display()
+            );
+            Ok(())
+        }
+    }
+
+    async fn install_service(config_path: &Path, cfg: &Config, yes: bool) -> Result<()> {
+        svc::install(config_path, cfg, yes).await
+    }
+
+    async fn uninstall_service(config_path: &Path, cfg: &Config) -> Result<()> {
+        svc::uninstall(config_path, cfg).await
+    }
+
+    async fn start(config_path: &Path, cfg: &Config) -> Result<()> {
+        if UnixStream::connect(cfg.socket_path()).await.is_ok() {
+            println!("rustsync is already running.");
+            return Ok(());
+        }
+        cfg.ensure_dir()?;
+
+        // Set up to start by itself: use that rather than a second copy.
+        if svc::start(config_path, cfg).await? {
+            return Ok(());
+        }
+        // First time at a terminal: offer to start by itself in the future.
+        let marker = cfg.dir.join("service-offered");
+        if std::io::stdin().is_terminal() && !marker.exists() && !svc::installed(config_path) && svc::supported() {
+            let _ = std::fs::write(&marker, "asked once; rustsync install-service does it later\n");
+            if confirm(svc::OFFER, true)? {
+                return install_service(config_path, cfg, false).await;
+            }
+        }
+        spawn_daemon(config_path, cfg).await
     }
 
     // ---------------------------------------------------------------- commands
