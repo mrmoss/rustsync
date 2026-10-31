@@ -1,0 +1,48 @@
+# Builds and tests rustsync on Linux, macOS and FreeBSD (Intel/AMD and ARM where the runners allow).
+# NOTE: written without being able to run it; if a runner image or action version has moved on,
+# the fix is usually just bumping it here.
+name: build
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  unix:
+    name: ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # Linux x86_64, Linux aarch64, macOS aarch64 (Apple silicon)
+        os: [ubuntu-latest, ubuntu-24.04-arm, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Linux build libraries
+        if: startsWith(matrix.os, 'ubuntu')
+        run: sudo apt-get update && sudo apt-get install -y libxkbcommon-dev libwayland-dev
+      - name: Build (service, command line and window)
+        run: cargo build --release
+      - name: Test
+        run: cargo test --release
+      - name: macOS, also for Intel Macs
+        if: startsWith(matrix.os, 'macos')
+        run: |
+          rustup target add x86_64-apple-darwin
+          cargo build --release --target x86_64-apple-darwin
+
+  freebsd:
+    name: freebsd
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: cross-platform-actions/action@v0.25.0
+        with:
+          operating_system: freebsd
+          version: '14.2'
+          # The service and command line only; the window needs X11/Wayland libraries.
+          run: |
+            sudo pkg install -y rust
+            cargo build --release --no-default-features
+            cargo test --release --no-default-features

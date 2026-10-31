@@ -19,12 +19,13 @@ identical. Nothing goes through anybody's cloud.
 - **Encrypted backups.** Give a server an *encrypted* copy of a folder that it cannot read, and
   restore from it if every machine is lost.
 - **Command line and a desktop window.** Everything the window does, the command line can do too.
-  On Linux there is also a tray icon.
+  On Linux and the BSDs there is also a tray icon.
 
 Contents: [How it works](#how-it-works-in-one-minute) ·
+[Compared with Syncthing](#how-rustsync-differs-from-syncthing) · [Design](#design-simple-and-managed-from-the-tool) ·
 [Install](#install) · [Quick start](#quick-start-two-machines-one-folder) ·
 [The desktop window](#the-desktop-window) · [All commands](#all-commands) ·
-[Starting by itself and the tray icon](#starting-by-itself-and-the-tray-icon) · [Platform notes](#platform-notes) ·
+[Starting by itself and the tray icon](#starting-by-itself-and-the-tray-icon) · [Platform notes](#platform-notes) · [Building and releasing](#building-and-releasing) ·
 [Encrypted backups](#encrypted-backups-for-a-server-or-if-everything-is-lost) ·
 [Troubleshooting](#troubleshooting)
 
@@ -52,6 +53,50 @@ A small background program (the **service**) does the syncing. The command line 
 window are just remote controls for it: you can close the window, or log out of the terminal, and
 syncing carries on.
 
+## How rustsync differs from Syncthing
+
+rustsync is inspired by [Syncthing](https://syncthing.net) and does the same basic job: keep folders
+identical on machines you own, with no central server. Syncthing is excellent, mature and widely used.
+**If you need something dependable today, use Syncthing.** rustsync makes different trade-offs, aimed at
+being smaller and simpler to set up and run:
+
+| | Syncthing | rustsync |
+|---|---|---|
+| **Pairing** | Each side adds the other's long device ID and approves it. | One side shows a **one-time code**, the other pastes it. One step, and the code only works once. |
+| **Finding each other** | Discovery servers, local discovery, relays and NAT traversal, so devices can find each other almost anywhere. | None. You give the address (a host name or IP and port) when pairing, so the machines must be able to reach each other: same network, a forwarded port, or a VPN or overlay network such as Tailscale. |
+| **Encryption** | TLS with a certificate per device. | The Noise protocol, with an extra secret shared only by each pair of devices mixed into every key. |
+| **Backups on a machine you don't trust** | "Untrusted" devices can hold encrypted folders. | Built in as a library mode (`share --backup`): the server stores only encrypted data, your other machines find and use the backup by themselves, it has a size limit and a clean-up command, and a **recovery code or kit** gets everything back if every machine is lost. |
+| **Managing it** | A web interface in your browser, plus a settings file. | A command line and a native desktop window, both talking to the same background service. Devices and libraries are managed with commands, not by editing a file. |
+| **Folder roles** | Send and receive, send only, or receive only, per folder. | Each library is either synced both ways or an encrypted backup. No send-only or receive-only yet. |
+| **Conflicts** | Keeps both versions (a conflict copy). | The most recent change wins, by the clock; no copy of the loser is kept. Keep clocks in sync. |
+| **File versioning, ignore patterns** | Yes. | No. |
+| **Platforms** | Windows, macOS, Linux, the BSDs, Android and more. | Linux, macOS and the BSDs on 64-bit Intel/AMD and ARM. No Windows or Android yet. |
+| **Maturity** | Years of use and a large community. | Brand new, written by an AI, little real-world testing. |
+| **Language** | Go. | Rust. |
+
+In short: pick Syncthing for reach (Windows, phones, devices behind firewalls with no VPN), fine-grained
+folder options and a track record. Try rustsync if you like a small tool you run from the terminal, a
+pairing step that is one copy and paste, and an encrypted backup server with a real way to recover.
+
+## Design: simple and managed from the tool
+
+rustsync borrows the feel of [Tailscale](https://tailscale.com)'s command line (it isn't affiliated
+with Tailscale): a background service plus one small tool that does everything, with short commands
+you can guess, plain-language output, and as little setup as possible. In practice:
+
+- **One tool, a few verbs.** `start`, `status`, `invite`, `join`, `create`, `share`, `accept`: you
+  rarely need the manual, and `rustsync --help` lists them all.
+- **It asks for what's missing.** Leave a device, library or code off a command and it shows you the
+  choices (or asks) instead of failing with a usage message.
+- **Everything is managed from the tool itself.** Pairing, libraries, sharing, size limits, recovery
+  codes and start-at-login are all commands (or buttons in the window). There's no file you must hand-edit:
+  the config file only holds a few optional settings, and devices and libraries live in the service's own
+  state, which the commands change for you.
+- **The window is just a remote control.** It does nothing the command line can't, so you can use
+  whichever you prefer, or both, and closing it never stops syncing.
+- **It offers to set itself up.** The first time you start it at a terminal, it offers to start
+  automatically at login (and at boot on Linux), the way you'd expect a well-behaved service to.
+
 ## Install
 
 You need [Rust](https://rustup.rs) (1.81 or newer).
@@ -75,7 +120,11 @@ cd rustsync
 cargo build --release
 ```
 
-This builds two programs into `target/release/`:
+Or, if you have [`just`](https://github.com/casey/just), `just install` builds and copies both
+programs into `~/.local/bin` for you. Ready-made downloads for each system are on the
+[Releases page](https://github.com/mrmoss/rustsync/releases) once one has been published.
+
+The build makes two programs in `target/release/`:
 
 | Program | What it is |
 |---|---|
@@ -299,39 +348,13 @@ it is closed).
   A build on Apple silicon makes an Apple-silicon program; to make an Intel one add
   `--target x86_64-apple-darwin` (after `rustup target add x86_64-apple-darwin`), and the other way
   round on an Intel Mac.
-- To get a double-clickable app with the logo, put the two programs and an icon in a bundle:
+- To get a double-clickable app with the logo, run `just macos-app` (see
+  [Building and releasing](#building-and-releasing)). It makes `dist/rustsync.app` and a zip of it.
+  Put the app in `/Applications`.
 
-  ```sh
-  mkdir -p rustsync.app/Contents/MacOS rustsync.app/Contents/Resources
-  cp target/release/rustsync target/release/rustsync-gui rustsync.app/Contents/MacOS/
-
-  mkdir rustsync.iconset
-  sips -z 16 16     assets/icon-256.png --out rustsync.iconset/icon_16x16.png
-  sips -z 32 32     assets/icon-256.png --out rustsync.iconset/icon_16x16@2x.png
-  sips -z 32 32     assets/icon-256.png --out rustsync.iconset/icon_32x32.png
-  sips -z 64 64     assets/icon-256.png --out rustsync.iconset/icon_32x32@2x.png
-  sips -z 128 128   assets/icon-256.png --out rustsync.iconset/icon_128x128.png
-  sips -z 256 256   assets/icon-256.png --out rustsync.iconset/icon_128x128@2x.png
-  sips -z 256 256   assets/icon-256.png --out rustsync.iconset/icon_256x256.png
-  iconutil -c icns rustsync.iconset -o rustsync.app/Contents/Resources/rustsync.icns
-
-  cat > rustsync.app/Contents/Info.plist <<'EOF'
-  <?xml version="1.0" encoding="UTF-8"?>
-  <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-  <plist version="1.0"><dict>
-    <key>CFBundleName</key><string>rustsync</string>
-    <key>CFBundleIdentifier</key><string>com.rustsync.gui</string>
-    <key>CFBundleExecutable</key><string>rustsync-gui</string>
-    <key>CFBundleIconFile</key><string>rustsync</string>
-    <key>CFBundlePackageType</key><string>APPL</string>
-    <key>CFBundleVersion</key><string>0.1.0</string>
-    <key>NSHighResolutionCapable</key><true/>
-  </dict></plist>
-  EOF
-  ```
-
-  The app is not signed. An app you built yourself opens normally; one you copy from elsewhere needs
-  a right-click, *Open*, the first time.
+  The app is not signed by a developer. One you built yourself opens normally; one you downloaded needs
+  a right-click, *Open*, the first time (or *Open Anyway* in System Settings, Privacy & Security, or
+  `xattr -dr com.apple.quarantine rustsync.app`).
 - macOS asks whether `rustsync` may accept incoming connections the first time it runs: allow it,
   or other machines cannot reach this one.
 - The Mac's file system is usually **case-insensitive**, so two files whose names differ only in
@@ -352,6 +375,37 @@ it is closed).
   folder on the way, but cannot do that last check, so do not let untrusted local users write to a
   synced folder. See [`SECURITY.md`](SECURITY.md).
 - Same case-insensitivity and socket-path notes as above if you use such a file system.
+
+## Building and releasing
+
+A [`justfile`](justfile) wraps the common jobs, so you don't have to remember the steps (get `just`
+with `cargo install just`, `brew install just`, or `pkg install just`). Run `just` to see them all:
+
+| Command | What it does |
+|---|---|
+| `just build` | Build everything in release mode. |
+| `just build-server` | Build only the service and command line (no window libraries). |
+| `just test` | Run the tests. |
+| `just install` | Build and install both programs into `~/.local/bin` (`PREFIX=/usr/local just install` to change it). |
+| `just package` | Make `dist/rustsync-<version>-<os>-<cpu>.tar.gz` with the programs and docs. |
+| `just macos-app` | On a Mac: make `dist/rustsync.app` (with the logo) and a zip of it. |
+| `just clean` | Remove build output and `dist/`. |
+
+To build for the other kind of CPU on a Mac, set the target: `TARGET=x86_64-apple-darwin just macos-app`.
+
+**Releases are made by GitHub Actions.** Pushing a tag builds the programs for Linux (Intel/AMD and
+ARM), macOS (Apple silicon and Intel) and FreeBSD, and puts them in a **draft** release:
+
+```sh
+# 1. bump `version` in Cargo.toml and commit it
+git tag v0.1.0
+git push --tags
+# 2. wait for the "release" workflow, look over the draft under Releases, then publish it
+```
+
+The tag must match the version in `Cargo.toml` or the build stops. The downloads are unsigned and come
+with a `SHA256SUMS` file. A separate workflow (`build`) builds and tests every push. For public
+repositories, GitHub Actions is free.
 
 ## Encrypted backups (for a server, or if everything is lost)
 

@@ -1,4 +1,3 @@
-Cargo.lock
 /target
 *.state/
 *.log
@@ -11,3 +10,7 @@ Cargo.lock
 .vscode
 .dockerignore
 Dockerfile
+
+# CI workflow is the one yaml file that belongs in the repo
+!/.github/workflows/*.yml
+/dist

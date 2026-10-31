@@ -1,0 +1,120 @@
+# Makes a draft GitHub release with downloadable programs when you push a tag like v0.1.0.
+#
+#   1. bump `version` in Cargo.toml and commit it
+#   2. git tag v0.1.0 && git push --tags
+#   3. wait for this workflow, look over the draft under "Releases", then publish it
+#
+# NOTE: written without being able to run it. If a runner image or action version has moved on,
+# the fix is usually just bumping it here.
+name: release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Built on Ubuntu 22.04 so the programs also run on older Linux systems.
+          - { name: linux-x86_64,  runner: ubuntu-22.04 }
+          - { name: linux-aarch64, runner: ubuntu-22.04-arm }
+          - { name: macos-aarch64, runner: macos-latest }
+          - { name: macos-x86_64,  runner: macos-latest, target: x86_64-apple-darwin }
+    env:
+      TARGET: ${{ matrix.target }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: The tag matches the version in Cargo.toml
+        run: |
+          v=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
+          [ "v$v" = "$GITHUB_REF_NAME" ] || { echo "tag $GITHUB_REF_NAME does not match Cargo.toml version $v"; exit 1; }
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: taiki-e/install-action@just
+      - name: Linux build libraries
+        if: startsWith(matrix.runner, 'ubuntu')
+        run: sudo apt-get update && sudo apt-get install -y libxkbcommon-dev libwayland-dev
+      - name: Package
+        run: just package
+      - name: macOS app
+        if: startsWith(matrix.runner, 'macos')
+        run: just macos-app
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-${{ matrix.name }}
+          path: |
+            dist/*.tar.gz
+            dist/*.app.zip
+          if-no-files-found: error
+
+  freebsd:
+    name: freebsd-x86_64
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: The tag matches the version in Cargo.toml
+        run: |
+          v=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
+          [ "v$v" = "$GITHUB_REF_NAME" ] || { echo "tag $GITHUB_REF_NAME does not match Cargo.toml version $v"; exit 1; }
+      - uses: cross-platform-actions/action@v0.25.0
+        with:
+          operating_system: freebsd
+          version: '14.2'
+          # The service and command line only; the window needs X11/Wayland libraries.
+          run: |
+            sudo pkg install -y rust just
+            just package-server
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-freebsd-x86_64
+          path: dist/*.tar.gz
+          if-no-files-found: error
+
+  release:
+    name: draft release
+    needs: [build, freebsd]
+    # Still make the draft if one platform failed, so the others are not lost.
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          pattern: dist-*
+          merge-multiple: true
+      - name: Checksums
+        run: |
+          cd dist
+          ls -l
+          sha256sum * > SHA256SUMS
+      - name: Draft the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cat > notes.md <<'NOTES'
+          **This is AI-generated, lightly tested software. Do not make it the only copy of anything you care about.**
+
+          Downloads are for 64-bit Intel/AMD (`x86_64`) and ARM (`aarch64`). Check them against `SHA256SUMS`.
+
+          - **Linux:** `rustsync-<version>-linux-<cpu>.tar.gz`, built on Ubuntu 22.04.
+          - **macOS:** `rustsync-<version>-macos-<cpu>.app.zip` is the app; the `.tar.gz` is just the programs. The builds are
+            unsigned, so the first time, right-click the app and choose Open (or allow it in System Settings, Privacy & Security).
+          - **FreeBSD:** `rustsync-<version>-freebsd-x86_64.tar.gz` has the service and command line only (no window).
+
+          See the README for how to set up and pair your machines.
+          NOTES
+          gh release create "$GITHUB_REF_NAME" dist/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --draft \
+            --title "$GITHUB_REF_NAME" \
+            --notes-file notes.md \
+            --generate-notes
