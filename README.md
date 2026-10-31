@@ -143,26 +143,27 @@ running yet). It has three pages:
 
 - **Libraries**: your libraries, who they're shared with, how much encrypted-backup space is used,
   and offers waiting for you to accept.
-- **Devices**: the machines you've paired, whether they're online, and *Pair a new device*.
+- **Devices**: the machines you've paired and whether they're online, plus *Show a pairing code* and
+  *Enter a pairing code* for adding another.
 - **This device**: your name, public key, the address you're listening on, and the switch for
   starting rustsync automatically.
 
-<!-- SCREENSHOTS: save your pictures as docs/screenshots/{libraries,devices,this-device,tray}.png,
-     then delete this line and the "<!--" and "-->" lines around the images below. -->
-<!--
 <p align="center">
-  <img src="docs/screenshots/libraries.png" width="720" alt="The Libraries page: each library with its devices and a usage bar">
+  <img src="docs/screenshots/libraries.png" width="760" alt="The Libraries page: an offer waiting to be accepted, and libraries with their backup usage bars">
 </p>
 <p align="center">
-  <img src="docs/screenshots/devices.png" width="720" alt="The Devices page: paired machines and the Pair a new device button">
+  <img src="docs/screenshots/devices.png" width="760" alt="The Devices page: pairing buttons and the list of paired machines">
 </p>
 <p align="center">
-  <img src="docs/screenshots/this-device.png" width="720" alt="The This device page: name, key, and the start-automatically switch">
+  <img src="docs/screenshots/this-device.png" width="760" alt="The This device page: name, public key, and the start-automatically switch">
 </p>
 <p align="center">
-  <img src="docs/screenshots/tray.png" width="320" alt="The tray icon and its menu">
+  <img src="docs/screenshots/tray.png" width="420" alt="The tray icon in its three states, and its menu">
 </p>
--->
+
+<sub>These pictures are drawn from the window's layout and colours with made-up example data (names,
+paths and sizes), not captured from a real session, so details such as fonts will differ a little on
+your machine.</sub>
 
 The window uses `~/.config/rustsync/config.yaml` unless you give it another config with
 `-c /path/to/config.yaml`, the same as the command line.
