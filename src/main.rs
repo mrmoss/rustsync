@@ -55,7 +55,7 @@ pub enum Cmd {
     },
     /// Pair with a machine that is waiting in `invite`: paste its code
     Join {
-        /// The code (asked if omitted)
+        /// The code (asked if omitted; leave it out so it does not end up in your shell history)
         code: Option<String>,
     },
     /// Stop syncing with a paired device
@@ -141,7 +141,8 @@ pub enum Cmd {
     /// Get a library back from an encrypted backup, using its recovery code
     Restore {
         /// A recovery code (rsr1-...) for one library, or the recovery kit (rsk1-...) for all of
-        /// them, each into its own subfolder (asked if omitted)
+        /// them, each into its own subfolder (asked if omitted; leave it out so the code does not
+        /// end up in your shell history)
         code: Option<String>,
         /// Empty folder to restore into (asked if omitted)
         folder: Option<String>,
@@ -620,7 +621,9 @@ mod net {
     //! Every connection runs the Noise protocol `Noise_XXpsk0_25519_ChaChaPoly_BLAKE2s`
     //! (the same family WireGuard uses): mutual authentication with long-term X25519
     //! keys, ephemeral keys for forward secrecy, ChaCha20-Poly1305 for records, and a
-    //! 32-byte pre-shared secret per pair of devices mixed into every key (quantum-resistant).
+    //! 32-byte pre-shared secret per pair of devices mixed into every key. As long as that secret
+    //! stays secret, recorded traffic stays safe even from a future quantum computer (X25519 alone
+    //! would not be); the identity keys themselves are ordinary X25519.
     //!
     //! Wire format: a sequence of frames `[u16 big-endian length][ciphertext]`.
     //! Each decrypted record is `[flag][data]` where flag 1 means "more records
@@ -698,9 +701,25 @@ mod net {
     /// The public key file is only a convenience copy (so you can `cat` it): always derived from
     /// the private key, replaced atomically.
     fn write_public(path: &Path, public: &[u8]) -> Result<()> {
-        let tmp = sibling(path, ".new");
-        std::fs::write(&tmp, format!("{}\n", hex(public)))?;
-        std::fs::rename(&tmp, path)?;
+        // Unpredictable name, created exclusively and never through a symlink (like the private key).
+        let tmp = sibling(path, &format!(".new-{:016x}", rand::random::<u64>()));
+        let written = (|| -> std::io::Result<()> {
+            let mut f = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o644)
+                .custom_flags(libc::O_NOFOLLOW)
+                .open(&tmp)?;
+            f.write_all(format!("{}\n", hex(public)).as_bytes())
+        })();
+        if let Err(e) = written {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(e.into());
+        }
+        if let Err(e) = std::fs::rename(&tmp, path) {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(e.into());
+        }
         Ok(())
     }
 
@@ -1887,7 +1906,7 @@ mod vault {
     //! One 32-byte vault key, shared by your own machines and NEVER given to the depot, is split
     //! (BLAKE3 key derivation) into independent keys for: chunk encryption, record encryption,
     //! hiding file paths, and naming chunks. Everything is symmetric (XChaCha20-Poly1305 and
-    //! BLAKE3), so it is not weakened by quantum computers.
+    //! BLAKE3), so it is not materially weakened by quantum computers (symmetric 256-bit keys).
     //!
     //! The depot sees: how many files exist, when they changed, chunk sizes, and which chunks are
     //! identical. It does not see names, paths, contents or modes.
@@ -2081,6 +2100,7 @@ mod depot {
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::Mutex;
     use std::time::SystemTime;
+    use tokio::io::AsyncWriteExt;
 
     const MAX_RECORD: usize = 12 * 1024 * 1024;
     const MAX_DELETE: usize = 1000; // blobs removed per request
@@ -2215,10 +2235,30 @@ mod depot {
             if let Some(parent) = path.parent() {
                 tokio::fs::create_dir_all(parent).await?;
             }
-            let tmp = self
-                .dir
-                .join(format!("tmp-{}-{}", std::process::id(), TMP.fetch_add(1, Ordering::Relaxed)));
-            tokio::fs::write(&tmp, data).await?;
+            // An unpredictable name, created exclusively (fails if anything is already there, a
+            // symlink included), never through a symlink, readable by us only.
+            let tmp = self.dir.join(format!(
+                "tmp-{}-{}-{:016x}",
+                std::process::id(),
+                TMP.fetch_add(1, Ordering::Relaxed),
+                rand::random::<u64>()
+            ));
+            let written = async {
+                let mut f = tokio::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .mode(0o600)
+                    .custom_flags(libc::O_NOFOLLOW)
+                    .open(&tmp)
+                    .await?;
+                f.write_all(data).await?;
+                f.flush().await
+            }
+            .await;
+            if let Err(e) = written {
+                let _ = tokio::fs::remove_file(&tmp).await;
+                return Err(e);
+            }
             if let Err(e) = tokio::fs::rename(&tmp, path).await {
                 let _ = tokio::fs::remove_file(&tmp).await;
                 return Err(e);
@@ -4267,8 +4307,13 @@ mod sync {
         let (r, mut w) = stream.into_split();
         let mut reader = BufReader::new(r);
         let mut line = String::new();
-        if reader.read_line(&mut line).await? == 0 {
+        // A request is one short line; do not buffer an endless one.
+        const MAX_REQUEST_LINE: u64 = 1024 * 1024;
+        if (&mut reader).take(MAX_REQUEST_LINE).read_line(&mut line).await? == 0 {
             return Ok(());
+        }
+        if !line.ends_with('\n') && line.len() as u64 >= MAX_REQUEST_LINE {
+            bail!("request too large");
         }
         let req: Request = serde_json::from_str(line.trim()).context("bad request")?;
         match req {
@@ -5143,6 +5188,38 @@ mod sync {
             debug!("uploaded {}", e.path);
         }
         Ok(())
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        /// A message that merely *claims* to hold an enormous list or string must be refused
+        /// quickly: decoding must not try to reserve memory for what the sender says is coming.
+        #[test]
+        fn huge_declared_lengths_are_refused() {
+            // [u32 variant][u64 length of `shared`] ...
+            let good = bincode::serialize(&Msg::Libraries { shared: vec![], offers: vec![], backups: vec![] }).unwrap();
+            for len in [u64::MAX, 1u64 << 40, 1u64 << 32] {
+                let mut bad = good.clone();
+                bad[4..12].copy_from_slice(&len.to_le_bytes());
+                assert!(bincode::deserialize::<Msg>(&bad).is_err(), "list of {} accepted", len);
+            }
+            // [u32 variant][u64 req][u8 Some][u64 length of the bytes] ...
+            let good = bincode::serialize(&Msg::Chunk { req: 1, data: Some(vec![1, 2, 3]) }).unwrap();
+            for len in [u64::MAX, 1u64 << 40] {
+                let mut bad = good.clone();
+                bad[13..21].copy_from_slice(&len.to_le_bytes());
+                assert!(bincode::deserialize::<Msg>(&bad).is_err(), "byte string of {} accepted", len);
+            }
+            // [u32 variant][u64 length of the name] ...
+            let good = bincode::serialize(&Msg::Hello { name: "x".to_string() }).unwrap();
+            let mut bad = good.clone();
+            bad[4..12].copy_from_slice(&(1u64 << 40).to_le_bytes());
+            assert!(bincode::deserialize::<Msg>(&bad).is_err());
+            // and the honest versions still decode
+            assert!(bincode::deserialize::<Msg>(&good).is_ok());
+        }
     }
 }
 

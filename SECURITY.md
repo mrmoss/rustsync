@@ -40,6 +40,8 @@
 | Key files | The private key must be a regular file, owned by you, mode 0600 (not a symlink); otherwise rustsync refuses to start. The public key file is always derived from the private key. New keys are created atomically and never overwrite an existing key. |
 | Backup size | Each encrypted backup can have a size limit (`quota`) that the machine keeping it enforces on every write, so a paired device cannot fill the drive past it. Unused chunks are only ever deleted by a machine holding the key, only if older than 7 days, and only after every record in the backup was read and decrypted. |
 | Memory / CPU | Small bounded queues everywhere a peer controls the input; a byte budget for pending index updates; at most 16 requests per device served at once (extras refused); index messages capped by size and count; library/offer/backup lists capped; a device that stops reading is dropped after 60 s. |
+| Temporary files | The files rustsync writes before renaming them into place (in encrypted backups and for the public key) get unpredictable names, are created exclusively (they fail if anything, a symlink included, is already there), are never opened through a symlink, and, for backups, are readable by the owner only. |
+| Local control socket | `control.sock` is owner-only (`0600`) in a `0700` directory, and a request is one line of at most 1 MiB. |
 | Connection floods | At most 32 unauthenticated connections at once and 4 per IP address, 10 s handshake deadline. |
 
 ## Known limits
@@ -49,7 +51,9 @@
   have write access. (A send-only / receive-only role would be a natural next step.)
 - The last step of replacing a file is a `rename`, which cannot be made fully race-free with
   portable APIs. Do not give untrusted local users write access to a synced folder.
-- The descriptor check needs Linux (`/proc`). Elsewhere the other safeguards still apply.
+- The descriptor check needs Linux (`/proc`). On macOS only `O_NOFOLLOW` and the ancestor checks guard against a symlink being swapped in while a file is replaced, so do not let untrusted local users write to a synced folder there.
+- An encrypted backup cannot check its own contents (it has no key). If a stored chunk is damaged, or a machine holding the library key uploaded a bad one first, the backup keeps it: restoring that file fails (it is detected, not silently wrong) until the chunk is deleted and uploaded again. There is no automatic repair yet.
+- Treat "holds the library key" as "fully trusted for that backup": such a device can already read, delete and overwrite everything in it.
 - Size limits are per backup and optional; with none set, a paired device that may back up there can fill the drive. The limit counts the bytes rustsync stores, not other files on the same drive.
 - A recovery code is per library and does not change; save it once. Losing every machine *and* every code means the encrypted backup cannot be opened (that is the point).
 - Library names are not sent to a machine that only keeps a backup (its offer shows `backup-<id>`); every library shows its id in `status` and the GUI. A restore from a single code takes the name from the folder; a kit carries the names.
