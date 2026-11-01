@@ -1627,9 +1627,9 @@ impl Node {
             bail!("the machine at {} has a different key than the code says (wrong machine?)", addr);
         }
         let hello = PairHello { name: self.name.clone() };
-        net::send_message(&mut stream, &mut transport, &bincode::serialize(&hello)?).await?;
+        net::send_message(&mut stream, &mut transport, &postcard::to_allocvec(&hello)?).await?;
         let bytes = recv_bytes(&mut stream, &mut transport).await?;
-        let info: PairInfo = bincode::deserialize(&bytes)?;
+        let info: PairInfo = postcard::from_bytes(&bytes)?;
         let inviter_name = clean_name(&info.name);
 
         // Show the same code the other screen shows, and wait for the person to decide.
@@ -1647,12 +1647,12 @@ impl Node {
             tokio::time::timeout(Duration::from_secs(APPROVE_SECS), answer).await,
             Ok(Ok(true))
         );
-        net::send_message(&mut stream, &mut transport, &bincode::serialize(&PairConfirm { ok })?).await?;
+        net::send_message(&mut stream, &mut transport, &postcard::to_allocvec(&PairConfirm { ok })?).await?;
         if !ok {
             bail!("pairing cancelled");
         }
         let bytes = recv_bytes_for(&mut stream, &mut transport, APPROVE_SECS + 30).await?;
-        let reply: PairAccept = bincode::deserialize(&bytes)?;
+        let reply: PairAccept = postcard::from_bytes(&bytes)?;
         if !reply.ok {
             bail!("the other device did not approve the pairing");
         }
@@ -2309,9 +2309,9 @@ async fn pair_inviter(
 ) -> Result<String> {
     let remote = net::parse_hex32(remote_hex, "a device key")?;
     let bytes = recv_bytes(stream, transport).await?;
-    let hello: PairHello = bincode::deserialize(&bytes)?;
+    let hello: PairHello = postcard::from_bytes(&bytes)?;
     let name = clean_name(&hello.name);
-    net::send_message(stream, transport, &bincode::serialize(&PairInfo { name: node.name.clone() })?).await?;
+    net::send_message(stream, transport, &postcard::to_allocvec(&PairInfo { name: node.name.clone() })?).await?;
 
     // Ask the person at this device, while the other device asks its person.
     let (decide, answer) = oneshot::channel();
@@ -2337,7 +2337,7 @@ async fn pair_inviter(
                     }
                     c = &mut confirm, if theirs.is_none() => {
                         theirs = Some(match c {
-                            Ok(b) => bincode::deserialize::<PairConfirm>(&b).map(|c| c.ok).unwrap_or(false),
+                            Ok(b) => postcard::from_bytes::<PairConfirm>(&b).map(|c| c.ok).unwrap_or(false),
                             Err(_) => false,
                         });
                     }
@@ -2355,7 +2355,7 @@ async fn pair_inviter(
     };
     if !(local_ok && remote_ok) {
         let no = PairAccept { ok: false, psk: Vec::new(), name: node.name.clone() };
-        let _ = net::send_message(stream, transport, &bincode::serialize(&no)?).await;
+        let _ = net::send_message(stream, transport, &postcard::to_allocvec(&no)?).await;
         if !local_ok {
             bail!("pairing cancelled");
         }
@@ -2377,7 +2377,7 @@ async fn pair_inviter(
     }
     node.save_state();
     let reply = PairAccept { ok: true, psk, name: node.name.clone() };
-    net::send_message(stream, transport, &bincode::serialize(&reply)?).await?;
+    net::send_message(stream, transport, &postcard::to_allocvec(&reply)?).await?;
     info!(device = %name, "paired ({})", short(remote_hex));
     node.request_resync();
     Ok(name)
@@ -2455,7 +2455,7 @@ async fn recv_bytes_for(stream: &mut TcpStream, t: &mut snow::TransportState, se
 }
 
 async fn send(wr: &mut OwnedWriteHalf, t: &mut snow::TransportState, msg: &Msg) -> Result<()> {
-    let bytes = bincode::serialize(msg)?;
+    let bytes = postcard::to_allocvec(msg)?;
     tokio::time::timeout(WRITE_TIMEOUT, net::send_message(wr, t, &bytes))
         .await
         .map_err(|_| anyhow!("the other side stopped reading"))?
@@ -2470,8 +2470,8 @@ async fn establish(
     dev: Device,
 ) -> Result<()> {
     let hello = Msg::Hello { name: node.name.clone() };
-    net::send_message(&mut stream, &mut transport, &bincode::serialize(&hello)?).await?;
-    let first: Msg = bincode::deserialize(&recv_bytes(&mut stream, &mut transport).await?)?;
+    net::send_message(&mut stream, &mut transport, &postcard::to_allocvec(&hello)?).await?;
+    let first: Msg = postcard::from_bytes(&recv_bytes(&mut stream, &mut transport).await?)?;
     if !matches!(first, Msg::Hello { .. }) {
         bail!("unexpected first message");
     }
@@ -2595,7 +2595,7 @@ async fn session_loop(
                     Ok(None) => continue,
                     Ok(Some(b)) => b,
                 };
-                let msg: Msg = match bincode::deserialize(&bytes) {
+                let msg: Msg = match postcard::from_bytes(&bytes) {
                     Ok(m) => m,
                     Err(e) => break Err(anyhow::Error::from(e)),
                 };
@@ -2832,7 +2832,7 @@ async fn depot_worker(
 async fn depot_stat(node: &Arc<Node>, remote: &Remote, depot_key: &str, lib: &str) -> Option<(u64, u64)> {
     let lib_s = lib.to_string();
     let raw = remote.call(move |req| Msg::DepotStat { req, lib: lib_s }).await.ok()?;
-    let (used, quota): (u64, u64) = bincode::deserialize(&raw).ok()?;
+    let (used, quota): (u64, u64) = postcard::from_bytes(&raw).ok()?;
     node.set_usage(lib, depot_key, used, quota);
     Some((used, quota))
 }
@@ -2851,7 +2851,7 @@ async fn run_prune(node: &Arc<Node>, remote: &Remote, depot_key: &str, lib: &str
 async fn depot_prune(remote: &Remote, lib: &str, rt: &Arc<LibRuntime>) -> Result<(u64, u64)> {
     let lib_s = lib.to_string();
     let raw = remote.call(move |req| Msg::DepotList { req, lib: lib_s }).await?;
-    let slots: Vec<(String, u64)> = bincode::deserialize(&raw)?;
+    let slots: Vec<(String, u64)> = postcard::from_bytes(&raw)?;
     let mut live: HashSet<String> = HashSet::new();
     for (slot, _) in slots {
         let (lib_s, id) = (lib.to_string(), slot.clone());
@@ -2872,7 +2872,7 @@ async fn depot_prune(remote: &Remote, lib: &str, rt: &Arc<LibRuntime>) -> Result
         let raw = remote
             .call(move |req| Msg::DepotBlobs { req, lib: lib_s, after: after_s, min_age: PRUNE_MIN_AGE_SECS })
             .await?;
-        let page: Vec<(String, u64)> = bincode::deserialize(&raw)?;
+        let page: Vec<(String, u64)> = postcard::from_bytes(&raw)?;
         let Some(last) = page.last() else { break };
         after = last.0.clone();
         let dead: Vec<(String, u64)> = page.iter().filter(|(id, _)| !live.contains(id)).cloned().collect();
@@ -2880,7 +2880,7 @@ async fn depot_prune(remote: &Remote, lib: &str, rt: &Arc<LibRuntime>) -> Result
             let ids: Vec<String> = group.iter().map(|(i, _)| i.clone()).collect();
             let lib_s = lib.to_string();
             let raw = remote.call(move |req| Msg::DepotDelete { req, lib: lib_s, ids }).await?;
-            let n: u64 = bincode::deserialize(&raw)?;
+            let n: u64 = postcard::from_bytes(&raw)?;
             removed += n;
             freed += group.iter().map(|(_, sz)| *sz).sum::<u64>();
         }
@@ -2899,7 +2899,7 @@ async fn depot_pull(
 ) -> Result<()> {
     let lib_s = lib.to_string();
     let raw = remote.call(move |req| Msg::DepotList { req, lib: lib_s }).await?;
-    let list: Vec<(String, u64)> = bincode::deserialize(&raw)?;
+    let list: Vec<(String, u64)> = postcard::from_bytes(&raw)?;
     let local: HashMap<String, u64> = rt
         .folder
         .snapshot()
@@ -2966,7 +2966,7 @@ async fn depot_push(
             let raw = remote
                 .call(move |req| Msg::DepotHave { req, lib: lib_s, ids: ids_c })
                 .await?;
-            let missing: HashSet<String> = bincode::deserialize::<Vec<String>>(&raw)?.into_iter().collect();
+            let missing: HashSet<String> = postcard::from_bytes::<Vec<String>>(&raw)?.into_iter().collect();
 
             let mut complete = true;
             for (i, id) in ids.iter().enumerate() {
@@ -3008,30 +3008,61 @@ async fn depot_push(
 mod tests {
     use super::*;
 
+    /// How postcard writes a number: 7 bits at a time, low bits first.
+    fn varint(mut n: u64) -> Vec<u8> {
+        let mut out = Vec::new();
+        loop {
+            let b = (n & 0x7f) as u8;
+            n >>= 7;
+            if n == 0 {
+                out.push(b);
+                return out;
+            }
+            out.push(b | 0x80);
+        }
+    }
+
     /// A message that merely *claims* to hold an enormous list or string must be refused
     /// quickly: decoding must not try to reserve memory for what the sender says is coming.
     #[test]
     fn huge_declared_lengths_are_refused() {
-        // [u32 variant][u64 length of `shared`] ...
-        let good = bincode::serialize(&Msg::Libraries { shared: vec![], offers: vec![], backups: vec![] }).unwrap();
+        // [variant][length of `shared`][length of `offers`][length of `backups`]
+        let good = postcard::to_allocvec(&Msg::Libraries { shared: vec![], offers: vec![], backups: vec![] }).unwrap();
+        assert_eq!(good.len(), 4);
         for len in [u64::MAX, 1u64 << 40, 1u64 << 32] {
-            let mut bad = good.clone();
-            bad[4..12].copy_from_slice(&len.to_le_bytes());
-            assert!(bincode::deserialize::<Msg>(&bad).is_err(), "list of {} accepted", len);
+            let mut bad = vec![good[0]];
+            bad.extend(varint(len));
+            bad.extend_from_slice(&good[2..]);
+            assert!(postcard::from_bytes::<Msg>(&bad).is_err(), "list of {} accepted", len);
         }
-        // [u32 variant][u64 req][u8 Some][u64 length of the bytes] ...
-        let good = bincode::serialize(&Msg::Chunk { req: 1, data: Some(vec![1, 2, 3]) }).unwrap();
+        // [variant][req][Some][length of the bytes][bytes]
+        let good = postcard::to_allocvec(&Msg::Chunk { req: 1, data: Some(vec![1, 2, 3]) }).unwrap();
+        assert_eq!(good.len(), 7);
         for len in [u64::MAX, 1u64 << 40] {
-            let mut bad = good.clone();
-            bad[13..21].copy_from_slice(&len.to_le_bytes());
-            assert!(bincode::deserialize::<Msg>(&bad).is_err(), "byte string of {} accepted", len);
+            let mut bad = good[..3].to_vec();
+            bad.extend(varint(len));
+            bad.extend_from_slice(&good[4..]);
+            assert!(postcard::from_bytes::<Msg>(&bad).is_err(), "byte string of {} accepted", len);
         }
-        // [u32 variant][u64 length of the name] ...
-        let good = bincode::serialize(&Msg::Hello { name: "x".to_string() }).unwrap();
-        let mut bad = good.clone();
-        bad[4..12].copy_from_slice(&(1u64 << 40).to_le_bytes());
-        assert!(bincode::deserialize::<Msg>(&bad).is_err());
+        // [variant][length of the name][name]
+        let good = postcard::to_allocvec(&Msg::Hello { name: "x".to_string() }).unwrap();
+        assert_eq!(good.len(), 3);
+        let mut bad = vec![good[0]];
+        bad.extend(varint(1u64 << 40));
+        bad.extend_from_slice(&good[2..]);
+        assert!(postcard::from_bytes::<Msg>(&bad).is_err());
         // and the honest versions still decode
-        assert!(bincode::deserialize::<Msg>(&good).is_ok());
+        assert!(postcard::from_bytes::<Msg>(&good).is_ok());
+    }
+
+    /// Garbage and cut-off messages are errors, never panics.
+    #[test]
+    fn truncated_and_garbage_messages_are_refused() {
+        let good = postcard::to_allocvec(&Msg::Index { lib: "abc".to_string(), entries: vec![] }).unwrap();
+        for cut in 0..good.len() {
+            assert!(postcard::from_bytes::<Msg>(&good[..cut]).is_err(), "cut at {} accepted", cut);
+        }
+        assert!(postcard::from_bytes::<Msg>(&[0xff; 64]).is_err());
+        assert!(postcard::from_bytes::<Msg>(&[]).is_err());
     }
 }

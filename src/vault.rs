@@ -13,6 +13,70 @@ use anyhow::{anyhow, bail, Result};
 use chacha20poly1305::aead::{Aead, KeyInit, Payload};
 use chacha20poly1305::{XChaCha20Poly1305, XNonce};
 
+/// New records start with this, so records written by older versions (which have a different
+/// layout) can still be read.
+const RECORD_MAGIC: [u8; 4] = [0, b'r', b's', 2];
+
+/// Read a record the way versions before 0.6 wrote it (a fixed-width binary layout: 8-byte
+/// lengths, 4-byte enum numbers, little endian). Only used to read old backups; every record
+/// is written in the new layout the next time it changes.
+fn legacy_entry(b: &[u8]) -> Result<Entry> {
+    struct R<'a>(&'a [u8]);
+    impl<'a> R<'a> {
+        fn take(&mut self, n: usize) -> Result<&'a [u8]> {
+            if self.0.len() < n {
+                bail!("the record is damaged");
+            }
+            let (a, rest) = self.0.split_at(n);
+            self.0 = rest;
+            Ok(a)
+        }
+        fn u32(&mut self) -> Result<u32> {
+            Ok(u32::from_le_bytes(self.take(4)?.try_into().unwrap()))
+        }
+        fn u64(&mut self) -> Result<u64> {
+            Ok(u64::from_le_bytes(self.take(8)?.try_into().unwrap()))
+        }
+        fn bool(&mut self) -> Result<bool> {
+            match self.take(1)?[0] {
+                0 => Ok(false),
+                1 => Ok(true),
+                _ => bail!("the record is damaged"),
+            }
+        }
+        fn string(&mut self) -> Result<String> {
+            let n = self.u64()?;
+            if n > self.0.len() as u64 {
+                bail!("the record is damaged");
+            }
+            Ok(String::from_utf8(self.take(n as usize)?.to_vec())?)
+        }
+    }
+    let mut r = R(b);
+    let path = r.string()?;
+    let kind = match r.u32()? {
+        0 => crate::index::Kind::File,
+        1 => crate::index::Kind::Dir,
+        _ => bail!("the record is damaged"),
+    };
+    let deleted = r.bool()?;
+    let mode = r.u32()?;
+    let size = r.u64()?;
+    let mtime_ns = r.u64()?;
+    let stamp = r.u64()?;
+    let hash = r.string()?;
+    let n = r.u64()?;
+    // each chunk name takes at least 8 bytes
+    if n > (r.0.len() / 8) as u64 {
+        bail!("the record is damaged");
+    }
+    let mut chunks = Vec::new();
+    for _ in 0..n {
+        chunks.push(r.string()?);
+    }
+    Ok(Entry { path, kind, deleted, mode, size, mtime_ns, stamp, hash, chunks })
+}
+
 pub struct Vault {
     blobs: XChaCha20Poly1305,
     records: XChaCha20Poly1305,
@@ -160,15 +224,93 @@ impl Vault {
     }
 
     pub fn seal_record(&self, slot: &str, e: &Entry) -> Result<Vec<u8>> {
-        Ok(seal(&self.records, slot.as_bytes(), &bincode::serialize(e)?))
+        let mut plain = RECORD_MAGIC.to_vec();
+        plain.extend(postcard::to_allocvec(e)?);
+        Ok(seal(&self.records, slot.as_bytes(), &plain))
     }
 
     pub fn open_record(&self, slot: &str, sealed: &[u8]) -> Result<Entry> {
         let plain = open(&self.records, slot.as_bytes(), sealed)?;
-        let e: Entry = bincode::deserialize(&plain)?;
+        let e: Entry = match plain.strip_prefix(&RECORD_MAGIC[..]) {
+            Some(rest) => postcard::from_bytes(rest)?,
+            // Written by an older version.
+            None => legacy_entry(&plain)?,
+        };
         if self.slot(&e.path) != slot {
             bail!("the depot returned a record for the wrong path");
         }
         Ok(e)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::index::Kind;
+
+    fn entry() -> Entry {
+        Entry {
+            path: "docs/a.txt".to_string(),
+            kind: Kind::File,
+            deleted: false,
+            mode: 0o644,
+            size: 5,
+            mtime_ns: 7,
+            stamp: 9,
+            hash: "ab".repeat(32),
+            chunks: vec!["cd".repeat(32), "ef".repeat(32)],
+        }
+    }
+
+    /// A record as versions before 0.6 stored it.
+    fn old_layout(e: &Entry) -> Vec<u8> {
+        let mut b = Vec::new();
+        let s = |b: &mut Vec<u8>, t: &str| {
+            b.extend((t.len() as u64).to_le_bytes());
+            b.extend(t.as_bytes());
+        };
+        s(&mut b, &e.path);
+        b.extend(0u32.to_le_bytes());
+        b.push(e.deleted as u8);
+        b.extend(e.mode.to_le_bytes());
+        b.extend(e.size.to_le_bytes());
+        b.extend(e.mtime_ns.to_le_bytes());
+        b.extend(e.stamp.to_le_bytes());
+        s(&mut b, &e.hash);
+        b.extend((e.chunks.len() as u64).to_le_bytes());
+        for c in &e.chunks {
+            s(&mut b, c);
+        }
+        b
+    }
+
+    #[test]
+    fn records_round_trip_and_old_ones_still_open() {
+        let v = Vault::new(&[7u8; 32]);
+        let e = entry();
+        let slot = v.slot(&e.path);
+        let back = v.open_record(&slot, &v.seal_record(&slot, &e).unwrap()).unwrap();
+        assert_eq!(back.path, e.path);
+        assert_eq!(back.chunks, e.chunks);
+        assert_eq!(back.stamp, 9);
+
+        let old = seal(&v.records, slot.as_bytes(), &old_layout(&e));
+        let back = v.open_record(&slot, &old).unwrap();
+        assert_eq!(back.path, e.path);
+        assert_eq!(back.hash, e.hash);
+        assert_eq!(back.chunks, e.chunks);
+        assert_eq!(back.mode, 0o644);
+        assert_eq!(back.mtime_ns, 7);
+    }
+
+    #[test]
+    fn damaged_old_records_are_errors() {
+        let b = old_layout(&entry());
+        for cut in 0..b.len() {
+            assert!(legacy_entry(&b[..cut]).is_err(), "cut at {} accepted", cut);
+        }
+        let mut huge = b.clone();
+        huge[..8].copy_from_slice(&u64::MAX.to_le_bytes());
+        assert!(legacy_entry(&huge).is_err());
     }
 }

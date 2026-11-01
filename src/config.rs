@@ -1,7 +1,7 @@
 //! The config file. Everything in it is optional: devices and libraries are not configured
 //! here, they are managed with commands and kept in the state directory.
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
 
@@ -32,9 +32,9 @@ pub struct Config {
 
     // Old config format: still parsed so we can tell the user it is ignored.
     #[serde(default)]
-    folders: Option<serde_yaml::Value>,
+    folders: Option<toml::Value>,
     #[serde(default)]
-    peers: Option<serde_yaml::Value>,
+    peers: Option<toml::Value>,
 
     /// The resolved state directory (filled in by `load`).
     #[serde(skip)]
@@ -152,11 +152,11 @@ pub fn abs_path(p: &Path) -> PathBuf {
     }
 }
 
-/// Used when you run `rustsync` without `-c`: ~/.config/rustsync/config.yaml
+/// Used when you run `rustsync` without `-c`: ~/.config/rustsync/config.toml
 pub fn default_config_path() -> PathBuf {
     match std::env::var("HOME") {
-        Ok(h) if !h.is_empty() => Path::new(&h).join(".config").join("rustsync").join("config.yaml"),
-        _ => PathBuf::from("rustsync.yaml"),
+        Ok(h) if !h.is_empty() => Path::new(&h).join(".config").join("rustsync").join("config.toml"),
+        _ => PathBuf::from("rustsync.toml"),
     }
 }
 
@@ -188,14 +188,15 @@ fn os_hostname() -> Option<String> {
     }
 }
 
-/// `<config path without extension>.state`, e.g. alpha.yaml -> alpha.state
+/// `<config path without extension>.state`, e.g. alpha.toml -> alpha.state
 fn default_state_dir(config_path: &Path) -> PathBuf {
     let stem = abs_path(config_path).with_extension("");
     crate::net::sibling(&stem, ".state")
 }
 
+/// A string as a TOML value, quoted and escaped.
 fn q(s: &str) -> String {
-    format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""))
+    toml::Value::String(s.to_string()).to_string()
 }
 
 /// Write a minimal config file.
@@ -207,13 +208,13 @@ pub fn write_default(path: &Path, port: u16) -> Result<()> {
         "#   rustsync -c {} status | invite | join | create | share | accept\n\n",
         path.display()
     ));
-    y.push_str(&format!("name: {}\n\n", q(&hostname())));
-    y.push_str(&format!("server:\n  port: {}\n\n", port));
+    y.push_str(&format!("name = {}\n\n", q(&hostname())));
     y.push_str("# Other devices can keep encrypted backups on this machine. You pick the folder for each\n");
     y.push_str("# one when you accept it (`rustsync accept`); this is just the suggested location:\n");
-    y.push_str("# backup_dir: /mnt/bigdrive/rustsync-backups\n");
-    y.push_str("# accept_backups: true      # false = never show backup offers\n\n");
-    y.push_str("sync_options:\n  full_scan_interval: 30\n\nlogging:\n  level: info\n");
+    y.push_str("# backup_dir = \"/mnt/bigdrive/rustsync-backups\"\n");
+    y.push_str("# accept_backups = true      # false = never show backup offers\n\n");
+    y.push_str(&format!("[server]\nport = {}\n\n", port));
+    y.push_str("[sync_options]\nfull_scan_interval = 30\n\n[logging]\nlevel = \"info\"\n");
     if let Some(parent) = path.parent() {
         if !parent.as_os_str().is_empty() {
             std::fs::create_dir_all(parent)
@@ -223,11 +224,183 @@ pub fn write_default(path: &Path, port: u16) -> Result<()> {
     std::fs::write(path, y).with_context(|| format!("cannot write {}", path.display()))
 }
 
+/// Which file to use for a config path. Versions before 0.6 kept the config in YAML; if the path
+/// names a `.yaml`/`.yml` file (or the `.toml` next to an old `.yaml` is missing), the old file is
+/// converted once to a `.toml` next to it (comments kept) and that is used from then on. The old
+/// file is left alone and no longer read.
+pub fn resolve(path: &Path) -> Result<PathBuf> {
+    let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();
+    let toml_path = if ext == "yaml" || ext == "yml" { path.with_extension("toml") } else { path.to_path_buf() };
+    if toml_path.exists() {
+        return Ok(toml_path);
+    }
+    let old = [path.to_path_buf(), toml_path.with_extension("yaml"), toml_path.with_extension("yml")]
+        .into_iter()
+        .find(|p| p.is_file() && p != &toml_path);
+    if let Some(old) = old {
+        convert_yaml_file(&old, &toml_path)?;
+    }
+    Ok(toml_path)
+}
+
+fn convert_yaml_file(old: &Path, new: &Path) -> Result<()> {
+    let text = std::fs::read_to_string(old).with_context(|| format!("cannot read config {}", old.display()))?;
+    let converted = yaml_to_toml(&text).with_context(|| format!("cannot convert {} to TOML", old.display()))?;
+    if let Err(e) = toml::from_str::<Config>(&converted) {
+        bail!(
+            "cannot convert {} to TOML ({}). Write {} by hand: the README shows what it looks like.",
+            old.display(),
+            e.message(),
+            new.display()
+        );
+    }
+    let tmp = new.with_extension("toml.tmp");
+    std::fs::write(&tmp, converted)?;
+    std::fs::rename(&tmp, new)?;
+    eprintln!(
+        "note: the config format changed to TOML. {} was converted to {}; the old file is no longer used.",
+        old.display(),
+        new.display()
+    );
+    Ok(())
+}
+
+/// Convert the (simple) YAML config files rustsync used to read into TOML: `key: value` lines,
+/// one level of sections, comments. The old `folders`/`peers` sections are dropped.
+fn yaml_to_toml(yaml: &str) -> Result<String> {
+    // TOML wants the plain keys first and the [tables] after them; YAML does not.
+    let (mut top, mut tables, mut pending) = (String::new(), String::new(), String::new());
+    let (mut in_table, mut skipping) = (false, false);
+    for (n, raw) in yaml.lines().enumerate() {
+        let line = raw.trim();
+        if line.is_empty() || line.starts_with('#') {
+            pending.push_str(line);
+            pending.push('\n');
+            continue;
+        }
+        if line == "---" || line == "..." {
+            continue;
+        }
+        let indent = raw.len() - raw.trim_start().len();
+        if skipping && (indent > 0 || line == "-" || line.starts_with("- ")) {
+            continue;
+        }
+        let colon = line.find(':').ok_or_else(|| anyhow!("line {}: expected `key: value`", n + 1))?;
+        let key = line[..colon].trim();
+        let rest = strip_yaml_comment(&line[colon + 1..]).trim().to_string();
+        if key.is_empty() || !key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-') {
+            bail!("line {}: cannot convert the key `{}`", n + 1, key);
+        }
+        if indent == 0 {
+            skipping = false;
+            in_table = false;
+            if rest.is_empty() || rest.starts_with('{') {
+                if key == "folders" || key == "peers" {
+                    skipping = true;
+                    pending.clear();
+                    continue;
+                }
+                in_table = true;
+                tables.push_str(&std::mem::take(&mut pending));
+                tables.push_str(&format!("[{}]\n", key));
+                if let Some(flow) = rest.strip_prefix('{') {
+                    let inner = flow.strip_suffix('}').ok_or_else(|| anyhow!("line {}: cannot convert `{}`", n + 1, rest))?;
+                    for item in inner.split(',').filter(|i| !i.trim().is_empty()) {
+                        let (k, v) = item.split_once(':').ok_or_else(|| anyhow!("line {}: cannot convert `{}`", n + 1, item.trim()))?;
+                        if let Some(v) = yaml_scalar(v.trim(), n + 1)? {
+                            tables.push_str(&format!("{} = {}\n", k.trim(), v));
+                        }
+                    }
+                    in_table = false;
+                }
+            } else if key == "folders" || key == "peers" {
+                pending.clear();
+            } else if let Some(v) = yaml_scalar(&rest, n + 1)? {
+                top.push_str(&std::mem::take(&mut pending));
+                top.push_str(&format!("{} = {}\n", key, v));
+            }
+        } else {
+            if !in_table {
+                bail!("line {}: cannot convert this nesting", n + 1);
+            }
+            if rest.is_empty() {
+                bail!("line {}: cannot convert nested sections", n + 1);
+            }
+            if let Some(v) = yaml_scalar(&rest, n + 1)? {
+                tables.push_str(&std::mem::take(&mut pending));
+                tables.push_str(&format!("{} = {}\n", key, v));
+            }
+        }
+    }
+    let mut out = top;
+    if !out.is_empty() && !tables.is_empty() && !out.ends_with("\n\n") {
+        out.push('\n');
+    }
+    out.push_str(&tables);
+    if !pending.trim().is_empty() {
+        out.push_str(&pending);
+    }
+    Ok(out)
+}
+
+/// `value  # comment` -> `value  ` (a `#` inside quotes is not a comment).
+fn strip_yaml_comment(s: &str) -> &str {
+    let (mut single, mut double, mut prev) = (false, false, ' ');
+    let mut escaped = false;
+    for (i, c) in s.char_indices() {
+        if double && escaped {
+            escaped = false;
+        } else if double && c == '\\' {
+            escaped = true;
+        } else if c == '"' && !single {
+            double = !double;
+        } else if c == '\'' && !double {
+            single = !single;
+        } else if c == '#' && !single && !double && prev.is_whitespace() {
+            return &s[..i];
+        }
+        prev = c;
+    }
+    s
+}
+
+/// One YAML value as TOML text (None for null).
+fn yaml_scalar(v: &str, line: usize) -> Result<Option<String>> {
+    if v == "null" || v == "~" || v.is_empty() {
+        return Ok(None);
+    }
+    if v.starts_with('"') {
+        if v.len() < 2 || !v.ends_with('"') {
+            bail!("line {}: cannot convert `{}`", line, v);
+        }
+        return Ok(Some(v.to_string()));
+    }
+    if let Some(inner) = v.strip_prefix('\'') {
+        let inner = inner.strip_suffix('\'').ok_or_else(|| anyhow!("line {}: cannot convert `{}`", line, v))?;
+        return Ok(Some(q(&inner.replace("''", "'"))));
+    }
+    if v.starts_with('[') || v.starts_with('{') || v.starts_with('&') || v.starts_with('*') || v.starts_with('|') || v.starts_with('>') {
+        bail!("line {}: cannot convert `{}`", line, v);
+    }
+    if v == "true" || v == "false" {
+        return Ok(Some(v.to_string()));
+    }
+    if let Ok(i) = v.parse::<i64>() {
+        return Ok(Some(i.to_string()));
+    }
+    if v.chars().all(|c| c.is_ascii_digit() || matches!(c, '.' | '-' | 'e' | 'E' | '+')) {
+        if let Ok(f) = v.parse::<f64>() {
+            return Ok(Some(f.to_string()));
+        }
+    }
+    Ok(Some(q(v)))
+}
+
 pub fn load(path: &Path) -> Result<Config> {
     let text = std::fs::read_to_string(path)
         .with_context(|| format!("cannot read config {}", path.display()))?;
     let mut cfg: Config =
-        serde_yaml::from_str(&text).with_context(|| format!("invalid config {}", path.display()))?;
+        toml::from_str(&text).with_context(|| format!("invalid config {}", path.display()))?;
     if cfg.folders.is_some() || cfg.peers.is_some() {
         eprintln!(
             "note: `folders` and `peers` in {} are no longer used. Pair machines with `invite`/`join` and share folders with `create`/`share`.",
@@ -245,61 +418,29 @@ pub fn load(path: &Path) -> Result<Config> {
 /// Write a new listening port into the config file, keeping the rest of the file (comments and
 /// all) as it is.
 pub fn set_port(path: &Path, port: u16) -> Result<()> {
-    set_in_section(path, "server", "port", &port.to_string(), serde_yaml::Value::from(port as u64))
+    set_in_section(path, "server", "port", toml_edit::value(port as i64))
 }
 
 /// Write a new size limit for the logs (e.g. `5MB`) into the config file.
 pub fn set_log_size(path: &Path, bytes: u64) -> Result<()> {
     let text = if bytes % 1_000_000 == 0 { format!("{}MB", bytes / 1_000_000) } else { bytes.to_string() };
-    set_in_section(path, "logging", "max_size", &text, serde_yaml::Value::from(text.clone()))
+    set_in_section(path, "logging", "max_size", toml_edit::value(text))
 }
 
-/// Set `section: key: value` in the config file, keeping the rest of the file (comments and all)
-/// as it is.
-fn set_in_section(path: &Path, section: &str, key: &str, value: &str, yaml_value: serde_yaml::Value) -> Result<()> {
+/// Set `[section] key = value` in the config file, keeping the rest of the file (comments and
+/// all) as it is.
+fn set_in_section(path: &Path, section: &str, key: &str, value: toml_edit::Item) -> Result<()> {
     let text = std::fs::read_to_string(path).with_context(|| format!("cannot read config {}", path.display()))?;
-    // `server: {port: 1}` and the like: rewrite the whole file (comments are lost).
-    if text.lines().any(|l| {
-        l.starts_with(&format!("{}:", section)) && !l[section.len() + 1..].trim_start().is_empty() && !l[section.len() + 1..].trim_start().starts_with('#')
-    }) {
-        let mut doc: serde_yaml::Value = serde_yaml::from_str(&text)?;
-        let map = doc.as_mapping_mut().ok_or_else(|| anyhow!("the config file is not a mapping"))?;
-        let section_key = serde_yaml::Value::from(section);
-        let mut server = map.get(&section_key).cloned().unwrap_or(serde_yaml::Value::Mapping(Default::default()));
-        if let Some(m) = server.as_mapping_mut() {
-            m.insert(serde_yaml::Value::from(key), yaml_value.clone());
-        }
-        map.insert(section_key, server);
-        std::fs::write(path, serde_yaml::to_string(&doc)?)?;
-        return Ok(());
+    let mut doc: toml_edit::DocumentMut = text.parse().with_context(|| format!("invalid config {}", path.display()))?;
+    if !doc.contains_key(section) {
+        doc[section] = toml_edit::table();
     }
-    let mut out: Vec<String> = Vec::new();
-    let (mut in_server, mut done) = (false, false);
-    for line in text.lines() {
-        let indented = line.starts_with(' ') || line.starts_with('\t');
-        if !indented && !line.trim().is_empty() && !line.trim_start().starts_with('#') {
-            if in_server && !done {
-                out.push(format!("  {}: {}", key, value));
-                done = true;
-            }
-            in_server = line.trim_end() == format!("{}:", section);
-        } else if in_server && !done && line.trim_start().starts_with(&format!("{}:", key)) {
-            out.push(format!("  {}: {}", key, value));
-            done = true;
-            continue;
-        }
-        out.push(line.to_string());
-    }
-    if in_server && !done {
-        out.push(format!("  {}: {}", key, value));
-        done = true;
-    }
-    if !done {
-        out.push(format!("{}:", section));
-        out.push(format!("  {}: {}", key, value));
-    }
-    let tmp = path.with_extension("yaml.tmp");
-    std::fs::write(&tmp, out.join("\n") + "\n")?;
+    let table = doc[section]
+        .as_table_like_mut()
+        .ok_or_else(|| anyhow!("`{}` in the config file is not a table", section))?;
+    table.insert(key, value);
+    let tmp = path.with_extension("toml.tmp");
+    std::fs::write(&tmp, doc.to_string())?;
     std::fs::rename(&tmp, path)?;
     Ok(())
 }
@@ -408,5 +549,79 @@ impl Config {
             .map_err(|e| anyhow!("cannot create {}: {}", self.dir.display(), e))?;
         let _ = std::fs::set_permissions(&self.dir, std::fs::Permissions::from_mode(0o700));
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn old_yaml_configs_convert() {
+        let yaml = "# my config\nname: \"my box\"   # shown to others\nserver: {port: 3040, host: 127.0.0.1}\nlogging:\n  level: debug\n  max_size: 5MB # logs\nstate_dir: /var/lib/rs\nsync_options:\n  full_scan_interval: 60\nfolders:\n  - path: /x\n    name: y\npeers:\n- a\n";
+        let toml = yaml_to_toml(yaml).unwrap();
+        let cfg: Config = toml::from_str(&toml).unwrap();
+        assert_eq!(cfg.name.as_deref(), Some("my box"));
+        assert_eq!(cfg.server.port, 3040);
+        assert_eq!(cfg.server.host, "127.0.0.1");
+        assert_eq!(cfg.logging.level, "debug");
+        assert_eq!(cfg.logging.max_bytes(), 5_000_000);
+        assert_eq!(cfg.state_dir.as_deref(), Some("/var/lib/rs"));
+        assert_eq!(cfg.sync_options.full_scan_interval, 60);
+        assert!(cfg.folders.is_none() && cfg.peers.is_none());
+        assert!(toml.contains("# my config"));
+    }
+
+    #[test]
+    fn yaml_that_cannot_be_converted_is_an_error() {
+        assert!(yaml_to_toml("server:\n  nested:\n    deeper: 1\n").is_err());
+        assert!(yaml_to_toml("name: [a, b]\n").is_err());
+        assert!(yaml_to_toml("just words\n").is_err());
+    }
+
+    #[test]
+    fn quoting_survives() {
+        let toml = yaml_to_toml("name: it's 'fine'\nstate_dir: 'C:\\x'\n").unwrap();
+        let cfg: Config = toml::from_str(&toml).unwrap();
+        assert_eq!(cfg.name.as_deref(), Some("it's 'fine'"));
+        assert_eq!(cfg.state_dir.as_deref(), Some("C:\\x"));
+    }
+
+    #[test]
+    fn edits_keep_comments_and_add_missing_sections() {
+        let dir = std::env::temp_dir().join(format!("rustsync-cfgtest-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("c.toml");
+        std::fs::write(&path, "# keep me\nname = \"a\"\n\n[server]\nport = 1 # old\n").unwrap();
+        set_port(&path, 4000).unwrap();
+        set_log_size(&path, 5_000_000).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("# keep me"));
+        let cfg = load(&path).unwrap();
+        assert_eq!(cfg.server.port, 4000);
+        assert_eq!(cfg.logging.max_size, "5MB");
+        assert_eq!(cfg.name.as_deref(), Some("a"));
+        // inline tables work too
+        std::fs::write(&path, "server = { port = 1 }\n").unwrap();
+        set_port(&path, 5000).unwrap();
+        assert_eq!(load(&path).unwrap().server.port, 5000);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn resolve_converts_once() {
+        let dir = std::env::temp_dir().join(format!("rustsync-restest-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a.yaml"), "name: a\nserver:\n  port: 3033\n").unwrap();
+        let got = resolve(&dir.join("a.yaml")).unwrap();
+        assert_eq!(got, dir.join("a.toml"));
+        assert_eq!(load(&got).unwrap().server.port, 3033);
+        // a newer .toml wins over the old file
+        std::fs::write(dir.join("a.toml"), "name = \"b\"\n").unwrap();
+        assert_eq!(resolve(&dir.join("a.yaml")).unwrap(), dir.join("a.toml"));
+        assert_eq!(load(&dir.join("a.toml")).unwrap().name.as_deref(), Some("b"));
+        // nothing there: the .toml path to create
+        assert_eq!(resolve(&dir.join("new.yaml")).unwrap(), dir.join("new.toml"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

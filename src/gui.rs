@@ -4,11 +4,11 @@
 //! the same local control socket (JSON lines) that `rustsync status | invite | join | create |
 //! share | accept ...` use. Close this window and the service keeps syncing.
 //!
-//! Usage:  rustsync-gui [-c /path/to/config.yaml] [--tray | --no-tray]
+//! Usage:  rustsync-gui [-c /path/to/config.toml] [--tray | --no-tray]
 //!   --tray     only the tray icon (the menu bar icon on macOS), no window (start this at login;
 //!              the icon opens the window)
 //!   --no-tray  window only; do not start the tray icon
-//! (default config: ~/.config/rustsync/config.yaml, like the command line)
+//! (default config: ~/.config/rustsync/config.toml, like the command line)
 
 // Some helpers (the tray icon, the XDG launcher) are only used on some systems.
 #![allow(dead_code)]
@@ -256,7 +256,7 @@ fn home() -> PathBuf {
 }
 
 fn default_config() -> PathBuf {
-    home().join(".config").join("rustsync").join("config.yaml")
+    home().join(".config").join("rustsync").join("config.toml")
 }
 
 /// None for the default config, otherwise a short name made from its path (the same rule as
@@ -354,7 +354,7 @@ fn absolute(p: &Path) -> PathBuf {
 /// file, otherwise `<config path without extension>.state`, exactly like the service.
 fn state_dir(config: &Path) -> PathBuf {
     if let Ok(text) = std::fs::read_to_string(config) {
-        if let Ok(v) = serde_yaml::from_str::<serde_yaml::Value>(&text) {
+        if let Ok(v) = text.parse::<toml::Table>() {
             if let Some(d) = v.get("state_dir").and_then(|d| d.as_str()) {
                 return absolute(Path::new(d));
             }
@@ -3624,7 +3624,9 @@ fn config_from_args() -> PathBuf {
 }
 
 fn main() -> eframe::Result<()> {
-    let config = absolute(&config_from_args());
+    // A config from before 0.6 is YAML: convert it once (the same as the program does).
+    let wanted = absolute(&config_from_args());
+    let config = rustsync::config::resolve(&wanted).unwrap_or(wanted);
     let args: Vec<String> = std::env::args().collect();
     let flag = |f: &str| args.iter().any(|a| a == f);
 

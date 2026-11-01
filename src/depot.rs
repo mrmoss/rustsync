@@ -359,7 +359,7 @@ impl Depot {
                     _ => None,
                 }
             }
-            Msg::DepotList { .. } => bincode::serialize(&self.list()).ok(),
+            Msg::DepotList { .. } => postcard::to_allocvec(&self.list()).ok(),
             Msg::DepotHave { ids, .. } => {
                 let mut missing: Vec<String> = Vec::new();
                 for id in ids {
@@ -367,20 +367,20 @@ impl Depot {
                         missing.push(id);
                     }
                 }
-                bincode::serialize(&missing).ok()
+                postcard::to_allocvec(&missing).ok()
             }
-            Msg::DepotStat { .. } => bincode::serialize(&(self.used(), self.quota())).ok(),
+            Msg::DepotStat { .. } => postcard::to_allocvec(&(self.used(), self.quota())).ok(),
             Msg::DepotBlobs { after, min_age, .. } => {
                 if after.len() > 64 || !after.chars().all(|c| c.is_ascii_hexdigit()) {
                     return None;
                 }
-                bincode::serialize(&self.old_blobs(after.to_lowercase(), min_age).await).ok()
+                postcard::to_allocvec(&self.old_blobs(after.to_lowercase(), min_age).await).ok()
             }
             Msg::DepotDelete { ids, .. } => {
                 if ids.len() > MAX_DELETE {
                     return None;
                 }
-                bincode::serialize(&self.delete_blobs(ids).await).ok()
+                postcard::to_allocvec(&self.delete_blobs(ids).await).ok()
             }
             _ => None,
         }

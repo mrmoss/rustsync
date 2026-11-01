@@ -32,15 +32,16 @@ fn start_daemon(dir: &Path, name: &str, port: u16) -> anyhow::Result<()> {
         }
     }
     std::fs::create_dir_all(dir)?;
-    let cfg_path = dir.join("config.yaml");
+    // An app from before 0.6 has a YAML config: convert it once.
+    let cfg_path = config::resolve(&dir.join("config.toml"))?;
     if !cfg_path.exists() {
-        let yaml = format!(
-            "name: {}\nstate_dir: {}\nserver:\n  port: {}\nsync_options:\n  full_scan_interval: 60\nlogging:\n  level: info\n",
-            serde_yaml::to_string(name)?.trim(),
-            serde_yaml::to_string(&state_dir(dir).to_string_lossy())?.trim(),
+        let text = format!(
+            "name = {}\nstate_dir = {}\n\n[server]\nport = {}\n\n[sync_options]\nfull_scan_interval = 60\n\n[logging]\nlevel = \"info\"\n",
+            toml::Value::String(name.to_string()),
+            toml::Value::String(state_dir(dir).to_string_lossy().into_owned()),
             port
         );
-        std::fs::write(&cfg_path, yaml)?;
+        std::fs::write(&cfg_path, text)?;
     }
     let cfg = config::load(&cfg_path)?;
     cfg.ensure_dir()?;

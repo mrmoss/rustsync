@@ -328,13 +328,13 @@ the only accent (the Android app also has a light version that follows the phone
 paths and sizes), not captured from a real session, so details such as fonts will differ a little on
 your machine.</sub>
 
-The window uses `~/.config/rustsync/config.yaml` unless you give it another config with
-`-c /path/to/config.yaml`, the same as the command line.
+The window uses `~/.config/rustsync/config.toml` unless you give it another config with
+`-c /path/to/config.toml`, the same as the command line.
 
 ## All commands
 
 Run `rustsync --help` (or `rustsync <command> --help`) for the full details. Every command takes
-`-c <config.yaml>` to pick a config file; the default is `~/.config/rustsync/config.yaml`. Anything
+`-c <config.toml>` to pick a config file; the default is `~/.config/rustsync/config.toml`. Anything
 you leave out is listed and asked for.
 
 ```
@@ -416,7 +416,7 @@ The first time you run `rustsync start` in a terminal it offers this too (once).
   to the desktop. On a **server** with no desktop, the simplest way is cron: run `crontab -e` and add
 
   ```
-  @reboot /usr/local/bin/rustsync -c /home/me/.config/rustsync/config.yaml start
+  @reboot /usr/local/bin/rustsync -c /home/me/.config/rustsync/config.toml start
   ```
 
   (use your own paths, and run `rustsync start` once by hand first so the config exists).
@@ -654,23 +654,31 @@ empty.) The window has the same: *Recovery kit…* and *Restore from backup…* 
 You rarely need to touch it: devices and libraries are **not** stored in the config file, you
 manage them with the commands above. Everything in it is optional:
 
-```yaml
-name: laptop              # what other devices call this one (default: the host name)
+```toml
+name = "laptop"           # what other devices call this one (default: the host name)
 
-server:
-  port: 3032              # port to listen on (or use `rustsync set-port`, or Settings > Network)
+# state_dir = "/somewhere/else"        # where keys, pairings and indexes live
+# backup_dir = "/mnt/big/backups"      # suggested place for encrypted backups kept on this machine
+# accept_backups = true                # show offers to keep encrypted backups here
 
-sync_options:
-  full_scan_interval: 30  # seconds between full re-scans (changes are also noticed instantly)
+[server]
+port = 3032               # port to listen on (or use `rustsync set-port`, or Settings > Network)
 
-logging:
-  level: info             # debug / info / warn / error
-  max_size: 2MB           # most the logs may use (or use `rustsync set-log-size`, or Settings > Logs)
+[sync_options]
+full_scan_interval = 30   # seconds between full re-scans (changes are also noticed instantly)
 
-# state_dir: /somewhere/else        # where keys, pairings and indexes live
-# backup_dir: /mnt/big/backups      # suggested place for encrypted backups kept on this machine
-# accept_backups: true              # show offers to keep encrypted backups here
+[logging]
+level = "info"            # debug / info / warn / error
+max_size = "2MB"          # most the logs may use (or use `rustsync set-log-size`, or Settings > Logs)
 ```
+
+**Upgrading from before 0.6.** The config used to be YAML (`config.yaml`). The first time a newer
+version starts with an old one it writes a `config.toml` next to it with the same settings and
+comments, and uses that from then on; the old file is left where it is and is no longer read. The
+same version also changed the messages devices send each other, so **all your devices must be
+updated**: an old and a new version refuse to connect to each other (nothing is lost or
+corrupted; they just do not talk until both are updated). Encrypted backups made by older versions
+are still readable.
 
 **Logs.** rustsync keeps a short history in the state directory as plain text, `activity.log`
 (when it grows past half the limit it is moved to `activity.log.1` and the older one is dropped, so
@@ -686,7 +694,7 @@ library say which:
 so on a server `tail -f`, `grep 'device="laptop"'` and `rustsync log --device laptop` all work.
 Times are UTC. `rustsync log --path` prints where the files are.
 
-**Where things live:** the config is `~/.config/rustsync/config.yaml`. Keys, pairings, library
+**Where things live:** the config is `~/.config/rustsync/config.toml`. Keys, pairings, library
 information and the log (`daemon.log`) live in the *state directory*, which sits next to the config
 file (`config.state/` for the default one) unless you set `state_dir`. Your library folders are
 wherever you chose; rustsync only keeps its own bookkeeping in the state directory.

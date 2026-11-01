@@ -5,6 +5,7 @@
 /testing
 /docker-data
 *.yaml
+/*_config.toml
 *.yml
 *.sh
 .vscode

@@ -19,7 +19,9 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 
 const PARAMS: &str = "Noise_XXpsk0_25519_ChaChaPoly_BLAKE2s";
-const PROLOGUE: &[u8] = b"rustsync/3";
+// Part of the key exchange: devices that speak a different message format (this changes with the
+// protocol version) cannot complete the handshake, so they refuse each other cleanly.
+const PROLOGUE: &[u8] = b"rustsync/4";
 const MAX_RECORD: usize = 65535;
 const PLAIN_CHUNK: usize = 60000;
 const MAX_MESSAGE: usize = 24 * 1024 * 1024;

@@ -1,6 +1,6 @@
 [package]
 name = "rustsync"
-version = "0.5.0"
+version = "0.6.0"
 edition = "2021"
 rust-version = "1.81"
 license = "GPL-2.0-only"
@@ -14,7 +14,6 @@ crate-type = ["lib", "cdylib"]
 
 [dependencies]
 anyhow = "1"
-bincode = "1"
 blake3 = "1"
 chacha20poly1305 = "0.10"
 # the desktop window (rustsync-gui); servers can skip it with --no-default-features
@@ -29,9 +28,13 @@ qrcode = { version = "0.14", default-features = false }
 rand = "0.8"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-serde_yaml = "0.9"
+# messages between devices and the encrypted backup records
+postcard = { version = "1", features = ["use-std"] }
 snow = "0.9"
 tokio = { version = "1", features = ["full"] }
+# the config file (toml_edit changes one setting and keeps the comments)
+toml = "0.8"
+toml_edit = "0.22"
 tokio-util = "0.7"
 tracing = "0.1"
 tracing-subscriber = "0.3"

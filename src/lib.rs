@@ -14,10 +14,10 @@ use tracing::info;
 #[command(
     version,
     about = "Simple end-to-end encrypted file sync",
-    after_help = "Run with no command to start the daemon in the foreground (or `start` for the background).\nUse -c <file> to pick a config file (default: ~/.config/rustsync/config.yaml)."
+    after_help = "Run with no command to start the daemon in the foreground (or `start` for the background).\nUse -c <file> to pick a config file (default: ~/.config/rustsync/config.toml)."
 )]
 pub struct Args {
-    /// Path to the YAML config file
+    /// Path to the TOML config file
     #[arg(short = 'c', long = "config", global = true)]
     pub config: Option<PathBuf>,
 
@@ -209,7 +209,8 @@ pub mod android;
 
 /// Everything the `rustsync` program does, given its parsed command line.
 pub async fn run(args: Args) -> anyhow::Result<()> {
-    let config_path = args.config.clone().unwrap_or_else(config::default_config_path);
+    // Configs from versions before 0.6 were YAML: convert them once.
+    let config_path = config::resolve(&args.config.clone().unwrap_or_else(config::default_config_path))?;
 
     if let Some(cmd) = args.command {
         return cli::run(&config_path, cmd).await;
