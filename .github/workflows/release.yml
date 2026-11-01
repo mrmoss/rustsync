@@ -119,9 +119,24 @@ jobs:
 
           See the README for how to set up and pair your machines.
           NOTES
-          gh release create "$GITHUB_REF_NAME" dist/* \
-            --repo "$GITHUB_REPOSITORY" \
-            --draft \
-            --title "$GITHUB_REF_NAME" \
-            --notes-file notes.md \
-            --generate-notes
+          # Say so in the draft if a platform did not build.
+          missing=""
+          for pat in linux-x86_64 linux-aarch64 macos-aarch64 macos-x86_64 freebsd-x86_64 android; do
+            ls dist/*"$pat"* >/dev/null 2>&1 || missing="$missing $pat"
+          done
+          if [ -n "$missing" ]; then
+            printf '\n> **Not built this time:**%s. See the workflow run.\n' "$missing" >> notes.md
+            echo "::warning::missing downloads:$missing"
+          fi
+          if gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            # A release for this tag already exists (for example made by hand on the website):
+            # add the files to it instead of making a new one.
+            gh release upload "$GITHUB_REF_NAME" dist/* --repo "$GITHUB_REPOSITORY" --clobber
+          else
+            gh release create "$GITHUB_REF_NAME" dist/* \
+              --repo "$GITHUB_REPOSITORY" \
+              --draft \
+              --title "$GITHUB_REF_NAME" \
+              --notes-file notes.md \
+              --generate-notes
+          fi
