@@ -228,6 +228,7 @@ never applied silently.
 | Memory / CPU | Small bounded queues everywhere a peer controls the input; a byte budget for pending index updates; at most 16 requests per device served at once (extras refused); index messages capped by size and count; library/offer/backup lists capped; a device that stops reading is dropped after 60 s. |
 | Temporary files | The files rustsync writes before renaming them into place (in encrypted backups and for the public key) get unpredictable names, are created exclusively (they fail if anything, a symlink included, is already there), are never opened through a symlink, and, for backups, are readable by the owner only. |
 | Local control socket | `control.sock` is owner-only (`0600`) in a `0700` directory, and a request is one line of at most 1 MiB. |
+| Logs | `activity.log` (and its `.1` copy) are created `0600` in the state directory and capped in size (`logging.max_size`). They hold device and library names, folder paths and error messages, never keys, pairing codes, recovery codes or file contents; line breaks and control characters in names and messages are replaced by spaces, so a hostile device name cannot start a log line of its own. |
 | Connection floods | At most 32 unauthenticated connections at once and 4 per IP address, 10 s handshake deadline. |
 
 ## Known limits

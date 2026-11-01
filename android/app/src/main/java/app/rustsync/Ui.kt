@@ -12,6 +12,7 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.rememberScrollState
@@ -105,6 +106,7 @@ fun App(model: Model, hasAllFilesAccess: () -> Boolean, askAllFilesAccess: () ->
         }
     }
     PairingDialogs(model)
+    LogDialog(model)
 }
 
 @Composable
@@ -195,6 +197,27 @@ private fun SettingsPage(model: Model, status: Status) {
                 ) { Text("Save port") }
             }
         }
+        RsCard(Modifier.fillMaxWidth()) {
+            Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                Text("Logs", style = MaterialTheme.typography.titleMedium)
+                Text("A short history of what RustSync did: connections, pairing, files received, errors.")
+                OutlinedButton(onClick = { model.showLog("Activity log", null, null) }) { Text("Show the log") }
+                var mb by remember(status.logMax) { mutableStateOf(fmtMb(status.logMax)) }
+                val parsed = mb.trim().toDoubleOrNull()?.takeIf { it in 0.1..500.0 }
+                OutlinedTextField(
+                    value = mb,
+                    onValueChange = { mb = it.filter { c -> c.isDigit() || c == '.' }.take(6) },
+                    singleLine = true,
+                    label = { Text("Keep at most (MB)") },
+                    isError = mb.isNotBlank() && parsed == null,
+                )
+                Text("The log never grows past this.", style = MaterialTheme.typography.bodySmall)
+                Button(
+                    enabled = parsed != null && Math.round(parsed * 1_000_000.0) != status.logMax,
+                    onClick = { parsed?.let { model.setLogSize(Math.round(it * 1_000_000.0)) } },
+                ) { Text("Save size") }
+            }
+        }
         val context = LocalContext.current
         val version = remember {
             try {
@@ -270,6 +293,7 @@ private fun Libraries(model: Model, status: Status) {
                         if (!lib.backupOnly) {
                             OutlinedButton(onClick = { sharing = lib }, enabled = status.devices.isNotEmpty()) { Text("Share") }
                         }
+                        TextButton(onClick = { model.showLog("Log: ${lib.name}", null, lib.name) }) { Text("Log") }
                         TextButton(onClick = { removing = lib }) { Text("Remove") }
                     }
                 }
@@ -417,11 +441,14 @@ private fun Devices(model: Model, status: Status) {
                     Column(Modifier.weight(1f)) {
                         Text(d.name, style = MaterialTheme.typography.titleMedium)
                         Text(
-                            (if (d.online) "● online" else "○ offline") + (d.addr?.let { "  $it" } ?: ""),
+                            (if (d.online) "● online" else "○ offline") +
+                                (d.addr?.let { "  $it" } ?: "") +
+                                (if (!d.online && d.lastSeen > 0) "  ·  last seen ${agoText(d.lastSeen)}" else ""),
                             style = MaterialTheme.typography.bodySmall,
                         )
                     }
                     Column(horizontalAlignment = Alignment.End) {
+                        TextButton(onClick = { model.showLog("Log: ${d.name}", d.name, null) }) { Text("Log") }
                         TextButton(onClick = { readdressing = d }) { Text("Change address") }
                         TextButton(onClick = { forgetting = d }) { Text("Forget") }
                     }
@@ -596,6 +623,60 @@ private fun QrImage(text: String, size: Dp = 240.dp) {
     } else {
         Text("This code is too long for a QR code; copy it instead.")
     }
+}
+
+/** "5 minutes ago" for a time in seconds since 1970. */
+private fun agoText(then: Long): String {
+    val s = System.currentTimeMillis() / 1000 - then
+    return when {
+        s < 60 -> "just now"
+        s < 3600 -> "${s / 60} minute${if (s / 60 == 1L) "" else "s"} ago"
+        s < 86_400 -> "${s / 3600} hour${if (s / 3600 == 1L) "" else "s"} ago"
+        else -> "${s / 86_400} day${if (s / 86_400 == 1L) "" else "s"} ago"
+    }
+}
+
+private fun fmtMb(bytes: Long): String {
+    val v = bytes / 1e6
+    return if (v == Math.rint(v)) v.toLong().toString() else String.format(java.util.Locale.ROOT, "%.1f", v)
+}
+
+/** The activity log, newest line first. */
+@Composable
+private fun LogDialog(model: Model) {
+    val log = model.log ?: return
+    val clipboard = LocalClipboardManager.current
+    AlertDialog(
+        onDismissRequest = { model.closeLog() },
+        title = { Text(log.title) },
+        text = {
+            Column(Modifier.heightIn(max = 420.dp).verticalScroll(rememberScrollState())) {
+                val text = log.text
+                val error = log.error
+                when {
+                    text != null -> {
+                        Text("Newest first. Times are UTC.", style = MaterialTheme.typography.bodySmall)
+                        Spacer(Modifier.height(6.dp))
+                        Text(
+                            text.lines().asReversed().joinToString("\n"),
+                            fontFamily = FontFamily.Monospace,
+                            fontSize = 11.sp,
+                            lineHeight = 15.sp,
+                        )
+                    }
+                    error != null -> Text(error, color = MaterialTheme.colorScheme.error)
+                    else -> CircularProgressIndicator()
+                }
+            }
+        },
+        confirmButton = { TextButton(onClick = { model.closeLog() }) { Text("Close") } },
+        dismissButton = {
+            Row {
+                TextButton(onClick = { model.showLog(log.title, log.device, log.library) }) { Text("Refresh") }
+                log.text?.let { t -> TextButton(onClick = { clipboard.setText(AnnotatedString(t)) }) { Text("Copy") } }
+            }
+        },
+    )
 }
 
 @Composable

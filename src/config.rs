@@ -95,12 +95,29 @@ impl Default for SyncOptions {
 pub struct LoggingConfig {
     #[serde(default = "default_level")]
     pub level: String,
+    /// How much the activity log (and `daemon.log`) may grow, e.g. `2MB`.
+    #[serde(default = "default_log_size")]
+    pub max_size: String,
+}
+
+impl LoggingConfig {
+    /// `max_size` in bytes (the default if it cannot be read).
+    pub fn max_bytes(&self) -> u64 {
+        match crate::proto::parse_size(&self.max_size) {
+            Ok(b) if b > 0 => b,
+            _ => crate::activity::DEFAULT_MAX,
+        }
+    }
 }
 
 impl Default for LoggingConfig {
     fn default() -> Self {
-        LoggingConfig { level: default_level() }
+        LoggingConfig { level: default_level(), max_size: default_log_size() }
     }
+}
+
+fn default_log_size() -> String {
+    "2MB".to_string()
 }
 
 fn default_true() -> bool {
@@ -228,19 +245,31 @@ pub fn load(path: &Path) -> Result<Config> {
 /// Write a new listening port into the config file, keeping the rest of the file (comments and
 /// all) as it is.
 pub fn set_port(path: &Path, port: u16) -> Result<()> {
+    set_in_section(path, "server", "port", &port.to_string(), serde_yaml::Value::from(port as u64))
+}
+
+/// Write a new size limit for the logs (e.g. `5MB`) into the config file.
+pub fn set_log_size(path: &Path, bytes: u64) -> Result<()> {
+    let text = if bytes % 1_000_000 == 0 { format!("{}MB", bytes / 1_000_000) } else { bytes.to_string() };
+    set_in_section(path, "logging", "max_size", &text, serde_yaml::Value::from(text.clone()))
+}
+
+/// Set `section: key: value` in the config file, keeping the rest of the file (comments and all)
+/// as it is.
+fn set_in_section(path: &Path, section: &str, key: &str, value: &str, yaml_value: serde_yaml::Value) -> Result<()> {
     let text = std::fs::read_to_string(path).with_context(|| format!("cannot read config {}", path.display()))?;
     // `server: {port: 1}` and the like: rewrite the whole file (comments are lost).
     if text.lines().any(|l| {
-        l.starts_with("server:") && !l["server:".len()..].trim_start().is_empty() && !l["server:".len()..].trim_start().starts_with('#')
+        l.starts_with(&format!("{}:", section)) && !l[section.len() + 1..].trim_start().is_empty() && !l[section.len() + 1..].trim_start().starts_with('#')
     }) {
         let mut doc: serde_yaml::Value = serde_yaml::from_str(&text)?;
         let map = doc.as_mapping_mut().ok_or_else(|| anyhow!("the config file is not a mapping"))?;
-        let key = serde_yaml::Value::from("server");
-        let mut server = map.get(&key).cloned().unwrap_or(serde_yaml::Value::Mapping(Default::default()));
+        let section_key = serde_yaml::Value::from(section);
+        let mut server = map.get(&section_key).cloned().unwrap_or(serde_yaml::Value::Mapping(Default::default()));
         if let Some(m) = server.as_mapping_mut() {
-            m.insert(serde_yaml::Value::from("port"), serde_yaml::Value::from(port as u64));
+            m.insert(serde_yaml::Value::from(key), yaml_value.clone());
         }
-        map.insert(key, server);
+        map.insert(section_key, server);
         std::fs::write(path, serde_yaml::to_string(&doc)?)?;
         return Ok(());
     }
@@ -250,24 +279,24 @@ pub fn set_port(path: &Path, port: u16) -> Result<()> {
         let indented = line.starts_with(' ') || line.starts_with('\t');
         if !indented && !line.trim().is_empty() && !line.trim_start().starts_with('#') {
             if in_server && !done {
-                out.push(format!("  port: {}", port));
+                out.push(format!("  {}: {}", key, value));
                 done = true;
             }
-            in_server = line.trim_end() == "server:";
-        } else if in_server && !done && line.trim_start().starts_with("port:") {
-            out.push(format!("  port: {}", port));
+            in_server = line.trim_end() == format!("{}:", section);
+        } else if in_server && !done && line.trim_start().starts_with(&format!("{}:", key)) {
+            out.push(format!("  {}: {}", key, value));
             done = true;
             continue;
         }
         out.push(line.to_string());
     }
     if in_server && !done {
-        out.push(format!("  port: {}", port));
+        out.push(format!("  {}: {}", key, value));
         done = true;
     }
     if !done {
-        out.push("server:".to_string());
-        out.push(format!("  port: {}", port));
+        out.push(format!("{}:", section));
+        out.push(format!("  {}: {}", key, value));
     }
     let tmp = path.with_extension("yaml.tmp");
     std::fs::write(&tmp, out.join("\n") + "\n")?;

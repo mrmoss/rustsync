@@ -2,7 +2,7 @@
 //! desktop program inside its own process, and talks to it over the same local control socket
 //! (JSON lines) as the command line and the desktop window do.
 
-use crate::{config, net, sync};
+use crate::{activity, config, net, sync};
 use jni::objects::{JClass, JString};
 use jni::sys::{jint, jstring};
 use jni::JNIEnv;
@@ -45,7 +45,7 @@ fn start_daemon(dir: &Path, name: &str, port: u16) -> anyhow::Result<()> {
     let cfg = config::load(&cfg_path)?;
     cfg.ensure_dir()?;
     let keys = net::load_or_create_keys(&cfg.private_key_path(), &cfg.public_key_path())?;
-    let _ = tracing_subscriber::fmt().with_max_level(tracing::Level::INFO).try_init();
+    activity::init(&cfg, tracing::Level::INFO, true);
     let handle = std::thread::Builder::new().name("rustsync".to_string()).spawn(move || {
         match tokio::runtime::Builder::new_multi_thread().enable_all().build() {
             Ok(rt) => {

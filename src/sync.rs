@@ -10,6 +10,7 @@
 //!                     the library name or any plaintext, so it can't read what it stores)
 //!            One server can therefore sync some libraries normally and back up others.
 
+use crate::activity;
 use crate::apply;
 use crate::config::{self, Config};
 use crate::depot::Depot;
@@ -698,7 +699,7 @@ impl Node {
                                         lib.members.retain(|m| m.device != from);
                                         lib.members.push(Member { device: from.to_string(), role: Role::Client, accepted: true });
                                         changed = true;
-                                        info!("{} now uses the encrypted backup kept here", from_name);
+                                        info!(device = %from_name, "now uses the encrypted backup kept here");
                                     }
                                 }
                                 continue;
@@ -788,20 +789,20 @@ impl Node {
                 lib.members.push(Member { device: store, role: Role::Store, accepted: false });
                 learned += 1;
                 changed = true;
-                info!("\"{}\": also using the encrypted backup on {}", lib.name, store_name);
+                info!(library = %lib.name, device = %store_name, "also using the encrypted backup on this device");
             }
         }
         if changed {
             self.save_state();
         }
         for (who, lib) in announce {
-            info!("{} offers you \"{}\". Accept it with: rustsync -c <config> accept", who, lib);
+            info!(device = %who, library = %lib, "offers you this library; accept it with: rustsync -c <config> accept");
         }
         for h in hints {
             info!("{}", h);
         }
         for (lib, who) in gone {
-            info!("{} no longer shares \"{}\" with this machine", who, lib);
+            info!(device = %who, library = %lib, "no longer shares this library with this machine");
         }
         (newly, changed)
     }
@@ -907,7 +908,7 @@ impl Node {
         tokio::spawn(watch_loop(self.clone(), rt.clone(), rx, watcher));
         tokio::spawn(periodic_loop(self.clone(), rt.clone(), every, deep_every));
         self.libs.lock().unwrap().insert(lib.id.clone(), rt);
-        info!("library \"{}\" -> {}", lib.name, folder.root.display());
+        info!(library = %lib.name, "syncing folder {}", folder.root.display());
         Ok(())
     }
 
@@ -915,7 +916,7 @@ impl Node {
     pub fn start_backup(&self, lib: &Library, create: bool) -> Result<()> {
         let depot = Depot::open(Path::new(&lib.folder), &lib.id, create, lib.quota)?;
         self.depots.lock().unwrap().insert(lib.id.clone(), Arc::new(depot));
-        info!("keeping an encrypted backup ({}) in {}", &lib.id[..8], lib.folder);
+        info!(library = %lib.name, "keeping an encrypted backup ({}) in {}", &lib.id[..8], lib.folder);
         Ok(())
     }
 
@@ -1423,6 +1424,7 @@ impl Node {
                     (Some(h), Some(p)) => Some(format!("{}:{}", h, p)),
                     _ => None,
                 },
+                last_seen: d.last_seen,
             })
             .collect();
         let names = |keys: &Vec<String>| -> Vec<String> { keys.iter().map(|k| st.device_name(k)).collect() };
@@ -1488,6 +1490,8 @@ impl Node {
             port: self.port(),
             addresses: config::local_addresses(),
             dns_names: config::dns_names(),
+            log_max: activity::max(),
+            log_file: self.cfg.dir.join(activity::FILE).to_string_lossy().to_string(),
             backup_dir: self.cfg.backup_dir_path().to_string_lossy().to_string(),
             devices,
             libraries,
@@ -1496,6 +1500,40 @@ impl Node {
     }
 
     // ------------------------------------------------------------ pairing
+
+    /// A device's name, for the log.
+    fn dev_label(&self, key: &str) -> String {
+        self.state.lock().unwrap().device_name(key)
+    }
+
+    /// A library's name, for the log.
+    fn lib_label(&self, id: &str) -> String {
+        self.state
+            .lock()
+            .unwrap()
+            .libraries
+            .iter()
+            .find(|l| l.id == id)
+            .map(|l| l.name.clone())
+            .unwrap_or_else(|| id.chars().take(8).collect())
+    }
+
+    /// Note that a device was connected just now (shown as "last seen" once it is offline).
+    fn touch_seen(&self, key: &str) {
+        let changed = {
+            let mut st = self.state.lock().unwrap();
+            match st.devices.iter_mut().find(|d| d.key == key) {
+                Some(d) => {
+                    d.last_seen = activity::unix_now();
+                    true
+                }
+                None => false,
+            }
+        };
+        if changed {
+            self.save_state();
+        }
+    }
 
     pub fn port(&self) -> u16 {
         self.port.load(Ordering::Relaxed)
@@ -1632,6 +1670,7 @@ impl Node {
                 psk: net::hex(&reply.psk),
                 host: Some(host),
                 port: Some(port),
+                last_seen: activity::unix_now(),
             });
         }
         self.save_state();
@@ -1682,6 +1721,18 @@ impl Node {
             Request::Forget { device } => out(self.forget_device(&device)?),
             Request::SetAddress { device, addr } => out(self.set_device_address(&device, &addr)?),
             Request::SetPort { port } => out(self.set_port(port).await?),
+            Request::Log { device, library, lines } => {
+                let text = activity::read(&self.cfg.dir, device.as_deref(), library.as_deref(), lines.min(2000));
+                out(if text.is_empty() { "(nothing logged yet)".to_string() } else { text })
+            }
+            Request::SetLogSize { bytes } => {
+                if bytes < activity::MIN_MAX || bytes > activity::MAX_MAX {
+                    bail!("the log size must be between {} and {}", fmt_size(activity::MIN_MAX), fmt_size(activity::MAX_MAX));
+                }
+                config::set_log_size(&self.cfg.path, bytes).context("cannot save the log size in the config file")?;
+                activity::set_max(bytes);
+                out(format!("The logs may now use up to {}.", fmt_size(bytes)))
+            }
             Request::Create { name, folder } => out(self.create_library(&name, &folder).await?),
             Request::RemoveLibrary { library } => out(self.remove_library(&library)?),
             Request::Share { library, device, backup } => out(self.share_library(&library, &device, backup)?),
@@ -1797,7 +1848,7 @@ pub async fn run_daemon(cfg: Config, keys: Keys) -> Result<()> {
             LibMode::Backup => node.start_backup(&lib, false),
         };
         if let Err(e) = r {
-            warn!("library \"{}\": {:#}", lib.name, e);
+            warn!(library = %lib.name, "cannot start this library: {:#}", e);
         }
     }
     let dial: Vec<String> = {
@@ -2321,12 +2372,13 @@ async fn pair_inviter(
             psk: net::hex(&psk),
             host: None,
             port: None,
+            last_seen: activity::unix_now(),
         });
     }
     node.save_state();
     let reply = PairAccept { ok: true, psk, name: node.name.clone() };
     net::send_message(stream, transport, &bincode::serialize(&reply)?).await?;
-    info!("paired with {} ({})", name, short(remote_hex));
+    info!(device = %name, "paired ({})", short(remote_hex));
     node.request_resync();
     Ok(name)
 }
@@ -2350,8 +2402,9 @@ async fn dial_loop(node: Arc<Node>, key: String) {
         match TcpStream::connect(&addr).await {
             Ok(stream) => {
                 backoff = 1;
+                let dev_name = dev.name.clone();
                 if let Err(e) = run_outbound(node.clone(), stream, dev).await {
-                    warn!("device at {}: {:#}", addr, e);
+                    warn!(device = %dev_name, "connection to {} ended: {:#}", addr, e);
                 }
             }
             Err(e) => debug!("cannot reach {}: {}", addr, e),
@@ -2428,12 +2481,14 @@ async fn establish(
     let (jobs_tx, jobs_rx) = mpsc::unbounded_channel::<DepotJob>();
     let cancel = CancellationToken::new();
     let id = node.register(&dev.key, tx.clone(), jobs_tx.clone(), cancel.clone());
-    info!("connected to {}", dev.name);
+    info!(device = %dev.name, "connected");
+    node.touch_seen(&dev.key);
 
     let result = session_loop(&node, &dev, transport, rd, wr, tx, out_rx, jobs_tx, jobs_rx, cancel.clone()).await;
     node.unregister(&dev.key, id);
     cancel.cancel();
-    info!("disconnected from {}", dev.name);
+    info!(device = %dev.name, "disconnected");
+    node.touch_seen(&dev.key);
     result
 }
 
@@ -2483,14 +2538,20 @@ async fn session_loop(
     {
         let node = node.clone();
         let origin = dev.key.clone();
+        let origin_name = dev.name.clone();
         let handle = handle.clone();
         let queued = queued.clone();
         tokio::spawn(async move {
             while let Some((lib, entries, cost)) = apply_rx.recv().await {
                 if let Some(rt) = node.lib_rt(&lib) {
                     match apply::apply_entries(&rt.folder, &handle, entries).await {
-                        Ok(applied) => node.broadcast(&lib, &applied, Some(origin.as_str())),
-                        Err(e) => warn!("apply failed: {:#}", e),
+                        Ok(applied) => {
+                            if !applied.is_empty() {
+                                info!(device = %origin_name, library = %node.lib_label(&lib), "received {} change(s)", applied.len());
+                            }
+                            node.broadcast(&lib, &applied, Some(origin.as_str()))
+                        }
+                        Err(e) => warn!(device = %origin_name, library = %node.lib_label(&lib), "could not apply changes: {:#}", e),
                     }
                 }
                 queued.fetch_sub(cost, Ordering::Relaxed);
@@ -2583,7 +2644,7 @@ async fn session_loop(
                         if node.is_peer(&lib, &dev.key) {
                             let cost = bytes.len().max(256);
                             if queued.load(Ordering::Relaxed) + cost > MAX_QUEUED_APPLY {
-                                warn!("{} is sending faster than we can apply; skipped an update (it is re-sent at the next full scan)", dev.name);
+                                warn!(device = %dev.name, "sending faster than we can apply; skipped an update (it is re-sent at the next full scan)");
                             } else {
                                 queued.fetch_add(cost, Ordering::Relaxed);
                                 if apply_tx.send((lib, entries, cost)).is_err() {
@@ -2724,12 +2785,12 @@ async fn depot_worker(
             DepotJob::SyncAll => {
                 for (lib_id, rt) in node.libs_with(&depot_key, Role::Store) {
                     if let Err(e) = depot_pull(&node, &remote, &depot_key, &lib_id, &rt, &mut known).await {
-                        warn!("depot pull: {:#}", e);
+                        warn!(device = %node.dev_label(&depot_key), library = %node.lib_label(&lib_id), "backup download failed: {:#}", e);
                         continue;
                     }
                     let snapshot = rt.folder.snapshot();
                     if let Err(e) = depot_push(&remote, &lib_id, &rt, snapshot, &mut known).await {
-                        warn!("depot push: {:#}", e);
+                        warn!(device = %node.dev_label(&depot_key), library = %node.lib_label(&lib_id), "backup upload failed: {:#}", e);
                     }
                     // How full is the backup? If nearly full, clean up (at most hourly).
                     if let Some((used, quota)) = depot_stat(&node, &remote, &depot_key, &lib_id).await {
@@ -2737,7 +2798,7 @@ async fn depot_worker(
                         let due = last_prune.get(&lib_id).map_or(true, |t| t.elapsed() > AUTO_PRUNE_EVERY);
                         if nearly_full && due {
                             last_prune.insert(lib_id.clone(), Instant::now());
-                            info!("the backup of \"{}\" is nearly full; removing chunks nothing uses any more", &lib_id[..8]);
+                            info!(device = %node.dev_label(&depot_key), library = %node.lib_label(&lib_id), "the backup is nearly full; removing chunks nothing uses any more");
                             run_prune(&node, &remote, &depot_key, &lib_id, &rt).await;
                         }
                     }
@@ -2749,7 +2810,7 @@ async fn depot_worker(
                 }
                 if let Some(rt) = node.lib_rt(&lib_id) {
                     if let Err(e) = depot_push(&remote, &lib_id, &rt, entries, &mut known).await {
-                        warn!("depot push: {:#}", e);
+                        warn!(device = %node.dev_label(&depot_key), library = %node.lib_label(&lib_id), "backup upload failed: {:#}", e);
                     }
                     depot_stat(&node, &remote, &depot_key, &lib_id).await;
                 }
@@ -2778,8 +2839,8 @@ async fn depot_stat(node: &Arc<Node>, remote: &Remote, depot_key: &str, lib: &st
 
 async fn run_prune(node: &Arc<Node>, remote: &Remote, depot_key: &str, lib: &str, rt: &Arc<LibRuntime>) {
     match depot_prune(remote, lib, rt).await {
-        Ok((n, bytes)) => info!("backup of \"{}\": removed {} unused chunk(s), freed {}", &lib[..8], n, fmt_size(bytes)),
-        Err(e) => warn!("cleaning up the backup failed (nothing was deleted that is in use): {:#}", e),
+        Ok((n, bytes)) => info!(device = %node.dev_label(depot_key), library = %node.lib_label(lib), "backup cleanup: removed {} unused chunk(s), freed {}", n, fmt_size(bytes)),
+        Err(e) => warn!(device = %node.dev_label(depot_key), library = %node.lib_label(lib), "cleaning up the backup failed (nothing was deleted that is in use): {:#}", e),
     }
     depot_stat(node, remote, depot_key, lib).await;
 }
@@ -2863,13 +2924,13 @@ async fn depot_pull(
         {
             Ok(r) => r,
             Err(e) => {
-                warn!("cannot fetch a record from the depot: {:#}", e);
+                warn!(device = %node.dev_label(depot_key), library = %node.lib_label(lib), "cannot fetch a record from the backup: {:#}", e);
                 continue;
             }
         };
         match rt.vault.open_record(&slot, &raw) {
             Ok(entry) => entries.push(entry),
-            Err(e) => warn!("{:#}", e),
+            Err(e) => warn!(device = %node.dev_label(depot_key), library = %node.lib_label(lib), "{:#}", e),
         }
     }
     if entries.is_empty() {

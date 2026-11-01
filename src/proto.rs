@@ -18,6 +18,10 @@ pub enum Request {
     SetAddress { device: String, addr: String },
     /// Listen on another port from now on (also written to the config file).
     SetPort { port: u16 },
+    /// The newest lines of the activity log, about a device and/or a library (both empty: all).
+    Log { device: Option<String>, library: Option<String>, lines: usize },
+    /// How much the logs may grow (bytes; also written to the config file).
+    SetLogSize { bytes: u64 },
     Create { name: String, folder: String },
     RemoveLibrary { library: String },
     Share { library: String, device: String, backup: bool },
@@ -76,6 +80,11 @@ pub struct StatusInfo {
     /// Host names other machines might use to find this one.
     #[serde(default)]
     pub dns_names: Vec<String>,
+    /// The size limit of the logs, in bytes, and where the activity log is.
+    #[serde(default)]
+    pub log_max: u64,
+    #[serde(default)]
+    pub log_file: String,
     pub devices: Vec<DeviceInfo>,
     /// Libraries with a folder on this machine (including encrypted backups kept for others).
     pub libraries: Vec<LibraryInfo>,
@@ -88,6 +97,9 @@ pub struct DeviceInfo {
     pub name: String,
     pub online: bool,
     pub addr: Option<String>,
+    /// When it was last connected (seconds since 1970); 0 = never seen.
+    #[serde(default)]
+    pub last_seen: u64,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]

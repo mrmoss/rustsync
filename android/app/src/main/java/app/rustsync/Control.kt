@@ -12,7 +12,7 @@ import java.io.OutputStream
 // What the daemon says about itself. These mirror src/proto.rs in the Rust core: the control
 // socket speaks one JSON value per line.
 
-data class DeviceInfo(val key: String, val name: String, val online: Boolean, val addr: String?)
+data class DeviceInfo(val key: String, val name: String, val online: Boolean, val addr: String?, val lastSeen: Long)
 
 data class LibraryInfo(
     val id: String,
@@ -35,6 +35,7 @@ data class Status(
     val backupDir: String,
     val port: Int,
     val dnsNames: List<String>,
+    val logMax: Long,
     val devices: List<DeviceInfo>,
     val libraries: List<LibraryInfo>,
     val offers: List<OfferInfo>,
@@ -68,6 +69,7 @@ private fun parseStatus(o: JSONObject): Status {
         backupDir = o.optString("backup_dir"),
         port = o.optInt("port", 3032),
         dnsNames = o.optJSONArray("dns_names").strings(),
+        logMax = o.optLong("log_max", 2_000_000L),
         devices = (0 until (devices?.length() ?: 0)).map {
             val d = devices!!.getJSONObject(it)
             DeviceInfo(
@@ -75,6 +77,7 @@ private fun parseStatus(o: JSONObject): Status {
                 name = d.optString("name"),
                 online = d.optBoolean("online"),
                 addr = if (d.isNull("addr")) null else d.optString("addr"),
+                lastSeen = d.optLong("last_seen", 0L),
             )
         },
         libraries = (0 until (libraries?.length() ?: 0)).map {
@@ -138,6 +141,15 @@ object Req {
     fun join(token: String) = obj("Join", JSONObject().put("token", token))
     fun decision(accept: Boolean) = obj("PairDecision", JSONObject().put("accept", accept))
     fun setPort(port: Int) = obj("SetPort", JSONObject().put("port", port))
+    fun log(device: String?, library: String?, lines: Int) =
+        obj(
+            "Log",
+            JSONObject()
+                .put("device", device ?: JSONObject.NULL)
+                .put("library", library ?: JSONObject.NULL)
+                .put("lines", lines),
+        )
+    fun setLogSize(bytes: Long) = obj("SetLogSize", JSONObject().put("bytes", bytes))
     fun forget(device: String) = obj("Forget", JSONObject().put("device", device))
     fun setAddress(device: String, addr: String) =
         obj("SetAddress", JSONObject().put("device", device).put("addr", addr))

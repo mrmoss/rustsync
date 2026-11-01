@@ -20,6 +20,9 @@ pub struct Device {
     pub host: Option<String>,
     #[serde(default)]
     pub port: Option<u16>,
+    /// When it was last connected (seconds since 1970); 0 = never.
+    #[serde(default)]
+    pub last_seen: u64,
 }
 
 /// What another device does with one of our libraries. This is decided per library, so one

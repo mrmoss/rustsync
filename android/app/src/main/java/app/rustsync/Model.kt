@@ -19,6 +19,9 @@ data class InviteUi(val code: String?, val error: String?)
 /** Entering (or scanning) a pairing code from another device. */
 data class JoinUi(val busy: Boolean, val error: String?)
 
+/** The log window: what it is about, and the text once it has arrived. */
+data class LogUi(val title: String, val device: String?, val library: String?, val text: String?, val error: String?)
+
 class Model(app: Application) : AndroidViewModel(app) {
     private val control = Control(Paths.dataDir(app))
 
@@ -27,6 +30,7 @@ class Model(app: Application) : AndroidViewModel(app) {
     var offline by mutableStateOf<String?>("Starting…")
         private set
     var message by mutableStateOf<String?>(null)
+    var log by mutableStateOf<LogUi?>(null)
     var invite by mutableStateOf<InviteUi?>(null)
         private set
     var join by mutableStateOf<JoinUi?>(null)
@@ -174,6 +178,24 @@ class Model(app: Application) : AndroidViewModel(app) {
 
     fun forget(device: String) = run(Req.forget(device))
     fun setPort(port: Int) = run(Req.setPort(port))
+    fun setLogSize(bytes: Long) = run(Req.setLogSize(bytes))
+
+    /** Open the log window (about one device or library, or everything) and fetch the text. */
+    fun showLog(title: String, device: String?, library: String?) {
+        log = LogUi(title, device, library, null, null)
+        viewModelScope.launch(Dispatchers.IO) {
+            val shown = try {
+                LogUi(title, device, library, control.run(Req.log(device, library, 300)), null)
+            } catch (e: Exception) {
+                LogUi(title, device, library, null, e.message ?: "something went wrong")
+            }
+            if (log?.title == title) log = shown
+        }
+    }
+
+    fun closeLog() {
+        log = null
+    }
     fun setAddress(device: String, addr: String) = run(Req.setAddress(device, addr))
     fun createLibrary(name: String, folder: String) = run(Req.create(name, folder))
     fun removeLibrary(id: String) = run(Req.removeLibrary(id))

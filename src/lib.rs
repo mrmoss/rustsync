@@ -87,6 +87,26 @@ pub enum Cmd {
         /// The new port (asked if omitted)
         port: Option<u16>,
     },
+    /// Show the activity log (what rustsync did recently), optionally for one device or library
+    Log {
+        /// Only lines about this device
+        #[arg(short, long)]
+        device: Option<String>,
+        /// Only lines about this library
+        #[arg(short, long)]
+        library: Option<String>,
+        /// How many of the newest lines to show
+        #[arg(short = 'n', long, default_value_t = 100)]
+        lines: usize,
+        /// Print where the log files are, and how big they may get, instead
+        #[arg(long)]
+        path: bool,
+    },
+    /// Change how big the logs may get (saved in the config file), e.g. 5MB
+    SetLogSize {
+        /// The new limit (asked if omitted)
+        size: Option<String>,
+    },
     /// Create a library: a named folder to sync
     Create {
         /// Library name (asked if omitted)
@@ -173,6 +193,7 @@ pub enum Cmd {
     },
 }
 
+pub mod activity;
 pub mod config;
 pub mod state;
 pub mod net;
@@ -210,7 +231,7 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
         .level
         .parse::<tracing::Level>()
         .unwrap_or(tracing::Level::INFO);
-    tracing_subscriber::fmt().with_max_level(level).init();
+    activity::init(&cfg, level, true);
 
     // Printed regardless of log level so it is easy to copy.
     println!("rustsync: {}", cfg.device_name());

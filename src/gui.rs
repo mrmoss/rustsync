@@ -35,6 +35,8 @@ enum Request {
     Join { token: String },
     PairDecision { accept: bool },
     SetPort { port: u16 },
+    Log { device: Option<String>, library: Option<String>, lines: usize },
+    SetLogSize { bytes: u64 },
     Forget { device: String },
     SetAddress { device: String, addr: String },
     Create { name: String, folder: String },
@@ -83,6 +85,10 @@ struct StatusInfo {
     addresses: Vec<(String, String)>,
     #[serde(default)]
     dns_names: Vec<String>,
+    #[serde(default)]
+    log_max: u64,
+    #[serde(default)]
+    log_file: String,
 }
 
 #[derive(Deserialize, Debug, Clone)]
@@ -91,6 +97,8 @@ struct DeviceInfo {
     name: String,
     online: bool,
     addr: Option<String>,
+    #[serde(default)]
+    last_seen: u64,
 }
 
 #[derive(Deserialize, Debug, Clone)]
@@ -385,6 +393,32 @@ fn expand(path: &str) -> String {
     p.to_string()
 }
 
+/// "5 minutes ago" for a time in seconds since 1970.
+fn ago_text(then: u64) -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let s = now.saturating_sub(then);
+    let (n, unit) = match s {
+        0..=59 => return "just now".to_string(),
+        60..=3599 => (s / 60, "minute"),
+        3600..=86_399 => (s / 3600, "hour"),
+        _ => (s / 86_400, "day"),
+    };
+    format!("{} {}{} ago", n, unit, if n == 1 { "" } else { "s" })
+}
+
+/// Bytes as megabytes for the log size box: "2" or "0.5".
+fn fmt_mb(bytes: u64) -> String {
+    let v = bytes as f64 / 1e6;
+    if (v - v.round()).abs() < 1e-9 {
+        format!("{}", v.round() as u64)
+    } else {
+        format!("{:.1}", v)
+    }
+}
+
 fn short(key: &str) -> &str {
     &key[..8.min(key.len())]
 }
@@ -406,6 +440,8 @@ enum Ev {
     ScanFailed(String),
     /// The recovery code of one library (kept out of the status bar on purpose).
     Recovery(Result<String, String>),
+    /// The newest lines of the activity log.
+    Log(Result<String, String>),
 }
 
 /// What the person compares while pairing.
@@ -437,6 +473,7 @@ enum Dialog {
     Quota { id: String, name: String, text: String },
     Unshare { lib_id: String, lib_name: String, candidates: Vec<(String, String)>, sel: usize },
     Recovery { name: String, code: Option<String>, error: Option<String> },
+    Log { title: String, device: Option<String>, library: Option<String>, text: Option<String>, error: Option<String> },
     Restore { code: String, folder: String, device: usize },
     Invite { host: String, manual: bool, code: Option<String>, note: String, error: Option<String>, running: bool, paired: bool },
     Join { code: String, running: bool, error: Option<String>, scanning: bool },
@@ -454,6 +491,8 @@ enum Action {
     Unshare { id: String, device: String },
     Refresh,
     ShowRecovery { id: Option<String>, name: String },
+    ShowLog { title: String, device: Option<String>, library: Option<String> },
+    SetLogSize { bytes: u64 },
     Restore { code: String, folder: String, device: usize },
     StartJoin { token: String },
     StartScan,
@@ -489,6 +528,8 @@ struct App {
     logo: egui::TextureHandle,
     /// The port being typed on the Home page (None: show the current one).
     port_edit: Option<String>,
+    /// The log size being typed on the Settings page (None: show the current one).
+    log_edit: Option<String>,
 }
 
 impl App {
@@ -533,6 +574,7 @@ impl App {
             browse: None,
             logo,
             port_edit: None,
+            log_edit: None,
         }
     }
 
@@ -579,6 +621,21 @@ impl App {
                 Err(e) => Ev::Recovery(Err(e)),
             };
             let _ = tx.send(ev);
+            ctx.request_repaint();
+        });
+    }
+
+    /// Ask the service for the newest lines of the activity log.
+    fn fetch_log(&self, device: Option<String>, library: Option<String>) {
+        let (tx, sock, ctx) = (self.tx.clone(), self.sock.clone(), self.ctx.clone());
+        std::thread::spawn(move || {
+            let mut out = String::new();
+            let res = call(&sock, &Request::Log { device, library, lines: 300 }, None, |r| {
+                if let Reply::Out(s) = r {
+                    out.push_str(&s);
+                }
+            });
+            let _ = tx.send(Ev::Log(res.map(|_| out)));
             ctx.request_repaint();
         });
     }
@@ -809,6 +866,14 @@ impl App {
                     }
                 }
             }
+            Ev::Log(res) => {
+                if let Dialog::Log { text, error, .. } = &mut self.dialog {
+                    match res {
+                        Ok(t) => *text = Some(t),
+                        Err(e) => *error = Some(e),
+                    }
+                }
+            }
             Ev::InviteEnded(res) => {
                 self.verify = None;
                 let was_paired = matches!(&self.dialog, Dialog::Invite { paired: true, .. });
@@ -851,6 +916,14 @@ impl App {
             Action::ShowRecovery { id, name } => {
                 self.dialog = Dialog::Recovery { name, code: None, error: None };
                 self.fetch_recovery(id);
+            }
+            Action::ShowLog { title, device, library } => {
+                self.dialog = Dialog::Log { title, device: device.clone(), library: library.clone(), text: None, error: None };
+                self.fetch_log(device, library);
+            }
+            Action::SetLogSize { bytes } => {
+                self.log_edit = None;
+                self.run(Request::SetLogSize { bytes })
             }
             Action::Restore { code, folder, device } => {
                 let key = self.status.as_ref().and_then(|s| s.devices.get(device)).map(|d| d.key.clone());
@@ -1767,6 +1840,13 @@ impl App {
                                     sel: 0,
                                 };
                             }
+                            if ui.button("Log…").clicked() {
+                                self.perform(Action::ShowLog {
+                                    title: format!("Log: {}", l.name),
+                                    device: None,
+                                    library: Some(l.name.clone()),
+                                });
+                            }
                             if ui.button("Remove").clicked() {
                                 self.dialog = Dialog::ConfirmRemove { id: l.id.clone(), name: l.name.clone() };
                             }
@@ -1873,6 +1953,9 @@ impl App {
                             line.push_str(&format!("  ·  {}", a));
                         }
                         line.push_str(if d.online { "  ·  online" } else { "  ·  offline" });
+                        if !d.online && d.last_seen > 0 {
+                            line.push_str(&format!("  ·  last seen {}", ago_text(d.last_seen)));
+                        }
                         ui.label(RichText::new(line).small().weak());
                         ui.horizontal_wrapped(|ui| {
                             if ui
@@ -1885,6 +1968,13 @@ impl App {
                                     name: d.name.clone(),
                                     text: d.addr.clone().unwrap_or_default(),
                                 };
+                            }
+                            if ui.button("Log…").clicked() {
+                                self.perform(Action::ShowLog {
+                                    title: format!("Log: {}", d.name),
+                                    device: Some(d.name.clone()),
+                                    library: None,
+                                });
                             }
                             if ui.button("Forget").clicked() {
                                 self.dialog = Dialog::ConfirmForget { key: d.key.clone(), name: d.name.clone() };
@@ -1966,6 +2056,54 @@ impl App {
             if save {
                 if let Ok(port) = text.trim().parse::<u16>() {
                     self.perform(Action::SetPort { port });
+                }
+            }
+        });
+
+        ui.add_space(8.0);
+        card(ui, |ui| {
+            ui.label(RichText::new("Logs").strong());
+            ui.label("A short history of what RustSync did: connections, pairing, files received, errors.");
+            if ui.button("Show the log").clicked() {
+                self.perform(Action::ShowLog { title: "Activity log".to_string(), device: None, library: None });
+            }
+            ui.add_space(4.0);
+            ui.label("Keep at most this much (the log never grows past it):");
+            let current = fmt_mb(status.log_max);
+            let mut text = self.log_edit.clone().unwrap_or_else(|| current.clone());
+            let parsed = text.trim().parse::<f64>().ok().filter(|v| *v >= 0.1 && *v <= 500.0);
+            let mut save = false;
+            ui.horizontal(|ui| {
+                let resp = ui.add(egui::TextEdit::singleline(&mut text).desired_width(70.0));
+                if resp.changed() {
+                    self.log_edit = Some(text.clone());
+                }
+                ui.label("MB");
+                let changed = text.trim() != current;
+                let enter = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                if ui.add_enabled(changed && parsed.is_some(), primary("Save")).clicked() || (enter && changed && parsed.is_some()) {
+                    save = true;
+                }
+                if changed && ui.button("Reset").clicked() {
+                    self.log_edit = None;
+                }
+            });
+            if !text.trim().is_empty() && parsed.is_none() {
+                ui.label(RichText::new("A size from 0.1 to 500 (megabytes).").color(RED).small());
+            }
+            if !status.log_file.is_empty() {
+                ui.label(
+                    RichText::new(format!(
+                        "Plain text in {}. On the command line: rustsync log (add --device NAME or --library NAME).",
+                        status.log_file
+                    ))
+                    .small()
+                    .weak(),
+                );
+            }
+            if save {
+                if let Some(v) = parsed {
+                    self.perform(Action::SetLogSize { bytes: (v * 1e6).round() as u64 });
                 }
             }
         });
@@ -2315,6 +2453,48 @@ impl App {
                     if ui.button("Close").clicked() {
                         close = true;
                     }
+                });
+            }
+
+            Dialog::Log { title, device, library, text, error } => {
+                window(title.as_str()).show(ctx, |ui| {
+                    match text.as_ref() {
+                        Some(t) => {
+                            egui::ScrollArea::vertical().max_height(380.0).stick_to_bottom(true).show(ui, |ui| {
+                                ui.add(
+                                    egui::TextEdit::multiline(&mut t.as_str())
+                                        .font(egui::TextStyle::Monospace)
+                                        .desired_rows(16)
+                                        .desired_width(f32::INFINITY),
+                                );
+                            });
+                            ui.label(RichText::new("Times are UTC. Newest at the bottom.").small().weak());
+                        }
+                        None => {
+                            if let Some(e) = error.as_ref() {
+                                ui.label(RichText::new(e.as_str()).color(RED));
+                            } else {
+                                ui.spinner();
+                            }
+                        }
+                    }
+                    ui.horizontal(|ui| {
+                        if ui.button("Refresh").clicked() {
+                            action = Some(Action::ShowLog {
+                                title: title.clone(),
+                                device: device.clone(),
+                                library: library.clone(),
+                            });
+                        }
+                        if let Some(t) = text.as_ref() {
+                            if ui.button("Copy").clicked() {
+                                ui.ctx().copy_text(t.clone());
+                            }
+                        }
+                        if ui.button("Close").clicked() {
+                            close = true;
+                        }
+                    });
                 });
             }
 

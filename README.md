@@ -284,10 +284,11 @@ running yet). It has four pages, and opens on the first:
   *Enter a pairing code* for adding another. When you show a code, the address comes from a
   drop-down of this machine's own IP addresses and host names, or *Set manually…* to type one.
   *Change address…* updates where a device is reached when its IP address changes (the Android
-  app has the same button).
-- **Settings**: the **port** this machine listens on; the switches for starting RustSync
-  automatically and for showing its tray (menu bar) icon when you log in; and *About* (version,
-  author and license).
+  app has the same button). A device that is offline shows when it was *last seen*, and each
+  device and library has a *Log…* button showing just what concerns it.
+- **Settings**: the **port** this machine listens on; the **logs** (show them, and set how big
+  they may grow); the switches for starting RustSync automatically and for showing its tray (menu
+  bar) icon when you log in; and *About* (version, author and license).
 
 Wherever a library needs a folder (*New library*, *Accept…*, *Restore from backup…*), you choose it
 with a **folder browser** instead of typing a path: shortcuts for your home folder and drives, a
@@ -342,7 +343,11 @@ rustsync [-c CONFIG] <COMMAND>
 Getting going
   start               Start the service in the background
   stop                Stop it
-  status              Show this device, paired devices, libraries and waiting offers
+  status              Show this device, paired devices (with when an offline one was last seen), libraries and waiting offers
+  log [-d DEVICE] [-l LIBRARY] [-n LINES] [--path]
+                      Show the activity log (newest last), or just what concerns one device or library;
+                      works even when rustsync is not running. `--path` says where the files are
+  set-log-size [SIZE] How big the logs may grow, e.g. 5MB (default 2MB)
   install-service     Start rustsync by itself at login (and at boot, on Linux)
   uninstall-service   Stop doing that (also stops rustsync now)
 
@@ -653,18 +658,33 @@ manage them with the commands above. Everything in it is optional:
 name: laptop              # what other devices call this one (default: the host name)
 
 server:
-  port: 3032              # port to listen on (or use `rustsync set-port`, or Home > Settings)
+  port: 3032              # port to listen on (or use `rustsync set-port`, or Settings > Network)
 
 sync_options:
   full_scan_interval: 30  # seconds between full re-scans (changes are also noticed instantly)
 
 logging:
   level: info             # debug / info / warn / error
+  max_size: 2MB           # most the logs may use (or use `rustsync set-log-size`, or Settings > Logs)
 
 # state_dir: /somewhere/else        # where keys, pairings and indexes live
 # backup_dir: /mnt/big/backups      # suggested place for encrypted backups kept on this machine
 # accept_backups: true              # show offers to keep encrypted backups here
 ```
+
+**Logs.** rustsync keeps a short history in the state directory as plain text, `activity.log`
+(when it grows past half the limit it is moved to `activity.log.1` and the older one is dropped, so
+the two together stay under `logging.max_size`, 2MB unless you change it). `daemon.log`, which holds
+what the program prints, is cut back to the same limit. One line per event; lines about a device or
+library say which:
+
+```
+2026-11-01T09:12:03Z INFO  device="laptop" library="photos" received 12 change(s)
+2026-11-01T09:12:09Z WARN  device="server" connection to 10.0.0.5:3032 ended: ...
+```
+
+so on a server `tail -f`, `grep 'device="laptop"'` and `rustsync log --device laptop` all work.
+Times are UTC. `rustsync log --path` prints where the files are.
 
 **Where things live:** the config is `~/.config/rustsync/config.yaml`. Keys, pairings, library
 information and the log (`daemon.log`) live in the *state directory*, which sits next to the config
@@ -688,7 +708,7 @@ different `name` and `server.port`, and pass `-c` to every command.
 | Nothing happens after `share` | The other side has to `accept` (look in `rustsync status` or the window for the offer). |
 | A backup stopped accepting data | It reached its size limit: raise it with `rustsync quota`, or free space with `rustsync prune`. |
 | No tray icon | Your desktop may not show tray icons (see the list above); look at `tray.log` in the state directory. |
-| Anything else | Look at `daemon.log` in the state directory, or run `rustsync` in a terminal (no command) to watch it live. Set `logging.level: debug` for more detail. |
+| Anything else | Run `rustsync log` (or press *Log…* on a device or library in the window, or *Settings → Logs*). `rustsync log --path` says where the files are; `daemon.log` in the state directory holds what the program prints. Run `rustsync` in a terminal (no command) to watch it live. Set `logging.level: debug` for more detail. |
 
 ## Security
 

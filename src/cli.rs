@@ -243,11 +243,16 @@ fn print_status(config: &Path, s: &StatusInfo) {
     }
     for d in &s.devices {
         println!(
-            "  {:<16} {}  {}{}",
+            "  {:<16} {}  {}{}{}",
             d.name,
             if d.online { "online " } else { "offline" },
             &d.key[..8.min(d.key.len())],
-            d.addr.as_ref().map(|a| format!("  {}", a)).unwrap_or_default()
+            d.addr.as_ref().map(|a| format!("  {}", a)).unwrap_or_default(),
+            if d.online || d.last_seen == 0 {
+                String::new()
+            } else {
+                format!("  (last seen {})", crate::activity::ago(crate::activity::unix_now(), d.last_seen))
+            }
         );
     }
     println!();
@@ -1163,6 +1168,42 @@ pub async fn run(config_path: &Path, cmd: Cmd) -> Result<()> {
             let dev_labels: Vec<String> = related.iter().map(|d| d.name.clone()).collect();
             let di = pick("device", &dev_labels, device, |i, t| name_or_prefix(&related[i].name, &related[i].key, t))?;
             call(&ctl, &Request::Unshare { library: l.id.clone(), device: related[di].key.clone() }).await?;
+            Ok(())
+        }
+        Cmd::Log { device, library, lines, path } => {
+            if path {
+                println!("{}", cfg.dir.join(crate::activity::FILE).display());
+                println!("{}.1", cfg.dir.join(crate::activity::FILE).display());
+                println!("{}  (what the program prints)", cfg.log_path().display());
+                println!("Limit: {} (change it with:  rustsync -c {} set-log-size)", proto::fmt_size(cfg.logging.max_bytes()), config_path.display());
+                return Ok(());
+            }
+            let text = crate::activity::read(&cfg.dir, device.as_deref(), library.as_deref(), lines);
+            if text.is_empty() {
+                eprintln!("(nothing logged yet)");
+            } else {
+                println!("{}", text);
+            }
+            Ok(())
+        }
+        Cmd::SetLogSize { size } => {
+            let text = match size {
+                Some(t) => t,
+                None => ask("Largest size the logs may grow to (e.g. 2MB, 10MB)", &proto::fmt_size(cfg.logging.max_bytes()).replace(' ', ""))?,
+            };
+            let bytes = proto::parse_size(&text).map_err(|e| anyhow!(e))?;
+            if bytes < crate::activity::MIN_MAX || bytes > crate::activity::MAX_MAX {
+                bail!(
+                    "choose between {} and {}",
+                    proto::fmt_size(crate::activity::MIN_MAX),
+                    proto::fmt_size(crate::activity::MAX_MAX)
+                );
+            }
+            if call(&ctl, &Request::SetLogSize { bytes }).await.is_err() {
+                // not running: just save it
+                config::set_log_size(config_path, bytes)?;
+                println!("Saved. It takes effect the next time rustsync starts.");
+            }
             Ok(())
         }
         Cmd::Quota { library, size } => {
