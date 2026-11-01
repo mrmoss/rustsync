@@ -112,7 +112,7 @@ fun GlyphIcon(glyph: Glyph, modifier: Modifier = Modifier.size(24.dp), color: Co
         val s = size.minDimension
         fun at(x: Float, y: Float) = Offset(x * s, y * s)
         val stroke = Stroke(width = s / 11f, cap = StrokeCap.Round, join = StrokeJoin.Round)
-        fun poly(vararg p: Offset, closed: Boolean = false) {
+        fun poly(p: List<Offset>, closed: Boolean = false) {
             val path = Path()
             path.moveTo(p[0].x, p[0].y)
             for (i in 1 until p.size) path.lineTo(p[i].x, p[i].y)
@@ -121,22 +121,22 @@ fun GlyphIcon(glyph: Glyph, modifier: Modifier = Modifier.size(24.dp), color: Co
         }
         when (glyph) {
             Glyph.Home -> {
-                poly(at(0.10f, 0.50f), at(0.50f, 0.14f), at(0.90f, 0.50f))
-                poly(at(0.22f, 0.42f), at(0.22f, 0.86f), at(0.78f, 0.86f), at(0.78f, 0.42f))
-                poly(at(0.42f, 0.86f), at(0.42f, 0.60f), at(0.58f, 0.60f), at(0.58f, 0.86f))
+                poly(listOf(at(0.10f, 0.50f), at(0.50f, 0.14f), at(0.90f, 0.50f)))
+                poly(listOf(at(0.22f, 0.42f), at(0.22f, 0.86f), at(0.78f, 0.86f), at(0.78f, 0.42f)))
+                poly(listOf(at(0.42f, 0.86f), at(0.42f, 0.60f), at(0.58f, 0.60f), at(0.58f, 0.86f)))
             }
             Glyph.Folder -> poly(
-                at(0.10f, 0.22f), at(0.40f, 0.22f), at(0.50f, 0.34f), at(0.90f, 0.34f), at(0.90f, 0.80f), at(0.10f, 0.80f),
+                listOf(at(0.10f, 0.22f), at(0.40f, 0.22f), at(0.50f, 0.34f), at(0.90f, 0.34f), at(0.90f, 0.80f), at(0.10f, 0.80f)),
                 closed = true,
             )
             Glyph.Devices -> {
-                poly(at(0.10f, 0.20f), at(0.90f, 0.20f), at(0.90f, 0.64f), at(0.10f, 0.64f), closed = true)
-                poly(at(0.50f, 0.64f), at(0.50f, 0.82f))
-                poly(at(0.30f, 0.84f), at(0.70f, 0.84f))
+                poly(listOf(at(0.10f, 0.20f), at(0.90f, 0.20f), at(0.90f, 0.64f), at(0.10f, 0.64f)), closed = true)
+                poly(listOf(at(0.50f, 0.64f), at(0.50f, 0.82f)))
+                poly(listOf(at(0.30f, 0.84f), at(0.70f, 0.84f)))
             }
             Glyph.Plus -> {
-                poly(at(0.50f, 0.18f), at(0.50f, 0.82f))
-                poly(at(0.18f, 0.50f), at(0.82f, 0.50f))
+                poly(listOf(at(0.50f, 0.18f), at(0.50f, 0.82f)))
+                poly(listOf(at(0.18f, 0.50f), at(0.82f, 0.50f)))
             }
             Glyph.Refresh -> {
                 drawArc(
