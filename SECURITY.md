@@ -54,16 +54,32 @@ per paired device, plus any open pairing code) against the first handshake messa
 secret decrypts it.
 
 ```mermaid
-flowchart TD
-    D["Device with an address dials it (TCP)"] --> H["Noise handshake, 10 s limit: secret mixed in from the first message"]
-    H --> L{"Listener: which secret opens the first message?"}
-    L -->|none| X["Dropped: unknown device or wrong code"]
-    L -->|a paired device's secret| P{"Is the caller's key that device's key?"}
-    P -->|no| X
-    P -->|yes| E["Exchange Hello (device names)"]
-    L -->|an open pairing code| W["Pairing, see below"]
-    E --> R["If that device was already connected, this connection replaces the old one"]
-    R --> LIB["Each side sends its list of libraries"]
+sequenceDiagram
+    autonumber
+    participant D as Caller (has an address)
+    participant L as Listener
+    D->>L: Open a TCP connection
+    Note over D,L: Anonymous until the handshake is done: 10 s limit
+    D->>L: Noise handshake, first message (the shared secret is mixed in)
+    L->>L: Try each secret it holds (one per paired device, plus any open pairing code)
+    alt no secret opens the message
+        L--xD: Dropped: unknown device or wrong code
+    else a paired device's secret opens it
+        L->>D: Handshake, second message
+        D->>L: Handshake, third message
+        L->>L: Is the caller's key really that device's key?
+        alt it is not
+            L--xD: Dropped
+        else it is
+            D->>L: Hello (device name)
+            L->>D: Hello (device name)
+            L->>L: Replace the older connection from that device, if any
+            D->>L: Libraries (my list)
+            L->>D: Libraries (my list)
+        end
+    else an open pairing code opens it
+        Note over D,L: Pairing, see the next section
+    end
 ```
 
 - **Who dials.** A device dials the address it has stored for another device (and redials with a

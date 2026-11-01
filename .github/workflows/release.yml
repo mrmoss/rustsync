@@ -48,6 +48,11 @@ jobs:
       - name: Debian package
         if: startsWith(matrix.runner, 'ubuntu')
         run: just deb
+      - name: Static command-line program (Linux)
+        if: startsWith(matrix.runner, 'ubuntu')
+        run: |
+          sudo apt-get install -y musl-tools
+          just package-static
       - name: macOS app
         if: startsWith(matrix.runner, 'macos')
         run: just macos-dmg
@@ -116,6 +121,10 @@ jobs:
           - **Linux:** `rustsync-<version>-linux-<cpu>.tar.gz`, built on Ubuntu 22.04.
             For Debian and Ubuntu (22.04 / Debian 12 or newer) there is also `rustsync_<version>_amd64.deb` (or `arm64`):
             `sudo apt install ./rustsync_<version>_amd64.deb`.
+          - **Linux, any distribution:** `rustsync-<version>-linux-<cpu>-static.tar.gz` has just the command-line program, built
+            fully static: it needs no libraries, so it runs on any Linux of that CPU (also old systems, Alpine, NAS boxes).
+            No window. Names that rely on the system's name-service plugins (like mDNS `.local`) do not resolve in it; use
+            an IP address or an ordinary DNS name.
           - **macOS:** `rustsync-<version>-macos-<cpu>.dmg`: open it and drag RustSync into Applications, then open it from there
             (the `.tar.gz` is just the programs). The app is unsigned, so the first time, right-click it and choose Open
             (or allow it in System Settings, Privacy & Security).
@@ -128,7 +137,7 @@ jobs:
           NOTES
           # Say so in the draft if a platform did not build.
           missing=""
-          for pat in linux-x86_64 linux-aarch64 macos-aarch64 macos-x86_64 freebsd-x86_64 android; do
+          for pat in linux-x86_64-static linux-aarch64-static linux-x86_64 linux-aarch64 macos-aarch64 macos-x86_64 freebsd-x86_64 android; do
             ls dist/*"$pat"* >/dev/null 2>&1 || missing="$missing $pat"
           done
           if [ -n "$missing" ]; then

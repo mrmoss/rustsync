@@ -33,6 +33,11 @@ jobs:
           just deb
           dpkg-deb --info dist/*.deb
           dpkg-deb --contents dist/*.deb
+      - name: Static command-line program (checks it links without libraries)
+        if: startsWith(matrix.os, 'ubuntu')
+        run: |
+          sudo apt-get install -y musl-tools
+          just package-static
       - name: macOS, also for Intel Macs
         if: startsWith(matrix.os, 'macos')
         run: |

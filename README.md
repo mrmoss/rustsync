@@ -76,22 +76,36 @@ sequenceDiagram
 **Sharing a library**
 
 ```mermaid
-flowchart LR
-    S["Laptop: share 'photos' with Desktop"] --> O["Desktop: an offer appears"]
-    O -->|Accept, then pick a folder| Y["The folders start syncing"]
-    O -->|Decline| N["Nothing happens"]
-    S -.->|"with --backup"| K["The other device keeps an encrypted copy it cannot read"]
+sequenceDiagram
+    participant A as Laptop
+    participant B as Desktop
+    A->>B: Offer: share 'photos' with you
+    Note over B: An offer appears (window, app or accept command)
+    alt you accept and pick a folder
+        B->>A: Accepted
+        A->>B: List of my files
+        B->>A: List of my files
+        Note over A,B: The folders start syncing
+    else you decline
+        Note over A,B: Nothing happens
+    end
+    Note over A,B: With --backup the other device keeps an encrypted copy it cannot read
 ```
 
 **Syncing: what happens when you save a file**
 
 ```mermaid
-flowchart LR
-    E["You change a file"] --> D["Noticed within moments"]
-    D --> T["The other devices are told what changed"]
-    T --> F["They fetch only the changed parts"]
-    F --> C["Checked against the original, then swapped in"]
-    C --> U["Everyone has the new file"]
+sequenceDiagram
+    actor You
+    participant A as Laptop
+    participant B as Desktop
+    You->>A: Save a file
+    A->>A: Noticed within moments
+    A->>B: Here is what changed
+    B->>A: Send me the parts I do not have
+    A->>B: Just those parts (encrypted)
+    B->>B: Check against the original, then swap in
+    Note over A,B: Everyone has the new file
 ```
 
 If two devices change the same file at about the same time, the most recent change wins (so keep
@@ -176,6 +190,12 @@ rustsync install-service                          # optional: start by itself
 It installs both programs into `/usr/bin`, a *RustSync* entry in your applications menu, and the
 docs. Remove it with `sudo apt remove rustsync` (your config and synced files are left alone).
 To make one yourself, `just deb`.
+
+On a **server** (or any Linux, old or new, including Alpine), download
+`rustsync-<version>-linux-<cpu>-static.tar.gz` from the same page: just the command-line program,
+fully static, so it needs no libraries and no particular Linux version. It has no window, and names
+that need the system's name-service plugins (mDNS `.local` names) do not resolve in it; use an IP
+address or an ordinary DNS name. `just package-static` makes one.
 
 Or, if you have [`just`](https://github.com/casey/just), `just install` builds and copies both
 programs into `~/.local/bin` for you. Ready-made downloads for each system are on the
@@ -565,6 +585,7 @@ with `cargo install just`, `brew install just`, or `pkg install just`). Run `jus
 | `just test` | Run the tests. |
 | `just install` | Build and install both programs into `~/.local/bin` (`PREFIX=/usr/local just install` to change it). |
 | `just package` | Make `dist/rustsync-<version>-<os>-<cpu>.tar.gz` with the programs and docs. |
+| `just package-static` | Linux: the same for the command-line program only, fully static (built with musl). |
 | `just macos-app` | On a Mac: make `dist/RustSync.app` (with the logo). |
 | `just macos-dmg` | On a Mac: make the `.dmg` disk image to hand out (drag the app into Applications). |
 | `just android-apk` | Make `dist/rustsync-<version>-android.apk` (see [The Android app](#the-android-app)). |
@@ -734,4 +755,3 @@ Remember the note at the top: this code is AI-generated and has not been indepen
 
 rustsync is free software, released under the [GNU General Public License, version 2](LICENSE)
 (`GPL-2.0-only`). You may use, study, change and share it under those terms; there is no warranty.
-

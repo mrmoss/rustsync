@@ -56,6 +56,41 @@ _pack programs:
     rm -rf "$d"
     echo "made dist/{{name}}.tar.gz"
 
+# Linux only: make dist/rustsync-<version>-linux-<cpu>-static.tar.gz with the command-line program
+# built fully static (musl): it needs no libraries at all, so it runs on any Linux of that CPU,
+# old or new, glibc or musl (Alpine). No window; names that need the system's name-service
+# plugins (like mDNS `.local` names) do not resolve in it, use IP addresses or ordinary DNS names.
+package-static:
+    #!/bin/sh
+    set -eu
+    [ "$(uname)" = Linux ] || { echo "static builds are for Linux only"; exit 1; }
+    cpu=$(uname -m)
+    case "$cpu" in
+      x86_64|aarch64) ;;
+      *) echo "no static target known for $cpu"; exit 1 ;;
+    esac
+    t="$cpu-unknown-linux-musl"
+    rustup target add "$t"
+    # Some libraries (the hashing code) have a little C in them: build that with musl's compiler.
+    if command -v musl-gcc >/dev/null; then
+      u=$(echo "$t" | tr - _)
+      export "CC_$u=musl-gcc"
+    fi
+    cargo build --release --no-default-features --target "$t"
+    bin="target/$t/release/rustsync"
+    if ldd "$bin" 2>&1 | grep -qE "not a dynamic|statically linked"; then
+      echo "checked: $bin is static"
+    else
+      echo "$bin is not static:"; ldd "$bin" || true; exit 1
+    fi
+    name="rustsync-{{version}}-linux-$cpu-static"
+    rm -rf "dist/$name"
+    mkdir -p "dist/$name"
+    cp "$bin" README.md SECURITY.md LICENSE "dist/$name/"
+    tar -C dist -czf "dist/$name.tar.gz" "$name"
+    rm -rf "dist/$name"
+    echo "made dist/$name.tar.gz"
+
 # Linux only: make dist/rustsync_<version>_<amd64|arm64>.deb (Debian, Ubuntu, Mint, ...). Needs dpkg-deb.
 deb: build
     #!/bin/sh
