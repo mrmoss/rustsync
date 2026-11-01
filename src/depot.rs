@@ -122,6 +122,7 @@ impl Depot {
 
     /// Reserve `len` bytes. `credit` is space that is about to be freed by the same operation
     /// (an older record being replaced). False if that would go over the quota.
+    #[allow(deprecated)] // `try_update` is newer than our minimum Rust version
     fn try_add(&self, len: u64, credit: u64) -> bool {
         self.used
             .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |u| {
@@ -135,6 +136,7 @@ impl Depot {
             .is_ok()
     }
 
+    #[allow(deprecated)]
     fn release(&self, n: u64) {
         let _ = self
             .used

@@ -932,20 +932,20 @@ fn configure_style(ctx: &egui::Context) {
     let v = &mut style.visuals;
     v.panel_fill = PANEL;
     v.window_fill = CARD;
-    v.window_stroke = Stroke::new(1.0, CARD_LINE);
+    v.window_stroke = Stroke::new(1.0_f32, CARD_LINE);
     v.window_corner_radius = CornerRadius::same(12);
     v.extreme_bg_color = FIELD;
     v.hyperlink_color = ACCENT;
     v.selection.bg_fill = Color32::from_rgb(140, 78, 46);
-    v.selection.stroke = Stroke::new(1.0, ACCENT);
-    v.widgets.noninteractive.fg_stroke = Stroke::new(1.0, TEXT);
-    v.widgets.noninteractive.bg_stroke = Stroke::new(1.0, CARD_LINE);
+    v.selection.stroke = Stroke::new(1.0_f32, ACCENT);
+    v.widgets.noninteractive.fg_stroke = Stroke::new(1.0_f32, TEXT);
+    v.widgets.noninteractive.bg_stroke = Stroke::new(1.0_f32, CARD_LINE);
     v.widgets.inactive.bg_fill = Color32::from_rgb(40, 40, 46);
     v.widgets.inactive.weak_bg_fill = Color32::from_rgb(40, 40, 46);
-    v.widgets.inactive.fg_stroke = Stroke::new(1.0, Color32::from_rgb(220, 220, 226));
+    v.widgets.inactive.fg_stroke = Stroke::new(1.0_f32, Color32::from_rgb(220, 220, 226));
     v.widgets.hovered.bg_fill = Color32::from_rgb(54, 54, 62);
     v.widgets.hovered.weak_bg_fill = Color32::from_rgb(54, 54, 62);
-    v.widgets.hovered.fg_stroke = Stroke::new(1.0, Color32::from_rgb(245, 245, 248));
+    v.widgets.hovered.fg_stroke = Stroke::new(1.0_f32, Color32::from_rgb(245, 245, 248));
     v.widgets.active.bg_fill = Color32::from_rgb(112, 64, 40);
     v.widgets.active.weak_bg_fill = Color32::from_rgb(112, 64, 40);
     for w in [
@@ -966,7 +966,7 @@ fn card(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui)) {
     let style = (*ui.style()).clone();
     egui::Frame::group(&style)
         .fill(CARD)
-        .stroke(Stroke::new(1.0, CARD_LINE))
+        .stroke(Stroke::new(1.0_f32, CARD_LINE))
         .corner_radius(CornerRadius::same(12))
         .inner_margin(egui::Margin::same(14))
         .show(ui, |ui| {
@@ -1180,7 +1180,7 @@ fn folder_picker(ui: &mut egui::Ui, folder: &str, empty_hint: &str, want: &mut O
         let width = (ui.available_width() - 170.0).max(180.0);
         egui::Frame::new()
             .fill(FIELD)
-            .stroke(Stroke::new(1.0, CARD_LINE))
+            .stroke(Stroke::new(1.0_f32, CARD_LINE))
             .corner_radius(CornerRadius::same(8))
             .inner_margin(egui::Margin::symmetric(10, 8))
             .show(ui, |ui| {
@@ -3341,7 +3341,9 @@ mod menubar {
                             let _ = set_service_blocking(&config, !service_installed(&config));
                         });
                     }
-                    "login" => set_login(&self.config, !login_path(&self.config).exists()),
+                    "login" => {
+                        let _ = set_login(&self.config, !login_path(&self.config).exists());
+                    }
                     "quit" => event_loop.exit(),
                     _ => {}
                 },

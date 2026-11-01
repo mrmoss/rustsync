@@ -161,7 +161,7 @@ macos-app: build
 # Android: build the Rust core for phones (needs the Android NDK and `cargo install cargo-ndk`)
 android-core:
     rustup target add aarch64-linux-android x86_64-linux-android
-    cargo ndk -p 26 -t arm64-v8a -t x86_64 -o android/app/src/main/jniLibs build --release --lib --no-default-features
+    cargo ndk --platform 26 -t arm64-v8a -t x86_64 -o android/app/src/main/jniLibs build --release --lib --no-default-features
 
 # Android: make dist/rustsync-<version>-android.apk (needs JDK 17, the Android SDK and `gradle`)
 android-apk: android-core
