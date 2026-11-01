@@ -36,7 +36,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # messages between devices and the encrypted backup records
 postcard = { version = "1", features = ["use-std"] }
-snow = "0.9"
+snow = "0.10"
 tokio = { version = "1", features = ["full"] }
 # the config file (toml_edit changes one setting and keeps the comments)
 toml = "0.8"
