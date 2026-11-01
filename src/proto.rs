@@ -16,6 +16,8 @@ pub enum Request {
     /// Change where to reach a paired device (`host` or `host:port`; empty clears it, so that
     /// only the other side dials).
     SetAddress { device: String, addr: String },
+    /// Listen on another port from now on (also written to the config file).
+    SetPort { port: u16 },
     Create { name: String, folder: String },
     RemoveLibrary { library: String },
     Share { library: String, device: String, backup: bool },
@@ -65,6 +67,15 @@ pub struct StatusInfo {
     pub listen: String,
     /// Suggested place for encrypted backups other devices keep here.
     pub backup_dir: String,
+    /// The port this machine listens on.
+    #[serde(default)]
+    pub port: u16,
+    /// This machine's IPv4 addresses, as (address, interface).
+    #[serde(default)]
+    pub addresses: Vec<(String, String)>,
+    /// Host names other machines might use to find this one.
+    #[serde(default)]
+    pub dns_names: Vec<String>,
     pub devices: Vec<DeviceInfo>,
     /// Libraries with a folder on this machine (including encrypted backups kept for others).
     pub libraries: Vec<LibraryInfo>,

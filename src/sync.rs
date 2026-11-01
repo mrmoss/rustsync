@@ -11,7 +11,7 @@
 //!            One server can therefore sync some libraries normally and back up others.
 
 use crate::apply;
-use crate::config::Config;
+use crate::config::{self, Config};
 use crate::depot::Depot;
 use crate::index::{self, Entry, Folder, CHUNK};
 use crate::net::{self, Keys, Reassembler};
@@ -337,6 +337,10 @@ pub struct Node {
     handshakes: Arc<Semaphore>,
     ip_conns: Mutex<HashMap<IpAddr, u32>>,
     next_session: AtomicU64,
+    /// The port we listen on (can be changed while running).
+    port: std::sync::atomic::AtomicU16,
+    /// Stops the accept loop of the current listener when it is replaced.
+    listener_stop: Mutex<CancellationToken>,
     pub shutdown: CancellationToken,
 }
 
@@ -1376,7 +1380,7 @@ impl Node {
     /// Change the address this machine dials to reach a paired device.
     pub fn set_device_address(self: &Arc<Self>, key: &str, addr: &str) -> Result<String> {
         let addr = addr.trim();
-        let target = if addr.is_empty() { None } else { Some(parse_host_port(addr, self.cfg.server.port)?) };
+        let target = if addr.is_empty() { None } else { Some(parse_host_port(addr, self.port())?) };
         let name = {
             let mut st = self.state.lock().unwrap();
             let Some(dev) = st.devices.iter_mut().find(|d| d.key == key) else {
@@ -1480,7 +1484,10 @@ impl Node {
         StatusInfo {
             name: self.name.clone(),
             key: net::hex(&self.keys.public),
-            listen: format!("{}:{}", self.cfg.server.host, self.cfg.server.port),
+            listen: format!("{}:{}", self.cfg.server.host, self.port()),
+            port: self.port(),
+            addresses: config::local_addresses(),
+            dns_names: config::dns_names(),
             backup_dir: self.cfg.backup_dir_path().to_string_lossy().to_string(),
             devices,
             libraries,
@@ -1489,6 +1496,34 @@ impl Node {
     }
 
     // ------------------------------------------------------------ pairing
+
+    pub fn port(&self) -> u16 {
+        self.port.load(Ordering::Relaxed)
+    }
+
+    /// Listen on another port: bind the new one first (so a port that is taken changes nothing),
+    /// switch over, and write it to the config file so it stays.
+    pub async fn set_port(self: &Arc<Self>, port: u16) -> Result<String> {
+        if port < 1024 && unsafe { libc::geteuid() } != 0 {
+            bail!("ports below 1024 need administrator rights; choose 1024 or higher");
+        }
+        if port == self.port() {
+            return Ok(format!("Already listening on port {}.", port));
+        }
+        let addr = format!("{}:{}", self.cfg.server.host, port);
+        let listener = TcpListener::bind(&addr).await.with_context(|| format!("cannot listen on {} (is it in use?)", addr))?;
+        config::set_port(&self.cfg.path, port).context("cannot save the port in the config file")?;
+        let stop = CancellationToken::new();
+        let old = std::mem::replace(&mut *self.listener_stop.lock().unwrap(), stop.clone());
+        old.cancel();
+        self.port.store(port, Ordering::Relaxed);
+        info!("listening on {}", addr);
+        tokio::spawn(accept_loop(self.clone(), listener, stop));
+        Ok(format!(
+            "Now listening on port {}. Other devices that dial this machine need the new address (they can use \"change address\"); devices this machine dials are not affected.",
+            port
+        ))
+    }
 
     fn create_invite(&self, host: &str) -> (String, Vec<u8>, mpsc::UnboundedReceiver<InviteEvent>) {
         let secret = random_bytes(32);
@@ -1501,7 +1536,7 @@ impl Node {
         let addr = if host.contains(':') {
             host.to_string()
         } else {
-            format!("{}:{}", host, self.cfg.server.port)
+            format!("{}:{}", host, self.port())
         };
         let token = format!("{}.{}@{}", net::hex(&self.keys.public), net::hex(&secret), addr);
         (token, secret, rx)
@@ -1646,6 +1681,7 @@ impl Node {
             Request::Status => Ok(vec![Reply::Info(self.status()), Reply::Done]),
             Request::Forget { device } => out(self.forget_device(&device)?),
             Request::SetAddress { device, addr } => out(self.set_device_address(&device, &addr)?),
+            Request::SetPort { port } => out(self.set_port(port).await?),
             Request::Create { name, folder } => out(self.create_library(&name, &folder).await?),
             Request::RemoveLibrary { library } => out(self.remove_library(&library)?),
             Request::Share { library, device, backup } => out(self.share_library(&library, &device, backup)?),
@@ -1727,6 +1763,7 @@ pub async fn run_daemon(cfg: Config, keys: Keys) -> Result<()> {
     let _ = std::fs::remove_file(&sock); // stale socket from a crash
 
     let state = State::load(&cfg.state_file())?;
+    let port = cfg.server.port;
     let node = Arc::new(Node {
         name: cfg.device_name(),
         cfg,
@@ -1741,6 +1778,8 @@ pub async fn run_daemon(cfg: Config, keys: Keys) -> Result<()> {
         handshakes: Arc::new(Semaphore::new(MAX_HANDSHAKES)),
         ip_conns: Mutex::new(HashMap::new()),
         next_session: AtomicU64::new(1),
+        port: std::sync::atomic::AtomicU16::new(port),
+        listener_stop: Mutex::new(CancellationToken::new()),
         shutdown: CancellationToken::new(),
     });
 
@@ -2104,7 +2143,7 @@ async fn periodic_loop(node: Arc<Node>, rt: Arc<LibRuntime>, every: u64, deep_ev
 // ---------------------------------------------------------------- networking
 
 async fn listen(node: Arc<Node>) {
-    let addr = format!("{}:{}", node.cfg.server.host, node.cfg.server.port);
+    let addr = format!("{}:{}", node.cfg.server.host, node.port());
     let listener = match TcpListener::bind(&addr).await {
         Ok(l) => l,
         Err(e) => {
@@ -2113,8 +2152,17 @@ async fn listen(node: Arc<Node>) {
         }
     };
     info!("listening on {}", addr);
+    let stop = node.listener_stop.lock().unwrap().clone();
+    accept_loop(node, listener, stop).await;
+}
+
+async fn accept_loop(node: Arc<Node>, listener: TcpListener, stop: CancellationToken) {
     loop {
-        match listener.accept().await {
+        let accepted = tokio::select! {
+            _ = stop.cancelled() => return,
+            r = listener.accept() => r,
+        };
+        match accepted {
             Ok((stream, peer)) => {
                 // Limit connections that have not authenticated yet (overall and per address).
                 let ip = peer.ip();

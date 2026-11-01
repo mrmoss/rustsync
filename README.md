@@ -53,6 +53,50 @@ A small background program (the **service**) does the syncing. The command line 
 window are just remote controls for it: you can close the window, or log out of the terminal, and
 syncing carries on.
 
+## How it works, in pictures
+
+Three short diagrams: how two devices get introduced, how a library is shared, and how a changed
+file reaches the other side. (Every step, message and check is in [SECURITY.md](SECURITY.md#how-it-works-in-detail).)
+
+**Pairing: introducing two devices, once**
+
+```mermaid
+sequenceDiagram
+    participant A as Laptop (shows the code)
+    participant B as Desktop (enters the code)
+    A->>A: Make a one-time code (and QR code)
+    Note over A,B: You carry the code across: type it, paste it or scan it
+    B->>A: Connect, using the code to prove it is allowed
+    A-->>B: Both screens show the same 8-digit number
+    Note over A,B: A person at each device checks that the numbers match and says yes
+    A-->>B: Hand over a secret that only these two share
+    Note over A,B: From now on they connect to each other automatically
+```
+
+**Sharing a library**
+
+```mermaid
+flowchart LR
+    S["Laptop: share 'photos' with Desktop"] --> O["Desktop: an offer appears"]
+    O -->|Accept, then pick a folder| Y["The folders start syncing"]
+    O -->|Decline| N["Nothing happens"]
+    S -.->|"with --backup"| K["The other device keeps an encrypted copy it cannot read"]
+```
+
+**Syncing: what happens when you save a file**
+
+```mermaid
+flowchart LR
+    E["You change a file"] --> D["Noticed within moments"]
+    D --> T["The other devices are told what changed"]
+    T --> F["They fetch only the changed parts"]
+    F --> C["Checked against the original, then swapped in"]
+    C --> U["Everyone has the new file"]
+```
+
+If two devices change the same file at about the same time, the most recent change wins (so keep
+the clocks right). A scan of every folder also runs regularly as a safety net.
+
 ## How rustsync differs from Syncthing
 
 rustsync is inspired by [Syncthing](https://syncthing.net) and does the same basic job: keep folders
@@ -120,6 +164,18 @@ git clone https://github.com/mrmoss/rustsync
 cd rustsync
 cargo build --release
 ```
+
+On Debian, Ubuntu and relatives, the easiest way is the `.deb` from the
+[Releases page](https://github.com/mrmoss/rustsync/releases) (needs Ubuntu 22.04, Debian 12 or newer):
+
+```sh
+sudo apt install ./rustsync_0.1.0_amd64.deb      # arm64 for ARM machines
+rustsync install-service                          # optional: start by itself
+```
+
+It installs both programs into `/usr/bin`, a *RustSync* entry in your applications menu, and the
+docs. Remove it with `sudo apt remove rustsync` (your config and synced files are left alone).
+To make one yourself, `just deb`.
 
 Or, if you have [`just`](https://github.com/casey/just), `just install` builds and copies both
 programs into `~/.local/bin` for you. Ready-made downloads for each system are on the
@@ -222,12 +278,15 @@ Prefer clicking? Start the window with `rustsync-gui` (it has a *Start* button i
 running yet). It has three pages, and opens on the first:
 
 - **Home**: this device: its name, public key, the address it's listening on, and the switches for
-  starting RustSync automatically and for showing its tray (menu bar) icon when you log in.
+  starting RustSync automatically and for showing its tray (menu bar) icon when you log in. The
+  *Settings* card changes the **port** it listens on.
 - **Libraries**: your libraries, who they're shared with, how much encrypted-backup space is used,
   and offers waiting for you to accept.
 - **Devices**: the machines you've paired and whether they're online, plus *Show a pairing code* and
-  *Enter a pairing code* for adding another. *Change address…* updates where a device is reached
-  when its IP address changes (the Android app has the same button).
+  *Enter a pairing code* for adding another. When you show a code, the address comes from a
+  drop-down of this machine's own IP addresses and host names, or *Set manually…* to type one.
+  *Change address…* updates where a device is reached when its IP address changes (the Android
+  app has the same button).
 
 Wherever a library needs a folder (*New library*, *Accept…*, *Restore from backup…*), you choose it
 with a **folder browser** instead of typing a path: shortcuts for your home folder and drives, a
@@ -290,6 +349,8 @@ Pairing devices
   forget [DEVICE]     Stop syncing with a paired device
   set-address [DEVICE] [HOST[:PORT]]
                       Change the address used to reach a paired device (when its IP changed)
+  set-port [PORT]     Change the port this machine listens on (other devices then need
+                      `set-address` with the new port)
 
 Libraries (folders to sync)
   create [NAME] [FOLDER]            Create a library from a folder
@@ -388,6 +449,17 @@ shows the icon, and it stays when the window is closed. The *Home* page has the 
 it adds a launch agent, `~/Library/LaunchAgents/com.rustsync.tray.plist`. To quit the icon, use
 its menu.
 
+**Start at login needs the app in a stable place.** A freshly downloaded app that is run straight
+from the Downloads folder or a disk image is run by macOS from a temporary, randomised location
+that disappears at restart; a login entry pointing there can't start anything. rustsync notices
+this, refuses to add the entry, and asks you to move *RustSync.app* into *Applications* first
+(then switch the option on again). If it was switched on earlier, switch it off and on again once
+the app is in *Applications*. Whether the entries are allowed to run is also shown in *System
+Settings → General → Login Items & Extensions*. If you move the app *after* turning it on, the
+entries are repaired the next time you open the app and press *Start* (or run `rustsync start`);
+the icon's entry repairs itself when the icon runs. Starting rustsync by hand always works, even
+if the login entry is broken.
+
 ## The Android app
 
 An Android app (a phone or tablet, Android 8 or newer) lives in [`android/`](android/). It runs
@@ -415,7 +487,8 @@ allow installing from that source.
   running in the background. Phones that aggressively stop apps (battery savers) may need rustsync
   set to "unrestricted" battery use.
 - **Reaching the phone.** Other devices connect to the phone, so when you show a pairing code on it
-  the address must be one they can reach (the local Wi-Fi address it suggests works at home).
+  the address must be one they can reach: pick the Wi-Fi address from the drop-down (it works at
+  home) or choose *Set manually…*. The port it listens on can be changed on the *Home* page.
   Pairing the other way round (phone enters the code) works from anywhere the phone can reach the
   other machine.
 
@@ -572,7 +645,7 @@ manage them with the commands above. Everything in it is optional:
 name: laptop              # what other devices call this one (default: the host name)
 
 server:
-  port: 3032              # port to listen on
+  port: 3032              # port to listen on (or use `rustsync set-port`, or Home > Settings)
 
 sync_options:
   full_scan_interval: 30  # seconds between full re-scans (changes are also noticed instantly)
@@ -599,6 +672,7 @@ different `name` and `server.port`, and pass `-c` to every command.
 |---|---|
 | `rustsync is not running for this config` | `rustsync start` (use the same `-c` as before). |
 | The window can't start the service | Put `rustsync` next to `rustsync-gui` or on your `PATH`, or set `RUSTSYNC_BIN=/path/to/rustsync`. |
+| Start at login doesn't start anything (macOS) | Move *RustSync.app* to *Applications*, then switch the option off and on again; check *Login Items & Extensions* in System Settings and `daemon.log` in the state directory. |
 | Pairing fails | The code is one-time and only valid while `invite` is still waiting. Check the address you gave to `invite` is reachable from the other machine, and that the port (default 3032) isn't blocked by a firewall. |
 | The two verification codes differ | Answer no on both and start again. A different number means the two machines did not talk to each other directly, or someone else used the code first. |
 | The camera does not open (window) | Use the pasted code instead. On Linux the camera must be a normal video device (`/dev/video0`) your user can open; on macOS allow the camera in System Settings, Privacy & Security. |
@@ -615,6 +689,13 @@ Pairing is the trust step: only devices you paired can connect, over a Noise-pro
 (which also carries the inviting machine's key, so the joining machine knows it reached the right
 one) and then a person on **each** machine confirming the same verification code. A device you only back up to
 never sees your files, names or keys. The details, and what is and isn't protected, are in
-[`SECURITY.md`](SECURITY.md).
+[`SECURITY.md`](SECURITY.md), which also walks through each step (connecting, pairing, sharing, syncing,
+backups) with diagrams.
 
 Remember the note at the top: this code is AI-generated and has not been independently audited.
+
+## License
+
+rustsync is free software, released under the [GNU General Public License, version 2](LICENSE)
+(`GPL-2.0-only`). You may use, study, change and share it under those terms; there is no warranty.
+

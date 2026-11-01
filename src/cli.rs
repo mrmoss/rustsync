@@ -419,6 +419,30 @@ async fn stop_running(config_path: &Path, cfg: &Config) {
     }
 }
 
+/// The program a service entry will run, as written in the entry itself: the first quoted or
+/// `<string>` word after the marker.
+fn entry_program(text: &str, after: &str, open: &str, close: &str) -> Option<String> {
+    let rest = &text[text.find(after)? + after.len()..];
+    let rest = &rest[rest.find(open)? + open.len()..];
+    Some(rest[..rest.find(close)?].to_string())
+}
+
+/// A downloaded Mac app that has not been moved is run by macOS from a temporary copy that
+/// disappears at the next restart: a start-at-login entry pointing there can never work.
+#[cfg(target_os = "macos")]
+fn unstable_exe(exe: &Path) -> Option<String> {
+    if exe.to_string_lossy().contains("/AppTranslocation/") {
+        Some(
+            "RustSync is running from a temporary location (macOS does that to a downloaded app that has not been \
+             moved), which is gone after a restart. Move RustSync.app into your Applications folder in Finder, \
+             open it from there, and turn this on again."
+                .to_string(),
+        )
+    } else {
+        None
+    }
+}
+
 // ---- Linux: a systemd user service
 
 #[cfg(target_os = "linux")]
@@ -503,6 +527,16 @@ mod svc {
             return Ok(false);
         }
         let name = unit_name(config_path);
+        if let Ok(unit) = std::fs::read_to_string(unit_path(&name)) {
+            if let Some(prog) = entry_program(&unit, "ExecStart=", "\"", "\"") {
+                if !Path::new(&prog).exists() {
+                    // rustsync was moved or reinstalled somewhere else: point the service at this copy.
+                    println!("The service {} runs {} which is gone; updating it to use this copy.", name, prog);
+                    install(config_path, cfg, true).await?;
+                    return Ok(true);
+                }
+            }
+        }
         if systemctl(&["start", &name])? && wait_socket(cfg, true, 100).await {
             println!("rustsync started (systemd service {}).", name);
             return Ok(true);
@@ -663,8 +697,22 @@ mod svc {
         }
         let label = label(config_path);
         let target = format!("{}/{}", domain(), label);
-        // Loaded already? Kick it. Otherwise load it first.
+        if let Ok(plist) = std::fs::read_to_string(plist_path(&label)) {
+            if let Some(prog) = entry_program(&plist, "<key>ProgramArguments</key>", "<string>", "</string>") {
+                if !Path::new(&prog).exists() {
+                    // The app was moved: point the launch agent at the copy that is running now.
+                    if let Some(problem) = unstable_exe(&std::env::current_exe()?) {
+                        bail!("the launch agent {} runs {} which is gone. {}", label, prog, problem);
+                    }
+                    println!("The launch agent {} runs {} which is gone; updating it to use this copy.", label, prog);
+                    install(config_path, cfg, true).await?;
+                    return Ok(true);
+                }
+            }
+        }
+        // Loaded already? Kick it. Otherwise load it first (and make sure it is not switched off).
         if !launchctl(&["kickstart", &target]) {
+            launchctl(&["enable", &target]);
             launchctl(&["bootstrap", &domain(), &plist_path(&label).to_string_lossy()]);
             launchctl(&["kickstart", &target]);
         }
@@ -672,7 +720,11 @@ mod svc {
             println!("rustsync started (launch agent {}).", label);
             return Ok(true);
         }
-        bail!("the launch agent {} did not start; see {}", label, cfg.log_path().display())
+        bail!(
+            "the launch agent {} did not start (check System Settings, General, Login Items & Extensions, and {})",
+            label,
+            cfg.log_path().display()
+        )
     }
 
     pub async fn install(config_path: &Path, cfg: &Config, _yes: bool) -> Result<()> {
@@ -682,6 +734,9 @@ mod svc {
         cfg.ensure_dir()?;
         let abs = std::path::absolute(config_path)?;
         let exe = std::env::current_exe()?;
+        if let Some(problem) = unstable_exe(&exe) {
+            bail!("{}", problem);
+        }
         let label = label(config_path);
         let path = plist_path(&label);
         let log = xml(&cfg.log_path().to_string_lossy());
@@ -702,6 +757,7 @@ mod svc {
         stop_running(config_path, cfg).await;
         let target = format!("{}/{}", domain(), label);
         launchctl(&["bootout", &target]); // forget an older copy, if any (fails when none)
+        launchctl(&["enable", &target]); // in case it was switched off before
         if !launchctl(&["bootstrap", &domain(), &path.to_string_lossy()]) {
             bail!("launchctl could not load {}; try:  launchctl bootstrap {} {}", label, domain(), path.display());
         }
@@ -818,8 +874,15 @@ async fn start(config_path: &Path, cfg: &Config) -> Result<()> {
     cfg.ensure_dir()?;
 
     // Set up to start by itself: use that rather than a second copy.
-    if svc::start(config_path, cfg).await? {
-        return Ok(());
+    match svc::start(config_path, cfg).await {
+        Ok(true) => return Ok(()),
+        Ok(false) => {}
+        Err(e) => {
+            // A broken start-at-login entry must not stop you from starting by hand.
+            eprintln!("Warning: {:#}", e);
+            eprintln!("Starting rustsync directly instead. To repair the entry:  rustsync -c {} install-service", config_path.display());
+            return spawn_daemon(config_path, cfg).await;
+        }
     }
     // First time at a terminal: offer to start by itself in the future.
     let marker = cfg.dir.join("service-offered");
@@ -865,10 +928,16 @@ pub async fn run(config_path: &Path, cmd: Cmd) -> Result<()> {
         Cmd::Invite { host, no_qr, light_terminal } => {
             let host = match host {
                 Some(h) => h,
-                None => ask(
-                    "Address the other machine will use to reach this one (host or host:port)",
-                    &config::hostname(),
-                )?,
+                None => {
+                    let info = status(&ctl).await?;
+                    let mut choices: Vec<String> = info.addresses.iter().map(|(a, _)| a.clone()).collect();
+                    choices.extend(info.dns_names.iter().cloned());
+                    if !choices.is_empty() {
+                        eprintln!("This machine can be reached at: {}", choices.join(", "));
+                    }
+                    let default = choices.first().cloned().unwrap_or_else(config::hostname);
+                    ask("Address the other machine will use to reach this one (host or host:port)", &default)?
+                }
             };
             let qr = if no_qr { None } else { Some(light_terminal) };
             converse(&ctl, &Request::Invite { host }, qr).await?;
@@ -900,6 +969,18 @@ pub async fn run(config_path: &Path, cmd: Cmd) -> Result<()> {
                 return Ok(());
             }
             call(&ctl, &Request::Forget { device: info.devices[i].key.clone() }).await?;
+            Ok(())
+        }
+        Cmd::SetPort { port } => {
+            let info = status(&ctl).await?;
+            let port = match port {
+                Some(p) => p,
+                None => ask("New port to listen on", &info.port.to_string())?
+                    .trim()
+                    .parse::<u16>()
+                    .map_err(|_| anyhow!("that is not a port number (1 to 65535)"))?,
+            };
+            call(&ctl, &Request::SetPort { port }).await?;
             Ok(())
         }
         Cmd::SetAddress { device, address } => {

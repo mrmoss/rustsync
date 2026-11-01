@@ -45,6 +45,9 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y libxkbcommon-dev libwayland-dev
       - name: Package
         run: just package
+      - name: Debian package
+        if: startsWith(matrix.runner, 'ubuntu')
+        run: just deb
       - name: macOS app
         if: startsWith(matrix.runner, 'macos')
         run: just macos-app
@@ -54,6 +57,7 @@ jobs:
           path: |
             dist/*.tar.gz
             dist/*.app.zip
+            dist/*.deb
           if-no-files-found: error
 
   freebsd:
@@ -110,6 +114,8 @@ jobs:
           Downloads are for 64-bit Intel/AMD (`x86_64`) and ARM (`aarch64`). Check them against `SHA256SUMS`.
 
           - **Linux:** `rustsync-<version>-linux-<cpu>.tar.gz`, built on Ubuntu 22.04.
+            For Debian and Ubuntu (22.04 / Debian 12 or newer) there is also `rustsync_<version>_amd64.deb` (or `arm64`):
+            `sudo apt install ./rustsync_<version>_amd64.deb`.
           - **macOS:** `rustsync-<version>-macos-<cpu>.app.zip` is the app; the `.tar.gz` is just the programs. The builds are
             unsigned, so the first time, right-click the app and choose Open (or allow it in System Settings, Privacy & Security).
           - **FreeBSD:** `rustsync-<version>-freebsd-x86_64.tar.gz` has the service and command line only (no window).

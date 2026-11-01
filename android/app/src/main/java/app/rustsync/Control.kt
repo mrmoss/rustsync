@@ -33,6 +33,8 @@ data class Status(
     val key: String,
     val listen: String,
     val backupDir: String,
+    val port: Int,
+    val dnsNames: List<String>,
     val devices: List<DeviceInfo>,
     val libraries: List<LibraryInfo>,
     val offers: List<OfferInfo>,
@@ -64,6 +66,8 @@ private fun parseStatus(o: JSONObject): Status {
         key = o.optString("key"),
         listen = o.optString("listen"),
         backupDir = o.optString("backup_dir"),
+        port = o.optInt("port", 3032),
+        dnsNames = o.optJSONArray("dns_names").strings(),
         devices = (0 until (devices?.length() ?: 0)).map {
             val d = devices!!.getJSONObject(it)
             DeviceInfo(
@@ -133,6 +137,7 @@ object Req {
     fun invite(host: String) = obj("Invite", JSONObject().put("host", host))
     fun join(token: String) = obj("Join", JSONObject().put("token", token))
     fun decision(accept: Boolean) = obj("PairDecision", JSONObject().put("accept", accept))
+    fun setPort(port: Int) = obj("SetPort", JSONObject().put("port", port))
     fun forget(device: String) = obj("Forget", JSONObject().put("device", device))
     fun setAddress(device: String, addr: String) =
         obj("SetAddress", JSONObject().put("device", device).put("addr", addr))

@@ -34,6 +34,7 @@ enum Request {
     Invite { host: String },
     Join { token: String },
     PairDecision { accept: bool },
+    SetPort { port: u16 },
     Forget { device: String },
     SetAddress { device: String, addr: String },
     Create { name: String, folder: String },
@@ -75,6 +76,13 @@ struct StatusInfo {
     /// Suggested folder for encrypted backups kept on this machine.
     #[serde(default)]
     backup_dir: String,
+    #[serde(default)]
+    port: u16,
+    /// This machine's IPv4 addresses: (address, interface).
+    #[serde(default)]
+    addresses: Vec<(String, String)>,
+    #[serde(default)]
+    dns_names: Vec<String>,
 }
 
 #[derive(Deserialize, Debug, Clone)]
@@ -429,7 +437,7 @@ enum Dialog {
     Unshare { lib_id: String, lib_name: String, candidates: Vec<(String, String)>, sel: usize },
     Recovery { name: String, code: Option<String>, error: Option<String> },
     Restore { code: String, folder: String, device: usize },
-    Invite { host: String, code: Option<String>, note: String, error: Option<String>, running: bool, paired: bool },
+    Invite { host: String, manual: bool, code: Option<String>, note: String, error: Option<String>, running: bool, paired: bool },
     Join { code: String, running: bool, error: Option<String>, scanning: bool },
     ConfirmForget { key: String, name: String },
     Address { key: String, name: String, text: String },
@@ -452,6 +460,7 @@ enum Action {
     PairDecide { accept: bool },
     Forget { key: String },
     SetAddress { key: String, addr: String },
+    SetPort { port: u16 },
     Remove { id: String },
     StartInvite { host: String },
     CancelInvite,
@@ -477,6 +486,8 @@ struct App {
     /// The folder browser, while one is open over a dialog.
     browse: Option<Browse>,
     logo: egui::TextureHandle,
+    /// The port being typed on the Home page (None: show the current one).
+    port_edit: Option<String>,
 }
 
 impl App {
@@ -520,6 +531,7 @@ impl App {
             scan_tex: None,
             browse: None,
             logo,
+            port_edit: None,
         }
     }
 
@@ -872,6 +884,10 @@ impl App {
                 self.send_decision(accept);
             }
             Action::Forget { key } => self.run(Request::Forget { device: key }),
+            Action::SetPort { port } => {
+                self.port_edit = None;
+                self.run(Request::SetPort { port })
+            }
             Action::SetAddress { key, addr } => self.run(Request::SetAddress { device: key, addr }),
             Action::Remove { id } => self.run(Request::RemoveLibrary { library: id }),
             Action::StartInvite { host } => {
@@ -1126,8 +1142,10 @@ fn usage_bar(ui: &mut egui::Ui, used: u64, quota: u64) {
     }
 }
 
-fn dot(online: bool) -> RichText {
-    RichText::new("●").color(if online { GREEN } else { OFFLINE })
+/// A small filled circle (drawn, because the "●" character is a blank box in some fonts).
+fn status_dot(ui: &mut egui::Ui, color: Color32) {
+    let (rect, _) = ui.allocate_exact_size(Vec2::splat(12.0), egui::Sense::hover());
+    ui.painter().circle_filled(rect.center(), 4.5, color);
 }
 
 /// Draw `text` as a QR code (black on white, with the quiet zone scanners need).
@@ -1503,7 +1521,12 @@ impl eframe::App for App {
                         .corner_radius(CornerRadius::same(14))
                         .inner_margin(egui::Margin::symmetric(12, 5))
                         .show(ui, |ui| {
-                            ui.label(RichText::new(format!("●  {}", status_text)).small().color(if online { GREEN } else { RED }));
+                            ui.horizontal(|ui| {
+                                ui.spacing_mut().item_spacing.x = 6.0;
+                                let color = if online { GREEN } else { RED };
+                                status_dot(ui, color);
+                                ui.label(RichText::new(&status_text).small().color(color));
+                            });
                         });
                     if online && icon_button(ui, Glyph::Refresh, "Ask connected devices for their library lists again and look for backups") {
                         refresh = true;
@@ -1518,7 +1541,7 @@ impl eframe::App for App {
         egui::TopBottomPanel::bottom("status_bar").exact_height(32.0).show(ctx, |ui| {
             ui.horizontal_centered(|ui| match &self.message {
                 Some((ok, msg)) => {
-                    ui.label(RichText::new("●").color(if *ok { GREEN } else { RED }));
+                    status_dot(ui, if *ok { GREEN } else { RED });
                     ui.label(RichText::new(msg).small());
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         if ui.small_button("Dismiss").clicked() {
@@ -1527,7 +1550,7 @@ impl eframe::App for App {
                     });
                 }
                 None => {
-                    ui.label(RichText::new("●").color(MUTED));
+                    status_dot(ui, MUTED);
                     ui.label(RichText::new(format!("Config: {}", self.config.display())).small().weak());
                 }
             });
@@ -1793,8 +1816,15 @@ impl App {
             ui.label("On one machine choose “Show a pairing code”; on the other, “Enter a pairing code”.");
             ui.horizontal(|ui| {
                 if ui.button("Show a pairing code").clicked() {
+                    let first = status
+                        .addresses
+                        .first()
+                        .map(|a| a.0.clone())
+                        .or_else(|| status.dns_names.first().cloned())
+                        .unwrap_or_default();
                     self.dialog = Dialog::Invite {
-                        host: String::new(),
+                        manual: first.is_empty(),
+                        host: first,
                         code: None,
                         note: String::new(),
                         error: None,
@@ -1856,6 +1886,12 @@ impl App {
     fn show_home(&mut self, ui: &mut egui::Ui) {
         let Some(status) = self.status.clone() else { return };
         heading(ui, "Home", "This device: how it identifies itself to the others, and how it starts.");
+        if let Some(problem) = app_location_problem() {
+            card(ui, |ui| {
+                ui.label(RichText::new("Move this app first").strong().color(AMBER));
+                ui.add(egui::Label::new(problem).wrap());
+            });
+        }
 
         card(ui, |ui| {
             ui.label(RichText::new("Name").small().weak());
@@ -1872,6 +1908,43 @@ impl App {
             ui.add_space(4.0);
             ui.label(RichText::new("Listening on").small().weak());
             ui.label(&status.listen);
+        });
+
+        ui.add_space(8.0);
+        card(ui, |ui| {
+            ui.label(RichText::new("Settings").strong());
+            ui.label("Port this machine listens on for the other devices:");
+            let current = status.port.to_string();
+            let mut text = self.port_edit.clone().unwrap_or_else(|| current.clone());
+            let mut save = false;
+            ui.horizontal(|ui| {
+                let resp = ui.add(egui::TextEdit::singleline(&mut text).desired_width(90.0));
+                let parsed = text.trim().parse::<u16>().ok().filter(|p| *p > 0);
+                if resp.changed() {
+                    self.port_edit = Some(text.clone());
+                }
+                let changed = text.trim() != current;
+                let enter = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                if ui.add_enabled(changed && parsed.is_some(), primary("Save")).clicked() || (enter && changed && parsed.is_some()) {
+                    save = true;
+                }
+                if changed && ui.button("Reset").clicked() {
+                    self.port_edit = None;
+                }
+            });
+            if !text.trim().is_empty() && text.trim().parse::<u16>().ok().filter(|p| *p > 0).is_none() {
+                ui.label(RichText::new("A port is a number from 1 to 65535.").color(RED).small());
+            }
+            ui.label(
+                RichText::new("The default is 3032. Devices that connect to this machine need to use the new port too; use “Change address…” on their side.")
+                    .small()
+                    .weak(),
+            );
+            if save {
+                if let Ok(port) = text.trim().parse::<u16>() {
+                    self.perform(Action::SetPort { port });
+                }
+            }
         });
 
         ui.add_space(8.0);
@@ -1898,15 +1971,35 @@ impl App {
                     .on_hover_text("Opening this window also shows the icon. Quit it from its own menu.")
                     .changed()
                 {
-                    set_tray_login(&self.config, on);
-                    if on {
-                        ensure_tray_running(&self.config);
+                    match set_tray_login(&self.config, on) {
+                        Ok(()) => {
+                            if on {
+                                ensure_tray_running(&self.config);
+                            }
+                        }
+                        Err(e) => self.say(false, &e),
                     }
                 }
             }
             if ui.button("Stop RustSync").clicked() {
                 self.run(Request::Stop);
             }
+        });
+
+        ui.add_space(8.0);
+        card(ui, |ui| {
+            ui.label(RichText::new("About").strong());
+            ui.label(format!("RustSync {}", env!("CARGO_PKG_VERSION")));
+            ui.label("Made by Michael Moss with the aid of clankers.");
+            ui.label(
+                RichText::new(
+                    "Free software, released under the GNU General Public License, version 2 (GPL-2.0-only). \
+                     It comes with no warranty.",
+                )
+                .small()
+                .weak(),
+            );
+            ui.hyperlink_to("github.com/mrmoss/rustsync", "https://github.com/mrmoss/rustsync");
         });
     }
 
@@ -1922,6 +2015,11 @@ impl App {
         }
         let mut dialog = std::mem::take(&mut self.dialog);
         let devices: Vec<DeviceInfo> = self.status.as_ref().map(|s| s.devices.clone()).unwrap_or_default();
+        let (addresses, dns_names, listen_port) = self
+            .status
+            .as_ref()
+            .map(|s| (s.addresses.clone(), s.dns_names.clone(), s.port))
+            .unwrap_or_default();
         let mut action: Option<Action> = None;
         let mut close = false;
         let mut want_browse: Option<String> = None;
@@ -2034,16 +2132,44 @@ impl App {
                 });
             }
 
-            Dialog::Invite { host, code, note, error, running, paired } => {
+            Dialog::Invite { host, manual, code, note, error, running, paired } => {
                 window("Show a pairing code").show(ctx, |ui| {
                     if !*running && code.is_none() {
                         ui.label("Address the other machine will use to reach this one:");
-                        ui.add(
-                            egui::TextEdit::singleline(host)
-                                .hint_text("e.g. 192.168.1.20 or myserver.example.com")
-                                .desired_width(f32::INFINITY),
+                        let mut opts: Vec<(String, String)> =
+                            addresses.iter().map(|(a, i)| (format!("{}  ({})", a, i), a.clone())).collect();
+                        opts.extend(dns_names.iter().map(|n| (format!("{}  (host name)", n), n.clone())));
+                        let shown = if *manual {
+                            "Set manually…".to_string()
+                        } else {
+                            opts.iter().find(|o| o.1 == *host).map(|o| o.0.clone()).unwrap_or_else(|| "Choose an address".to_string())
+                        };
+                        egui::ComboBox::from_id_salt("invite_host").selected_text(shown).width(330.0).show_ui(ui, |ui| {
+                            for (label, value) in &opts {
+                                if ui.selectable_label(!*manual && *host == *value, label).clicked() {
+                                    *host = value.clone();
+                                    *manual = false;
+                                }
+                            }
+                            if ui.selectable_label(*manual, "Set manually…").clicked() {
+                                *manual = true;
+                            }
+                        });
+                        if *manual {
+                            ui.add(
+                                egui::TextEdit::singleline(host)
+                                    .hint_text("e.g. 192.168.1.20 or myserver.example.com")
+                                    .desired_width(f32::INFINITY),
+                            );
+                        }
+                        ui.label(
+                            RichText::new(format!(
+                                "Port {} is added for you; type :port after the address to use another. A host name works if the other machine can look it up.",
+                                if listen_port == 0 { 3032 } else { listen_port }
+                            ))
+                            .small()
+                            .weak(),
                         );
-                        ui.label(RichText::new("Add :port if it isn't the default (3032).").small().weak());
                         if let Some(e) = error {
                             ui.label(RichText::new(e.as_str()).color(RED));
                         }
@@ -2574,6 +2700,27 @@ fn run_tray(config: &Path) -> i32 {
     menubar::run(config)
 }
 
+/// On a Mac: a downloaded app that has not been moved runs from a temporary copy that is gone after
+/// a restart, so nothing that starts it (or its helper) at login can work until it is moved.
+#[cfg(target_os = "macos")]
+fn app_location_problem() -> Option<String> {
+    let exe = std::env::current_exe().ok()?;
+    if exe.to_string_lossy().contains("/AppTranslocation/") {
+        Some(
+            "RustSync is running from a temporary location (macOS does that to a downloaded app that has not been moved). \
+             Move RustSync.app into your Applications folder in Finder and open it from there; until then it cannot start itself at login."
+                .to_string(),
+        )
+    } else {
+        None
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn app_location_problem() -> Option<String> {
+    None
+}
+
 /// Is the icon set to start when the person logs in?
 #[cfg(all(feature = "tray", unix, not(any(target_os = "macos", target_os = "ios", target_os = "android"))))]
 fn tray_login_on(_config: &Path) -> bool {
@@ -2581,10 +2728,11 @@ fn tray_login_on(_config: &Path) -> bool {
 }
 
 #[cfg(all(feature = "tray", unix, not(any(target_os = "macos", target_os = "ios", target_os = "android"))))]
-fn set_tray_login(config: &Path, on: bool) {
+fn set_tray_login(config: &Path, on: bool) -> Result<(), String> {
     if tray::autostart_path().exists() != on {
         tray::toggle_autostart(config);
     }
+    Ok(())
 }
 
 #[cfg(all(feature = "tray", target_os = "macos"))]
@@ -2593,8 +2741,8 @@ fn tray_login_on(config: &Path) -> bool {
 }
 
 #[cfg(all(feature = "tray", target_os = "macos"))]
-fn set_tray_login(config: &Path, on: bool) {
-    menubar::set_login(config, on);
+fn set_tray_login(config: &Path, on: bool) -> Result<(), String> {
+    menubar::set_login(config, on)
 }
 
 #[cfg(not(any(
@@ -2609,7 +2757,9 @@ fn tray_login_on(_config: &Path) -> bool {
     all(feature = "tray", target_os = "macos"),
     all(feature = "tray", unix, not(any(target_os = "macos", target_os = "ios", target_os = "android")))
 )))]
-fn set_tray_login(_config: &Path, _on: bool) {}
+fn set_tray_login(_config: &Path, _on: bool) -> Result<(), String> {
+    Ok(())
+}
 
 /// Does this build have a tray / menu bar icon at all?
 fn tray_supported() -> bool {
@@ -2839,7 +2989,22 @@ mod tray {
 
     // -------- the tray process
 
+    /// If the app was moved after the icon was set to start at login, the entry points at a
+    /// program that is gone: point it at this copy.
+    fn heal_autostart(config: &Path) {
+        let path = autostart_path();
+        let Ok(text) = std::fs::read_to_string(&path) else { return };
+        let Some(start) = text.find("Exec=\"") else { return };
+        let rest = &text[start + 6..];
+        let Some(end) = rest.find('"') else { return };
+        if !Path::new(&rest[..end]).exists() {
+            let _ = std::fs::remove_file(&path);
+            toggle_autostart(config);
+        }
+    }
+
     pub fn run(config: &Path) -> i32 {
+        heal_autostart(config);
         // One icon per configuration.
         let Some(_lock) = lock_file(&tray_lock_path(config)) else { return 0 };
         let (tx, rx) = mpsc::channel::<Cmd>();
@@ -2979,13 +3144,16 @@ mod menubar {
         home().join("Library").join("LaunchAgents").join(format!("{}.plist", login_label(config)))
     }
 
-    pub fn set_login(config: &Path, on: bool) {
+    pub fn set_login(config: &Path, on: bool) -> Result<(), String> {
         let path = login_path(config);
         if !on {
             let _ = std::fs::remove_file(&path);
-            return;
+            return Ok(());
         }
-        let Ok(exe) = std::env::current_exe() else { return };
+        let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+        if let Some(problem) = app_location_problem() {
+            return Err(problem);
+        }
         let xml = |s: &str| s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;");
         let label = xml(&login_label(config));
         let exe = xml(&exe.to_string_lossy());
@@ -3007,9 +3175,7 @@ mod menubar {
         if let Some(dir) = path.parent() {
             let _ = std::fs::create_dir_all(dir);
         }
-        if let Err(e) = std::fs::write(&path, text) {
-            eprintln!("rustsync-gui: cannot write {}: {}", path.display(), e);
-        }
+        std::fs::write(&path, text).map_err(|e| format!("cannot write {}: {}", path.display(), e))
     }
 
     enum Msg {
@@ -3183,7 +3349,23 @@ mod menubar {
         }
     }
 
+    /// If the app was moved after the icon was set to start at login, the launch agent points at a
+    /// program that is gone: point it at this copy (it is read at the next login).
+    fn heal_login(config: &Path) {
+        let Ok(text) = std::fs::read_to_string(login_path(config)) else { return };
+        let Some(start) = text.find("<key>ProgramArguments</key>") else { return };
+        let rest = &text[start..];
+        let Some(a) = rest.find("<string>") else { return };
+        let rest = &rest[a + 8..];
+        let Some(b) = rest.find("</string>") else { return };
+        let old = rest[..b].replace("&lt;", "<").replace("&gt;", ">").replace("&amp;", "&");
+        if !Path::new(&old).exists() && app_location_problem().is_none() {
+            let _ = set_login(config, true);
+        }
+    }
+
     pub fn run(config: &Path) -> i32 {
+        heal_login(config);
         // One icon per configuration.
         let Some(_lock) = lock_file(&tray_lock_path(config)) else { return 0 };
         let mut builder = EventLoop::<Msg>::with_user_event();

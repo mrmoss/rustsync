@@ -26,6 +26,13 @@ jobs:
         run: cargo build --release
       - name: Test
         run: cargo test --release
+      - uses: taiki-e/install-action@just
+      - name: Debian package (checks the .deb can be made)
+        if: startsWith(matrix.os, 'ubuntu')
+        run: |
+          just deb
+          dpkg-deb --info dist/*.deb
+          dpkg-deb --contents dist/*.deb
       - name: macOS, also for Intel Macs
         if: startsWith(matrix.os, 'macos')
         run: |

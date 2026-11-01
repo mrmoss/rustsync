@@ -39,6 +39,9 @@ pub struct Config {
     /// The resolved state directory (filled in by `load`).
     #[serde(skip)]
     pub dir: PathBuf,
+    /// Where this config was read from (filled in by `load`).
+    #[serde(skip)]
+    pub path: PathBuf,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -214,11 +217,125 @@ pub fn load(path: &Path) -> Result<Config> {
             path.display()
         );
     }
+    cfg.path = path.to_path_buf();
     cfg.dir = match &cfg.state_dir {
         Some(d) => abs_path(Path::new(d)),
         None => default_state_dir(path),
     };
     Ok(cfg)
+}
+
+/// Write a new listening port into the config file, keeping the rest of the file (comments and
+/// all) as it is.
+pub fn set_port(path: &Path, port: u16) -> Result<()> {
+    let text = std::fs::read_to_string(path).with_context(|| format!("cannot read config {}", path.display()))?;
+    // `server: {port: 1}` and the like: rewrite the whole file (comments are lost).
+    if text.lines().any(|l| {
+        l.starts_with("server:") && !l["server:".len()..].trim_start().is_empty() && !l["server:".len()..].trim_start().starts_with('#')
+    }) {
+        let mut doc: serde_yaml::Value = serde_yaml::from_str(&text)?;
+        let map = doc.as_mapping_mut().ok_or_else(|| anyhow!("the config file is not a mapping"))?;
+        let key = serde_yaml::Value::from("server");
+        let mut server = map.get(&key).cloned().unwrap_or(serde_yaml::Value::Mapping(Default::default()));
+        if let Some(m) = server.as_mapping_mut() {
+            m.insert(serde_yaml::Value::from("port"), serde_yaml::Value::from(port as u64));
+        }
+        map.insert(key, server);
+        std::fs::write(path, serde_yaml::to_string(&doc)?)?;
+        return Ok(());
+    }
+    let mut out: Vec<String> = Vec::new();
+    let (mut in_server, mut done) = (false, false);
+    for line in text.lines() {
+        let indented = line.starts_with(' ') || line.starts_with('\t');
+        if !indented && !line.trim().is_empty() && !line.trim_start().starts_with('#') {
+            if in_server && !done {
+                out.push(format!("  port: {}", port));
+                done = true;
+            }
+            in_server = line.trim_end() == "server:";
+        } else if in_server && !done && line.trim_start().starts_with("port:") {
+            out.push(format!("  port: {}", port));
+            done = true;
+            continue;
+        }
+        out.push(line.to_string());
+    }
+    if in_server && !done {
+        out.push(format!("  port: {}", port));
+        done = true;
+    }
+    if !done {
+        out.push("server:".to_string());
+        out.push(format!("  port: {}", port));
+    }
+    let tmp = path.with_extension("yaml.tmp");
+    std::fs::write(&tmp, out.join("\n") + "\n")?;
+    std::fs::rename(&tmp, path)?;
+    Ok(())
+}
+
+/// The IPv4 addresses of this machine's network interfaces (not loopback, not link-local):
+/// (address, interface name).
+pub fn local_addresses() -> Vec<(String, String)> {
+    let mut out: Vec<(String, String)> = Vec::new();
+    let mut list: *mut libc::ifaddrs = std::ptr::null_mut();
+    // SAFETY: getifaddrs fills a list that is freed with freeifaddrs below; every pointer in it
+    // is only read while the list is alive.
+    unsafe {
+        if libc::getifaddrs(&mut list) != 0 {
+            return out;
+        }
+        let mut cur = list;
+        while !cur.is_null() {
+            let ifa = &*cur;
+            cur = ifa.ifa_next;
+            if ifa.ifa_addr.is_null() {
+                continue;
+            }
+            let flags = ifa.ifa_flags as u32;
+            if flags & (libc::IFF_UP as u32) == 0 || flags & (libc::IFF_LOOPBACK as u32) != 0 {
+                continue;
+            }
+            if (*ifa.ifa_addr).sa_family as i32 != libc::AF_INET {
+                continue;
+            }
+            let sin = &*(ifa.ifa_addr as *const libc::sockaddr_in);
+            let ip = std::net::Ipv4Addr::from(u32::from_be(sin.sin_addr.s_addr));
+            if ip.is_link_local() || ip.is_unspecified() || ip.is_loopback() {
+                continue;
+            }
+            let name = std::ffi::CStr::from_ptr(ifa.ifa_name).to_string_lossy().to_string();
+            let entry = (ip.to_string(), name);
+            if !out.contains(&entry) {
+                out.push(entry);
+            }
+        }
+        libc::freeifaddrs(list);
+    }
+    // Addresses on a home or office network first.
+    out.sort_by_key(|(a, _)| !a.parse::<std::net::Ipv4Addr>().map(|i| i.is_private()).unwrap_or(false));
+    out
+}
+
+/// Names other machines might be able to use to find this one: the machine's own host name, and
+/// `name.local` (found through Bonjour/mDNS on most home networks).
+pub fn dns_names() -> Vec<String> {
+    let mut buf = [0u8; 256];
+    // SAFETY: gethostname writes at most buf.len() bytes.
+    if unsafe { libc::gethostname(buf.as_mut_ptr() as *mut libc::c_char, buf.len()) } != 0 {
+        return Vec::new();
+    }
+    let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+    let name = String::from_utf8_lossy(&buf[..end]).trim().to_string();
+    if name.is_empty() || name == "localhost" {
+        return Vec::new();
+    }
+    let mut names = vec![name.clone()];
+    if !name.contains('.') {
+        names.push(format!("{}.local", name));
+    }
+    names
 }
 
 impl Config {

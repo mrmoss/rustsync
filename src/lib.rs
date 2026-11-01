@@ -82,6 +82,11 @@ pub enum Cmd {
         /// New address, `host` or `host:port` (asked if omitted; the current one is the default)
         address: Option<String>,
     },
+    /// Change the port this machine listens on (saved in the config file)
+    SetPort {
+        /// The new port (asked if omitted)
+        port: Option<u16>,
+    },
     /// Create a library: a named folder to sync
     Create {
         /// Library name (asked if omitted)

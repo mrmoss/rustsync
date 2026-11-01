@@ -51,10 +51,74 @@ _pack programs:
     rm -rf "$d"
     mkdir -p "$d"
     for p in {{programs}}; do cp "{{bin}}/$p" "$d/"; done
-    cp README.md SECURITY.md "$d/"
+    cp README.md SECURITY.md LICENSE "$d/"
     tar -C dist -czf "dist/{{name}}.tar.gz" "{{name}}"
     rm -rf "$d"
     echo "made dist/{{name}}.tar.gz"
+
+# Linux only: make dist/rustsync_<version>_<amd64|arm64>.deb (Debian, Ubuntu, Mint, ...). Needs dpkg-deb.
+deb: build
+    #!/bin/sh
+    set -eu
+    [ "$(uname)" = Linux ] || { echo "deb only works on Linux"; exit 1; }
+    command -v dpkg-deb >/dev/null || { echo "dpkg-deb is missing (apt install dpkg-dev)"; exit 1; }
+    case "{{cpu}}" in
+      x86_64)  arch=amd64 ;;
+      aarch64) arch=arm64 ;;
+      *) echo "no Debian architecture known for {{cpu}}"; exit 1 ;;
+    esac
+    pkg="dist/deb-root"
+    out="dist/rustsync_{{version}}_${arch}.deb"
+    rm -rf "$pkg"
+    mkdir -p "$pkg/DEBIAN" "$pkg/usr/bin" "$pkg/usr/share/applications" \
+             "$pkg/usr/share/icons/hicolor/256x256/apps" "$pkg/usr/share/doc/rustsync"
+    install -m 755 "{{bin}}/rustsync" "{{bin}}/rustsync-gui" "$pkg/usr/bin/"
+    install -m 644 assets/icon-256.png "$pkg/usr/share/icons/hicolor/256x256/apps/rustsync.png"
+    install -m 644 README.md SECURITY.md "$pkg/usr/share/doc/rustsync/"
+    install -m 644 LICENSE "$pkg/usr/share/doc/rustsync/copyright"
+    cat > "$pkg/usr/share/applications/rustsync.desktop" <<DESKTOP
+    [Desktop Entry]
+    Type=Application
+    Name=RustSync
+    Comment=Simple, encrypted file sync
+    Exec=rustsync-gui
+    Icon=rustsync
+    Terminal=false
+    Categories=Network;FileTransfer;Utility;
+    DESKTOP
+    # The libraries the programs need: let dpkg work them out (it needs a stub source package to
+    # run). If that is not possible, fall back to the C library, which every system has.
+    deps="libc6"
+    stub=$(mktemp -d)
+    mkdir "$stub/debian"
+    printf 'Source: rustsync\n\nPackage: rustsync\nArchitecture: any\n' > "$stub/debian/control"
+    if found=$(cd "$stub" && dpkg-shlibdeps -O -e"$OLDPWD/$pkg/usr/bin/rustsync" -e"$OLDPWD/$pkg/usr/bin/rustsync-gui" 2>/dev/null | sed -n 's/^shlibs:Depends=//p') && [ -n "$found" ]; then
+      deps="$found"
+    fi
+    rm -rf "$stub"
+    size=$(du -sk "$pkg" | cut -f1)
+    cat > "$pkg/DEBIAN/control" <<CONTROL
+    Package: rustsync
+    Version: {{version}}
+    Section: net
+    Priority: optional
+    Architecture: $arch
+    Maintainer: mrmoss <mrmoss@users.noreply.github.com>
+    Installed-Size: $size
+    Depends: $deps
+    Recommends: libxkbcommon-x11-0, libgl1 | libegl1
+    Homepage: https://github.com/mrmoss/rustsync
+    Description: Simple, end-to-end encrypted file sync between your own devices
+     rustsync keeps folders in sync between your machines, with encrypted
+     backups. It includes the sync service and command line (rustsync) and a
+     desktop window with a tray icon (rustsync-gui).
+     .
+     After installing, run "rustsync install-service" (or use the window) to
+     have it start by itself.
+    CONTROL
+    dpkg-deb --root-owner-group --build "$pkg" "$out" >/dev/null
+    rm -rf "$pkg"
+    echo "made $out"
 
 # macOS only: make dist/RustSync.app (with the logo) and a zip of it to hand out
 macos-app: build
@@ -97,7 +161,7 @@ macos-app: build
 # Android: build the Rust core for phones (needs the Android NDK and `cargo install cargo-ndk`)
 android-core:
     rustup target add aarch64-linux-android x86_64-linux-android
-    cargo ndk -t arm64-v8a -t x86_64 -o android/app/src/main/jniLibs build --release --lib --no-default-features
+    cargo ndk -p 26 -t arm64-v8a -t x86_64 -o android/app/src/main/jniLibs build --release --lib --no-default-features
 
 # Android: make dist/rustsync-<version>-android.apk (needs JDK 17, the Android SDK and `gradle`)
 android-apk: android-core

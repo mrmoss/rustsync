@@ -173,6 +173,7 @@ class Model(app: Application) : AndroidViewModel(app) {
     // ---------------------------------------------------------------- everything else
 
     fun forget(device: String) = run(Req.forget(device))
+    fun setPort(port: Int) = run(Req.setPort(port))
     fun setAddress(device: String, addr: String) = run(Req.setAddress(device, addr))
     fun createLibrary(name: String, folder: String) = run(Req.create(name, folder))
     fun removeLibrary(id: String) = run(Req.removeLibrary(id))
@@ -181,17 +182,23 @@ class Model(app: Application) : AndroidViewModel(app) {
     fun decline(offer: String) = run(Req.decline(offer))
     fun resync() = run(Req.refresh())
 
-    /** A guess at this phone's address on the local network, to prefill the pairing dialog. */
-    fun localAddress(): String {
+    /** This phone's IPv4 addresses (address, interface), home-network ones first. */
+    fun localAddresses(): List<Pair<String, String>> {
+        val found = ArrayList<Triple<Boolean, String, String>>()
         try {
             for (nif in NetworkInterface.getNetworkInterfaces()) {
                 if (nif.isLoopback || !nif.isUp) continue
                 for (addr in nif.inetAddresses) {
-                    if (addr is Inet4Address && addr.isSiteLocalAddress) return addr.hostAddress ?: ""
+                    if (addr is Inet4Address && !addr.isLinkLocalAddress && !addr.isLoopbackAddress) {
+                        found.add(Triple(addr.isSiteLocalAddress, addr.hostAddress ?: "", nif.name))
+                    }
                 }
             }
         } catch (_: Exception) {
         }
-        return ""
+        return found.sortedBy { !it.first }.map { it.second to it.third }.filter { it.first.isNotEmpty() }
     }
+
+    /** A guess at this phone's address on the local network, to prefill the pairing dialog. */
+    fun localAddress(): String = localAddresses().firstOrNull()?.first ?: ""
 }

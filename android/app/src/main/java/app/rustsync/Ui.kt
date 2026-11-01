@@ -19,6 +19,8 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.NavigationBar
 import androidx.compose.material3.NavigationBarItem
@@ -40,6 +42,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.platform.LocalClipboardManager
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
@@ -88,7 +91,7 @@ fun App(model: Model, hasAllFilesAccess: () -> Boolean, askAllFilesAccess: () ->
                 Offline(model.offline ?: "")
             } else {
                 when (tab) {
-                    0 -> ThisDevice(status, hasAllFilesAccess, askAllFilesAccess)
+                    0 -> ThisDevice(model, status, hasAllFilesAccess, askAllFilesAccess)
                     1 -> Libraries(model, status)
                     else -> Devices(model, status)
                 }
@@ -123,7 +126,7 @@ private fun Offline(reason: String) {
 // ---------------------------------------------------------------- Home
 
 @Composable
-private fun ThisDevice(status: Status, hasAllFilesAccess: () -> Boolean, askAllFilesAccess: () -> Unit) {
+private fun ThisDevice(model: Model, status: Status, hasAllFilesAccess: () -> Boolean, askAllFilesAccess: () -> Unit) {
     var allFiles by remember { mutableStateOf(hasAllFilesAccess()) }
     LaunchedEffect(Unit) { allFiles = hasAllFilesAccess() }
     val clipboard = LocalClipboardManager.current
@@ -152,6 +155,51 @@ private fun ThisDevice(status: Status, hasAllFilesAccess: () -> Boolean, askAllF
                     }) { Text("Open settings") }
                     TextButton(onClick = { allFiles = hasAllFilesAccess() }) { Text("I allowed it") }
                 }
+            }
+        }
+        RsCard(Modifier.fillMaxWidth()) {
+            Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                Text("Settings", style = MaterialTheme.typography.titleMedium)
+                Text("Port this phone listens on for the other devices:")
+                var port by remember(status.port) { mutableStateOf(status.port.toString()) }
+                val parsed = port.trim().toIntOrNull()?.takeIf { it in 1..65535 }
+                OutlinedTextField(
+                    value = port,
+                    onValueChange = { port = it.filter { c -> c.isDigit() }.take(5) },
+                    singleLine = true,
+                    label = { Text("Port") },
+                    isError = port.isNotBlank() && parsed == null,
+                )
+                Text(
+                    "The default is 3032. Other devices that connect to this phone need the new port too " +
+                        "(they can use “Change address”).",
+                    style = MaterialTheme.typography.bodySmall,
+                )
+                Button(
+                    enabled = parsed != null && parsed != status.port,
+                    onClick = { parsed?.let { model.setPort(it) } },
+                ) { Text("Save port") }
+            }
+        }
+        val context = LocalContext.current
+        val version = remember {
+            try {
+                context.packageManager.getPackageInfo(context.packageName, 0).versionName ?: ""
+            } catch (_: Exception) {
+                ""
+            }
+        }
+        RsCard(Modifier.fillMaxWidth()) {
+            Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                Text("About", style = MaterialTheme.typography.titleMedium)
+                Text(if (version.isEmpty()) "RustSync" else "RustSync $version")
+                Text("Made by Michael Moss with the aid of clankers.")
+                Text(
+                    "Free software, released under the GNU General Public License, version 2 (GPL-2.0-only). " +
+                        "It comes with no warranty.",
+                    style = MaterialTheme.typography.bodySmall,
+                )
+                Text("github.com/mrmoss/rustsync", style = MaterialTheme.typography.bodySmall)
             }
         }
         Text(
@@ -370,20 +418,55 @@ private fun Devices(model: Model, status: Status) {
     }
 
     if (askHost) {
-        var host by remember { mutableStateOf(model.localAddress()) }
+        val options = remember { model.localAddresses().map { (a, i) -> "$a  ($i)" to a } + status.dnsNames.map { "$it  (host name)" to it } }
+        var host by remember { mutableStateOf(options.firstOrNull()?.second ?: "") }
+        var manual by remember { mutableStateOf(options.isEmpty()) }
+        var open by remember { mutableStateOf(false) }
         AlertDialog(
             onDismissRequest = { askHost = false },
             title = { Text("Show a pairing code") },
             text = {
                 Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                     Text("The address the other device will use to reach this phone:")
-                    OutlinedTextField(
-                        value = host,
-                        onValueChange = { host = it },
-                        singleLine = true,
-                        label = { Text("e.g. 192.168.1.20") },
+                    Box {
+                        OutlinedButton(modifier = Modifier.fillMaxWidth(), onClick = { open = true }) {
+                            Text(
+                                if (manual) "Set manually…"
+                                else options.firstOrNull { it.second == host }?.first ?: "Choose an address",
+                            )
+                        }
+                        DropdownMenu(expanded = open, onDismissRequest = { open = false }) {
+                            for ((label, value) in options) {
+                                DropdownMenuItem(
+                                    text = { Text(label) },
+                                    onClick = {
+                                        host = value
+                                        manual = false
+                                        open = false
+                                    },
+                                )
+                            }
+                            DropdownMenuItem(
+                                text = { Text("Set manually…") },
+                                onClick = {
+                                    manual = true
+                                    open = false
+                                },
+                            )
+                        }
+                    }
+                    if (manual) {
+                        OutlinedTextField(
+                            value = host,
+                            onValueChange = { host = it },
+                            singleLine = true,
+                            label = { Text("e.g. 192.168.1.20 or a host name") },
+                        )
+                    }
+                    Text(
+                        "Port ${status.port} is added for you; type :port after the address to use another.",
+                        style = MaterialTheme.typography.bodySmall,
                     )
-                    Text("Add :port if it isn't 3032.", style = MaterialTheme.typography.bodySmall)
                 }
             },
             confirmButton = {
@@ -440,7 +523,7 @@ private fun Devices(model: Model, status: Status) {
                         label = { Text("e.g. 192.168.1.20") },
                     )
                     Text(
-                        "Add :port if it isn't 3032. Leave it empty if that device always calls this phone.",
+                        "Add :port if it isn't the default (3032). Leave it empty if that device always calls this phone.",
                         style = MaterialTheme.typography.bodySmall,
                     )
                 }

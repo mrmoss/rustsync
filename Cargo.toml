@@ -1,8 +1,9 @@
 [package]
 name = "rustsync"
-version = "0.3.1"
+version = "0.3.3"
 edition = "2021"
 rust-version = "1.81"
+license = "GPL-2.0-only"
 
 # The program is a library (the core, also used by the Android app) plus thin command-line and
 # window front ends.
