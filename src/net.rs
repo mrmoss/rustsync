@@ -210,6 +210,11 @@ async fn write_frame<W: AsyncWrite + Unpin>(w: &mut W, data: &[u8]) -> std::io::
     w.write_all(data).await
 }
 
+/// The pre-shared secret as the fixed-size array the Noise library wants.
+fn psk_array(psk: &[u8]) -> Result<&[u8; 32]> {
+    psk.try_into().map_err(|_| anyhow!("a pairing secret must be exactly 32 bytes"))
+}
+
 /// Run the Noise XX handshake. Returns the transport state and the peer's static public key.
 /// `psk` is the 32-byte secret code of the machine being called. It is mixed into every key
 /// from the first message on, so recorded traffic stays safe even if X25519 is broken later,
@@ -222,9 +227,9 @@ pub async fn handshake<S: AsyncRead + AsyncWrite + Unpin>(
 ) -> Result<(snow::TransportState, Vec<u8>)> {
     let params: snow::params::NoiseParams = PARAMS.parse()?;
     let builder = snow::Builder::new(params)
-        .local_private_key(&keys.private)
-        .psk(0, psk)
-        .prologue(PROLOGUE);
+        .local_private_key(&keys.private)?
+        .psk(0, psk_array(psk)?)?
+        .prologue(PROLOGUE)?;
     let mut hs = if initiator { builder.build_initiator()? } else { builder.build_responder()? };
     let mut buf = vec![0u8; MAX_RECORD];
     let mut my_turn = initiator;
@@ -258,9 +263,9 @@ pub async fn handshake_responder<S: AsyncRead + AsyncWrite + Unpin>(
     for (i, psk) in psks.iter().enumerate() {
         let params: snow::params::NoiseParams = PARAMS.parse()?;
         let mut hs = snow::Builder::new(params)
-            .local_private_key(&keys.private)
-            .psk(0, psk.as_slice())
-            .prologue(PROLOGUE)
+            .local_private_key(&keys.private)?
+            .psk(0, psk_array(psk)?)?
+            .prologue(PROLOGUE)?
             .build_responder()?;
         if hs.read_message(&first, &mut buf).is_err() {
             continue;
