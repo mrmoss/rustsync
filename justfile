@@ -56,12 +56,12 @@ _pack programs:
     rm -rf "$d"
     echo "made dist/{{name}}.tar.gz"
 
-# macOS only: make dist/rustsync.app (with the logo) and a zip of it to hand out
+# macOS only: make dist/RustSync.app (with the logo) and a zip of it to hand out
 macos-app: build
     #!/bin/sh
     set -eu
     [ "$(uname)" = Darwin ] || { echo "macos-app only works on a Mac"; exit 1; }
-    app=dist/rustsync.app
+    app=dist/RustSync.app
     icons=dist/rustsync.iconset
     rm -rf "$app" "$icons"
     mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources" "$icons"
@@ -77,8 +77,8 @@ macos-app: build
     <?xml version="1.0" encoding="UTF-8"?>
     <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
     <plist version="1.0"><dict>
-      <key>CFBundleName</key><string>rustsync</string>
-      <key>CFBundleDisplayName</key><string>rustsync</string>
+      <key>CFBundleName</key><string>RustSync</string>
+      <key>CFBundleDisplayName</key><string>RustSync</string>
       <key>CFBundleIdentifier</key><string>com.rustsync.gui</string>
       <key>CFBundleExecutable</key><string>rustsync-gui</string>
       <key>CFBundleIconFile</key><string>rustsync</string>
@@ -86,7 +86,7 @@ macos-app: build
       <key>CFBundleShortVersionString</key><string>{{version}}</string>
       <key>CFBundleVersion</key><string>{{version}}</string>
       <key>NSHighResolutionCapable</key><true/>
-      <key>NSCameraUsageDescription</key><string>rustsync uses the camera to read the QR code that pairs two devices.</string>
+      <key>NSCameraUsageDescription</key><string>RustSync uses the camera to read the QR code that pairs two devices.</string>
     </dict></plist>
     PLIST
     # Not signed by a developer, but sign it "ad hoc" so macOS accepts the pieces as one app.

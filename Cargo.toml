@@ -1,6 +1,6 @@
 [package]
 name = "rustsync"
-version = "0.2.2"
+version = "0.3.0"
 edition = "2021"
 rust-version = "1.81"
 
@@ -45,14 +45,20 @@ nokhwa = { version = "0.10", default-features = false, features = ["input-native
 jni = "0.21"
 
 # system tray icon for rustsync-gui: StatusNotifierItem over D-Bus (pure Rust, no GTK). Linux and
-# the BSDs (any desktop with a D-Bus session and a tray host); macOS has no such tray here.
+# the BSDs (any desktop with a D-Bus session and a tray host).
 [target.'cfg(all(unix, not(any(target_os = "macos", target_os = "ios", target_os = "android"))))'.dependencies]
 ksni = { version = "0.3", features = ["blocking"], optional = true }
+
+# The menu bar icon on macOS (the icon, and the event loop it needs).
+[target.'cfg(target_os = "macos")'.dependencies]
+tray-icon = { version = "0.19", default-features = false, optional = true }
+winit = { version = "0.30", optional = true }
 
 [features]
 default = ["gui", "tray", "camera"]
 gui = ["dep:eframe"]
-tray = ["dep:ksni"]
+# the tray icon on Linux/BSD, the menu bar icon on macOS
+tray = ["dep:ksni", "dep:tray-icon", "dep:winit"]
 # scan a pairing QR code with the camera in the window (Linux, macOS). If this does not build
 # on your machine, build without it: --no-default-features --features gui,tray
 camera = ["gui", "dep:nokhwa", "dep:rqrr"]

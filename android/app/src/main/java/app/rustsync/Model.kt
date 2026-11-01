@@ -53,7 +53,7 @@ class Model(app: Application) : AndroidViewModel(app) {
             offline = null
         } catch (e: Exception) {
             status = null
-            offline = e.message ?: "rustsync is not running"
+            offline = e.message ?: "RustSync is not running"
         }
     }
 

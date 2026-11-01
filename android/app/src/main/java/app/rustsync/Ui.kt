@@ -18,7 +18,6 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
-import androidx.compose.material3.Card
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.NavigationBar
@@ -54,11 +53,11 @@ import com.journeyapps.barcodescanner.BarcodeEncoder
 import com.journeyapps.barcodescanner.ScanContract
 import com.journeyapps.barcodescanner.ScanOptions
 
-private val tabs = listOf("This device" to "⚙", "Libraries" to "▦", "Devices" to "⌂")
+private val tabs = listOf("Home" to Glyph.Home, "Libraries" to Glyph.Folder, "Devices" to Glyph.Devices)
 
 @Composable
 fun App(model: Model, hasAllFilesAccess: () -> Boolean, askAllFilesAccess: () -> Unit) {
-    var tab by remember { mutableIntStateOf(0) } // "This device" first, and the one you land on
+    var tab by remember { mutableIntStateOf(0) } // Home first, and the one you land on
     val snackbar = remember { SnackbarHostState() }
     val message = model.message
     LaunchedEffect(message) {
@@ -76,7 +75,7 @@ fun App(model: Model, hasAllFilesAccess: () -> Boolean, askAllFilesAccess: () ->
                     NavigationBarItem(
                         selected = tab == i,
                         onClick = { tab = i },
-                        icon = { Text(icon, fontSize = 20.sp) },
+                        icon = { GlyphIcon(icon) },
                         label = { Text(label) },
                     )
                 }
@@ -116,20 +115,20 @@ private fun Offline(reason: String) {
     Column(Modifier.fillMaxSize().padding(24.dp), verticalArrangement = Arrangement.Center) {
         CircularProgressIndicator()
         Spacer(Modifier.height(12.dp))
-        Text("rustsync is starting…")
+        Text("RustSync is starting…")
         if (reason.isNotBlank() && reason != "Starting…") Text(reason, style = MaterialTheme.typography.bodySmall)
     }
 }
 
-// ---------------------------------------------------------------- This device
+// ---------------------------------------------------------------- Home
 
 @Composable
 private fun ThisDevice(status: Status, hasAllFilesAccess: () -> Boolean, askAllFilesAccess: () -> Unit) {
     var allFiles by remember { mutableStateOf(hasAllFilesAccess()) }
     LaunchedEffect(Unit) { allFiles = hasAllFilesAccess() }
     val clipboard = LocalClipboardManager.current
-    Page("This device", "How other devices see this phone.") {
-        Card(Modifier.fillMaxWidth()) {
+    Page("Home", "This phone: how other devices see it.") {
+        RsCard(Modifier.fillMaxWidth()) {
             Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
                 Text(status.name, style = MaterialTheme.typography.titleLarge)
                 Text("● running", color = MaterialTheme.colorScheme.primary)
@@ -137,15 +136,15 @@ private fun ThisDevice(status: Status, hasAllFilesAccess: () -> Boolean, askAllF
                 Text("Public key", style = MaterialTheme.typography.labelMedium)
                 Text(status.key, fontFamily = FontFamily.Monospace, fontSize = 12.sp)
                 TextButton(onClick = { clipboard.setText(AnnotatedString(status.key)) }) { Text("Copy key") }
-                Text("rustsync ${Core.version()}", style = MaterialTheme.typography.bodySmall)
+                Text("RustSync ${Core.version()}", style = MaterialTheme.typography.bodySmall)
             }
         }
         if (!allFiles) {
-            Card(Modifier.fillMaxWidth()) {
+            RsCard(Modifier.fillMaxWidth()) {
                 Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
                     Text("Allow access to your files", style = MaterialTheme.typography.titleMedium)
                     Text(
-                        "To sync folders like Documents or Pictures, rustsync needs “all files access”. " +
+                        "To sync folders like Documents or Pictures, RustSync needs “all files access”. " +
                             "Android asks for it on a separate settings screen.",
                     )
                     Button(onClick = {
@@ -156,7 +155,7 @@ private fun ThisDevice(status: Status, hasAllFilesAccess: () -> Boolean, askAllF
             }
         }
         Text(
-            "Keep the notification: it is what lets Android leave rustsync running in the background.",
+            "Keep the notification: it is what lets Android leave RustSync running in the background.",
             style = MaterialTheme.typography.bodySmall,
         )
     }
@@ -181,7 +180,7 @@ private fun Libraries(model: Model, status: Status) {
 
     Page("Libraries", "Named folders kept in sync between your devices.") {
         for (offer in status.offers) {
-            Card(Modifier.fillMaxWidth()) {
+            RsCard(Modifier.fillMaxWidth()) {
                 Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
                     val what = if (offer.backup) "keep an encrypted backup of “${offer.name}”" else "sync “${offer.name}”"
                     Text("${offer.fromName} wants to $what", style = MaterialTheme.typography.titleMedium)
@@ -194,9 +193,12 @@ private fun Libraries(model: Model, status: Status) {
         }
         if (status.libraries.isEmpty()) Text("No libraries yet.")
         for (lib in status.libraries) {
-            Card(Modifier.fillMaxWidth()) {
+            RsCard(Modifier.fillMaxWidth()) {
                 Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
-                    Text(lib.name, style = MaterialTheme.typography.titleMedium)
+                    Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                        GlyphTile(Glyph.Folder)
+                        Text(lib.name, style = MaterialTheme.typography.titleMedium)
+                    }
                     Text(lib.folder, fontFamily = FontFamily.Monospace, fontSize = 12.sp)
                     if (lib.backupOnly) Text("Encrypted backup (unreadable here)")
                     if (lib.syncingWith.isNotEmpty()) Text("Syncing with: ${lib.syncingWith.joinToString(", ")}")
@@ -322,22 +324,33 @@ private fun Devices(model: Model, status: Status) {
     var askHost by remember { mutableStateOf(false) }
     var enter by remember { mutableStateOf(false) }
     var forgetting by remember { mutableStateOf<DeviceInfo?>(null) }
+    val scan = rememberLauncherForActivityResult(ScanContract()) { result ->
+        val text = result.contents
+        if (text != null) model.enterCode(text)
+    }
 
     Page("Devices", "Pair your devices once; then share libraries between them.") {
-        Card(Modifier.fillMaxWidth()) {
+        RsCard(Modifier.fillMaxWidth()) {
             Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
                 Text("Add a device", style = MaterialTheme.typography.titleMedium)
-                Text("On one device choose “Show a pairing code”; on the other, “Enter or scan a code”.")
-                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    Button(onClick = { askHost = true }) { Text("Show a code") }
-                    OutlinedButton(onClick = { enter = true }) { Text("Enter or scan") }
+                Text("Scan the QR code the other device is showing. Or show one on this phone and scan it from there.")
+                Button(modifier = Modifier.fillMaxWidth().height(52.dp), onClick = { scan.launch(scanOptions()) }) {
+                    Text("Scan a code")
+                }
+                OutlinedButton(modifier = Modifier.fillMaxWidth(), onClick = { askHost = true }) {
+                    Text("Show a code on this phone")
+                }
+                TextButton(modifier = Modifier.align(Alignment.CenterHorizontally), onClick = { enter = true }) {
+                    Text("Enter a code by hand", style = MaterialTheme.typography.bodySmall)
                 }
             }
         }
         if (status.devices.isEmpty()) Text("No devices yet.")
         for (d in status.devices) {
-            Card(Modifier.fillMaxWidth()) {
+            RsCard(Modifier.fillMaxWidth()) {
                 Row(Modifier.padding(16.dp), verticalAlignment = Alignment.CenterVertically) {
+                    if (d.online) GlyphTile(Glyph.Devices, Good, GoodSoft) else GlyphTile(Glyph.Devices, Muted, MaterialTheme.colorScheme.outlineVariant)
+                    Spacer(Modifier.size(12.dp))
                     Column(Modifier.weight(1f)) {
                         Text(d.name, style = MaterialTheme.typography.titleMedium)
                         Text(
@@ -384,33 +397,16 @@ private fun Devices(model: Model, status: Status) {
 
     if (enter) {
         var code by remember { mutableStateOf("") }
-        val scan = rememberLauncherForActivityResult(ScanContract()) { result ->
-            val text = result.contents
-            if (text != null) {
-                enter = false
-                model.enterCode(text)
-            }
-        }
         AlertDialog(
             onDismissRequest = { enter = false },
-            title = { Text("Enter a pairing code") },
+            title = { Text("Enter a code by hand") },
             text = {
-                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                    OutlinedTextField(
-                        value = code,
-                        onValueChange = { code = it },
-                        label = { Text("Pairing code") },
-                        minLines = 3,
-                    )
-                    OutlinedButton(onClick = {
-                        val options = ScanOptions()
-                            .setDesiredBarcodeFormats(listOf("QR_CODE"))
-                            .setPrompt("Scan the QR code on the other device")
-                            .setBeepEnabled(false)
-                            .setOrientationLocked(false)
-                        scan.launch(options)
-                    }) { Text("Scan its QR code") }
-                }
+                OutlinedTextField(
+                    value = code,
+                    onValueChange = { code = it },
+                    label = { Text("Pairing code") },
+                    minLines = 3,
+                )
             },
             confirmButton = {
                 TextButton(
@@ -442,6 +438,14 @@ private fun Devices(model: Model, status: Status) {
 }
 
 // ---------------------------------------------------------------- pairing
+
+/** The camera screen: upright, QR codes only. */
+private fun scanOptions(): ScanOptions = ScanOptions()
+    .setDesiredBarcodeFormats(listOf("QR_CODE"))
+    .setPrompt("Point the camera at the QR code on the other device")
+    .setBeepEnabled(false)
+    .setOrientationLocked(false)
+    .setCaptureActivity(PortraitCaptureActivity::class.java)
 
 @Composable
 private fun QrImage(text: String, size: Dp = 240.dp) {
@@ -516,7 +520,7 @@ private fun PairingDialogs(model: Model) {
                         invite.error != null -> Text(invite.error)
                         invite.code == null -> CircularProgressIndicator()
                         else -> {
-                            Text("On the other device choose “Enter or scan a code” and scan this:")
+                            Text("On the other device tap “Scan a code” and point it at this:")
                             QrImage(invite.code)
                             Text(invite.code, fontFamily = FontFamily.Monospace, fontSize = 10.sp)
                             TextButton(onClick = { clipboard.setText(AnnotatedString(invite.code)) }) { Text("Copy code") }

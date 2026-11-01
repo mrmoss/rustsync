@@ -191,7 +191,7 @@ class Control(private val dataDir: String) {
                 }
             }
         }
-        error("rustsync did not answer")
+        error("RustSync did not answer")
     }
 
     /** Run a one-shot request; returns what it printed. Throws with the daemon's message. */

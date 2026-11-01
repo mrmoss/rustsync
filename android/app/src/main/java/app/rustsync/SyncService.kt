@@ -21,7 +21,7 @@ class SyncService : Service() {
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         val manager = getSystemService(NotificationManager::class.java)
         manager.createNotificationChannel(
-            NotificationChannel(CHANNEL, "rustsync", NotificationManager.IMPORTANCE_LOW),
+            NotificationChannel(CHANNEL, "RustSync", NotificationManager.IMPORTANCE_LOW),
         )
         val open = PendingIntent.getActivity(
             this,
@@ -30,7 +30,7 @@ class SyncService : Service() {
             PendingIntent.FLAG_IMMUTABLE,
         )
         val notification: Notification = Notification.Builder(this, CHANNEL)
-            .setContentTitle("rustsync is running")
+            .setContentTitle("RustSync is running")
             .setContentText("Keeping your libraries in sync")
             .setSmallIcon(android.R.drawable.stat_notify_sync)
             .setContentIntent(open)

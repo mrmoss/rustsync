@@ -5,7 +5,8 @@
 //! share | accept ...` use. Close this window and the service keeps syncing.
 //!
 //! Usage:  rustsync-gui [-c /path/to/config.yaml] [--tray | --no-tray]
-//!   --tray     only the tray icon, no window (start this at login; the icon opens the window)
+//!   --tray     only the tray icon (the menu bar icon on macOS), no window (start this at login;
+//!              the icon opens the window)
 //!   --no-tray  window only; do not start the tray icon
 //! (default config: ~/.config/rustsync/config.yaml, like the command line)
 
@@ -198,7 +199,7 @@ fn call(
     cancel: Option<&Arc<Mutex<Option<UnixStream>>>>,
     mut on_reply: impl FnMut(Reply),
 ) -> Result<(), String> {
-    let stream = UnixStream::connect(sock).map_err(|_| "rustsync is not running".to_string())?;
+    let stream = UnixStream::connect(sock).map_err(|_| "RustSync is not running".to_string())?;
     if let Some(slot) = cancel {
         if let Ok(handle) = stream.try_clone() {
             *slot.lock().unwrap() = Some(handle);
@@ -215,7 +216,7 @@ fn call(
             Ok(Reply::Done) => return Ok(()),
             Ok(Reply::Error(e)) => return Err(e),
             Ok(other) => on_reply(other),
-            Err(e) => return Err(format!("unexpected answer from rustsync: {}", e)),
+            Err(e) => return Err(format!("unexpected answer from RustSync: {}", e)),
         }
     }
     Ok(())
@@ -228,7 +229,7 @@ fn fetch_status(sock: &Path) -> Result<StatusInfo, String> {
             info = Some(i);
         }
     })?;
-    info.ok_or_else(|| "rustsync did not answer".to_string())
+    info.ok_or_else(|| "RustSync did not answer".to_string())
 }
 
 // ---------------------------------------------------------------- finding things
@@ -297,9 +298,9 @@ fn service_installed(config: &Path) -> bool {
 
 /// The wording of the "start automatically" switch on this system.
 #[cfg(target_os = "linux")]
-const AUTOSTART_LABEL: &str = "Start rustsync automatically (when you log in, or at boot)";
+const AUTOSTART_LABEL: &str = "Start RustSync automatically (when you log in, or at boot)";
 #[cfg(not(target_os = "linux"))]
-const AUTOSTART_LABEL: &str = "Start rustsync automatically (when you log in)";
+const AUTOSTART_LABEL: &str = "Start RustSync automatically (when you log in)";
 
 /// Turn "start by itself" on or off through the `rustsync` program.
 fn set_service_blocking(config: &Path, on: bool) -> Result<(), String> {
@@ -411,7 +412,7 @@ struct Verify {
 #[derive(Default, PartialEq, Clone, Copy)]
 enum Page {
     #[default]
-    ThisDevice,
+    Home,
     Libraries,
     Devices,
 }
@@ -470,6 +471,9 @@ struct App {
     verify: Option<Verify>,
     scan_stop: Option<Arc<AtomicBool>>,
     scan_tex: Option<egui::TextureHandle>,
+    /// The folder browser, while one is open over a dialog.
+    browse: Option<Browse>,
+    logo: egui::TextureHandle,
 }
 
 impl App {
@@ -489,6 +493,12 @@ impl App {
             });
         }
 
+        let logo = cc.egui_ctx.load_texture(
+            "logo",
+            egui::ColorImage::from_rgba_unmultiplied([128, 128], ICON_128),
+            egui::TextureOptions::LINEAR,
+        );
+
         App {
             ctx: cc.egui_ctx.clone(),
             config,
@@ -498,13 +508,15 @@ impl App {
             status: None,
             offline_reason: String::new(),
             starting_since: None,
-            page: Page::ThisDevice,
+            page: Page::Home,
             dialog: Dialog::None,
             message: None,
             invite_cancel: Arc::new(Mutex::new(None)),
             verify: None,
             scan_stop: None,
             scan_tex: None,
+            browse: None,
+            logo,
         }
     }
 
@@ -563,9 +575,9 @@ impl App {
                 Ok(()) => Ev::Op {
                     ok: true,
                     msg: if on {
-                        "rustsync will start by itself".to_string()
+                        "RustSync will start by itself".to_string()
                     } else {
-                        "rustsync no longer starts by itself, and has been stopped".to_string()
+                        "RustSync no longer starts by itself, and has been stopped".to_string()
                     },
                 },
                 Err(msg) => Ev::Op { ok: false, msg },
@@ -592,11 +604,11 @@ impl App {
             let ev = match res {
                 Ok(s) if s.success() => None,
                 Ok(_) => Some(format!(
-                    "rustsync did not start; see daemon.log in {}",
+                    "RustSync did not start; see daemon.log in {}",
                     state_dir(&config).display()
                 )),
                 Err(e) => Some(format!(
-                    "cannot run {} ({}). Put rustsync next to this program, or set RUSTSYNC_BIN.",
+                    "cannot run {} ({}). Put the rustsync program next to this one, or set RUSTSYNC_BIN.",
                     bin.display(),
                     e
                 )),
@@ -874,22 +886,57 @@ impl App {
 
 // ---------------------------------------------------------------- look
 
-const BLUE: Color32 = Color32::from_rgb(105, 175, 255);
-const GREEN: Color32 = Color32::from_rgb(105, 210, 155);
-const RED: Color32 = Color32::from_rgb(235, 110, 110);
-const MUTED: Color32 = Color32::from_rgb(145, 165, 192);
-const CARD: Color32 = Color32::from_rgb(27, 33, 46);
+// One palette for every RustSync app (the Android app uses the same values): a neutral,
+// slightly warm graphite with the logo's orange as the only accent.
+const ACCENT: Color32 = Color32::from_rgb(255, 138, 76);
+const ACCENT_SOFT: Color32 = Color32::from_rgb(52, 34, 26);
+const ACCENT_LINE: Color32 = Color32::from_rgb(122, 70, 42);
+const GREEN: Color32 = Color32::from_rgb(82, 201, 140);
+const GREEN_SOFT: Color32 = Color32::from_rgb(25, 50, 40);
+const RED: Color32 = Color32::from_rgb(240, 98, 98);
+const RED_SOFT: Color32 = Color32::from_rgb(58, 28, 28);
+const AMBER: Color32 = Color32::from_rgb(240, 182, 80);
+const MUTED: Color32 = Color32::from_rgb(150, 150, 162);
+const OFFLINE: Color32 = Color32::from_rgb(110, 110, 120);
+const TEXT: Color32 = Color32::from_rgb(226, 226, 232);
+const PANEL: Color32 = Color32::from_rgb(18, 18, 20);
+const SIDEBAR: Color32 = Color32::from_rgb(14, 14, 16);
+const CARD: Color32 = Color32::from_rgb(27, 27, 31);
+const CARD_LINE: Color32 = Color32::from_rgb(44, 44, 50);
+const FIELD: Color32 = Color32::from_rgb(11, 11, 13);
+const HOVER: Color32 = Color32::from_rgb(38, 38, 44);
 
 fn configure_style(ctx: &egui::Context) {
     let mut style = (*ctx.style()).clone();
     style.visuals = egui::Visuals::dark();
-    style.visuals.panel_fill = Color32::from_rgb(20, 25, 36);
-    style.visuals.window_fill = Color32::from_rgb(27, 33, 46);
-    style.visuals.extreme_bg_color = Color32::from_rgb(14, 18, 27);
-    style.visuals.widgets.inactive.bg_fill = Color32::from_rgb(39, 48, 65);
-    style.visuals.widgets.hovered.bg_fill = Color32::from_rgb(54, 68, 91);
-    style.visuals.widgets.active.bg_fill = Color32::from_rgb(55, 112, 190);
-    style.visuals.selection.bg_fill = Color32::from_rgb(50, 115, 190);
+    let v = &mut style.visuals;
+    v.panel_fill = PANEL;
+    v.window_fill = CARD;
+    v.window_stroke = Stroke::new(1.0, CARD_LINE);
+    v.window_corner_radius = CornerRadius::same(12);
+    v.extreme_bg_color = FIELD;
+    v.hyperlink_color = ACCENT;
+    v.selection.bg_fill = Color32::from_rgb(140, 78, 46);
+    v.selection.stroke = Stroke::new(1.0, ACCENT);
+    v.widgets.noninteractive.fg_stroke = Stroke::new(1.0, TEXT);
+    v.widgets.noninteractive.bg_stroke = Stroke::new(1.0, CARD_LINE);
+    v.widgets.inactive.bg_fill = Color32::from_rgb(40, 40, 46);
+    v.widgets.inactive.weak_bg_fill = Color32::from_rgb(40, 40, 46);
+    v.widgets.inactive.fg_stroke = Stroke::new(1.0, Color32::from_rgb(220, 220, 226));
+    v.widgets.hovered.bg_fill = Color32::from_rgb(54, 54, 62);
+    v.widgets.hovered.weak_bg_fill = Color32::from_rgb(54, 54, 62);
+    v.widgets.hovered.fg_stroke = Stroke::new(1.0, Color32::from_rgb(245, 245, 248));
+    v.widgets.active.bg_fill = Color32::from_rgb(112, 64, 40);
+    v.widgets.active.weak_bg_fill = Color32::from_rgb(112, 64, 40);
+    for w in [
+        &mut v.widgets.noninteractive,
+        &mut v.widgets.inactive,
+        &mut v.widgets.hovered,
+        &mut v.widgets.active,
+        &mut v.widgets.open,
+    ] {
+        w.corner_radius = CornerRadius::same(8);
+    }
     style.spacing.item_spacing = Vec2::new(10.0, 10.0);
     style.spacing.button_padding = Vec2::new(14.0, 8.0);
     ctx.set_style(style);
@@ -899,22 +946,143 @@ fn card(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui)) {
     let style = (*ui.style()).clone();
     egui::Frame::group(&style)
         .fill(CARD)
-        .stroke(Stroke::new(1.0, Color32::from_rgb(45, 54, 72)))
-        .corner_radius(CornerRadius::same(10))
+        .stroke(Stroke::new(1.0, CARD_LINE))
+        .corner_radius(CornerRadius::same(12))
+        .inner_margin(egui::Margin::same(14))
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
             add(ui);
         });
 }
 
-fn nav_button(ui: &mut egui::Ui, icon: &str, label: &str, selected: bool) -> bool {
-    let fill = if selected { Color32::from_rgb(38, 68, 105) } else { Color32::TRANSPARENT };
-    let text_color = if selected { Color32::from_rgb(145, 200, 255) } else { Color32::from_rgb(205, 215, 230) };
-    let button = egui::Button::new(RichText::new(format!("{icon}   {label}")).color(text_color))
-        .fill(fill)
-        .stroke(if selected { Stroke::new(1.0, Color32::from_rgb(60, 120, 190)) } else { Stroke::NONE })
-        .corner_radius(CornerRadius::same(7));
-    ui.add_sized([ui.available_width(), 38.0], button).clicked()
+/// The main button of a dialog or page.
+fn primary(text: &str) -> egui::Button<'static> {
+    egui::Button::new(RichText::new(text).strong().color(Color32::from_rgb(28, 16, 8)))
+        .fill(ACCENT)
+        .corner_radius(CornerRadius::same(8))
+}
+
+// ---- icons, drawn with lines so they look the same on every system (fonts differ a lot).
+
+#[derive(Clone, Copy, PartialEq)]
+enum Glyph {
+    Home,
+    Folder,
+    Devices,
+    Plus,
+    Refresh,
+}
+
+fn paint_glyph(painter: &egui::Painter, glyph: Glyph, rect: egui::Rect, color: Color32) {
+    let size = rect.width().min(rect.height());
+    let at = |x: f32, y: f32| egui::pos2(rect.min.x + x * size, rect.min.y + y * size);
+    let width = (size / 11.0).max(1.5);
+    let stroke = Stroke::new(width, color);
+    // A line through the points with round ends and corners.
+    let poly = |pts: Vec<egui::Pos2>, closed: bool| {
+        for p in &pts {
+            painter.circle_filled(*p, width / 2.0, color);
+        }
+        if closed {
+            painter.add(egui::Shape::closed_line(pts, stroke));
+        } else {
+            painter.add(egui::Shape::line(pts, stroke));
+        }
+    };
+    match glyph {
+        Glyph::Home => {
+            poly(vec![at(0.10, 0.50), at(0.50, 0.14), at(0.90, 0.50)], false);
+            poly(vec![at(0.22, 0.42), at(0.22, 0.86), at(0.78, 0.86), at(0.78, 0.42)], false);
+            poly(vec![at(0.42, 0.86), at(0.42, 0.60), at(0.58, 0.60), at(0.58, 0.86)], false);
+        }
+        Glyph::Folder => {
+            poly(
+                vec![at(0.10, 0.22), at(0.40, 0.22), at(0.50, 0.34), at(0.90, 0.34), at(0.90, 0.80), at(0.10, 0.80)],
+                true,
+            );
+        }
+        Glyph::Devices => {
+            poly(vec![at(0.10, 0.20), at(0.90, 0.20), at(0.90, 0.64), at(0.10, 0.64)], true);
+            poly(vec![at(0.50, 0.64), at(0.50, 0.82)], false);
+            poly(vec![at(0.30, 0.84), at(0.70, 0.84)], false);
+        }
+        Glyph::Plus => {
+            poly(vec![at(0.50, 0.18), at(0.50, 0.82)], false);
+            poly(vec![at(0.18, 0.50), at(0.82, 0.50)], false);
+        }
+        Glyph::Refresh => {
+            // An open circle with an arrow head at its end.
+            let (cx, cy, r) = (0.5f32, 0.5f32, 0.32f32);
+            let (a0, a1) = (50.0f32.to_radians(), 330.0f32.to_radians());
+            let steps = 24;
+            let pts: Vec<egui::Pos2> = (0..=steps)
+                .map(|i| {
+                    let a = a0 + (a1 - a0) * i as f32 / steps as f32;
+                    at(cx + r * a.cos(), cy + r * a.sin())
+                })
+                .collect();
+            painter.add(egui::Shape::line(pts, stroke));
+            let (c, sn) = (a1.cos(), a1.sin());
+            let end = (cx + r * c, cy + r * sn);
+            let tangent = (-sn, c);
+            let tip = at(end.0 + tangent.0 * 0.17, end.1 + tangent.1 * 0.17);
+            let left = at(end.0 + c * 0.13, end.1 + sn * 0.13);
+            let right = at(end.0 - c * 0.13, end.1 - sn * 0.13);
+            painter.add(egui::Shape::convex_polygon(vec![tip, left, right], color, Stroke::NONE));
+        }
+    }
+}
+
+/// A rounded square with an icon, for the head of a card.
+fn tile(ui: &mut egui::Ui, glyph: Glyph, color: Color32, fill: Color32) {
+    let (rect, _) = ui.allocate_exact_size(Vec2::splat(42.0), egui::Sense::hover());
+    ui.painter().rect_filled(rect, CornerRadius::same(11), fill);
+    paint_glyph(ui.painter(), glyph, rect.shrink(10.0), color);
+}
+
+/// A row with an icon and a label (the side menu, the folder list).
+fn icon_row(ui: &mut egui::Ui, glyph: Glyph, label: &str, selected: bool, height: f32) -> egui::Response {
+    let (rect, resp) = ui.allocate_exact_size(Vec2::new(ui.available_width(), height), egui::Sense::click());
+    let hovered = resp.hovered();
+    let fill = if selected {
+        ACCENT_SOFT
+    } else if hovered {
+        HOVER
+    } else {
+        Color32::TRANSPARENT
+    };
+    let color = if selected { ACCENT } else { TEXT };
+    let painter = ui.painter();
+    painter.rect_filled(rect, CornerRadius::same(8), fill);
+    if selected {
+        painter.rect_filled(
+            egui::Rect::from_min_size(egui::pos2(rect.min.x, rect.center().y - 10.0), Vec2::new(3.0, 20.0)),
+            CornerRadius::same(2),
+            ACCENT,
+        );
+    }
+    let icon = egui::Rect::from_center_size(egui::pos2(rect.min.x + 24.0, rect.center().y), Vec2::splat(20.0));
+    paint_glyph(painter, glyph, icon, color);
+    painter.text(
+        egui::pos2(rect.min.x + 44.0, rect.center().y),
+        egui::Align2::LEFT_CENTER,
+        label,
+        egui::FontId::proportional(15.0),
+        color,
+    );
+    resp.on_hover_cursor(egui::CursorIcon::PointingHand)
+}
+
+/// A small square icon button; true when clicked.
+fn icon_button(ui: &mut egui::Ui, glyph: Glyph, tip: &str) -> bool {
+    let (rect, resp) = ui.allocate_exact_size(Vec2::splat(34.0), egui::Sense::click());
+    let hovered = resp.hovered();
+    if hovered {
+        ui.painter().rect_filled(rect, CornerRadius::same(9), HOVER);
+    }
+    let icon = egui::Rect::from_center_size(rect.center(), Vec2::splat(19.0));
+    paint_glyph(ui.painter(), glyph, icon, if hovered { TEXT } else { MUTED });
+    resp.on_hover_text(tip).on_hover_cursor(egui::CursorIcon::PointingHand).clicked()
 }
 
 fn heading(ui: &mut egui::Ui, title: &str, subtitle: &str) {
@@ -924,7 +1092,7 @@ fn heading(ui: &mut egui::Ui, title: &str, subtitle: &str) {
 }
 
 fn section(ui: &mut egui::Ui, text: &str) {
-    ui.label(RichText::new(text).size(11.0).strong().color(Color32::from_rgb(130, 150, 178)));
+    ui.label(RichText::new(text).size(11.0).strong().color(MUTED));
 }
 
 /// A bar showing how much of a size limit is used (just the amount when there is no limit).
@@ -937,7 +1105,7 @@ fn usage_bar(ui: &mut egui::Ui, used: u64, quota: u64) {
     let color = if frac >= 0.95 {
         RED
     } else if frac >= 0.8 {
-        Color32::from_rgb(235, 185, 90)
+        AMBER
     } else {
         GREEN
     };
@@ -955,7 +1123,7 @@ fn usage_bar(ui: &mut egui::Ui, used: u64, quota: u64) {
 }
 
 fn dot(online: bool) -> RichText {
-    RichText::new("●").color(if online { GREEN } else { Color32::from_rgb(110, 120, 138) })
+    RichText::new("●").color(if online { GREEN } else { OFFLINE })
 }
 
 /// Draw `text` as a QR code (black on white, with the quiet zone scanners need).
@@ -984,6 +1152,175 @@ fn qr_view(ui: &mut egui::Ui, text: &str, size: f32) {
     }
 }
 
+/// A read-only path with a button that opens the folder browser.
+fn folder_picker(ui: &mut egui::Ui, folder: &str, empty_hint: &str, want: &mut Option<String>) {
+    ui.horizontal(|ui| {
+        let width = (ui.available_width() - 170.0).max(180.0);
+        egui::Frame::new()
+            .fill(FIELD)
+            .stroke(Stroke::new(1.0, CARD_LINE))
+            .corner_radius(CornerRadius::same(8))
+            .inner_margin(egui::Margin::symmetric(10, 8))
+            .show(ui, |ui| {
+                ui.set_width(width);
+                let text = if folder.trim().is_empty() {
+                    RichText::new(empty_hint).color(MUTED)
+                } else {
+                    RichText::new(folder).monospace()
+                };
+                ui.add(egui::Label::new(text).truncate());
+            });
+        if ui.button("Choose folder…").clicked() {
+            *want = Some(folder.to_string());
+        }
+    });
+}
+
+/// The state of the folder browser window.
+struct Browse {
+    dir: PathBuf,
+    hidden: bool,
+    new_name: String,
+    error: Option<String>,
+    entries: Vec<(String, PathBuf)>,
+    unreadable: bool,
+    listed: Option<(PathBuf, bool)>,
+}
+
+impl Browse {
+    /// Start in `start` (a path from the dialog), or the nearest folder above it that exists.
+    fn new(start: &str) -> Browse {
+        let mut dir = PathBuf::from(expand(start));
+        if !dir.is_absolute() {
+            dir = home();
+        }
+        while !dir.is_dir() {
+            if !dir.pop() {
+                dir = home();
+                break;
+            }
+        }
+        Browse { dir, hidden: false, new_name: String::new(), error: None, entries: Vec::new(), unreadable: false, listed: None }
+    }
+
+    /// Read the folder again, but only when the place or the hidden-files switch changed.
+    fn relist(&mut self) {
+        let key = (self.dir.clone(), self.hidden);
+        if self.listed.as_ref() == Some(&key) {
+            return;
+        }
+        self.entries.clear();
+        self.unreadable = false;
+        match std::fs::read_dir(&self.dir) {
+            Ok(rd) => {
+                for e in rd.flatten() {
+                    let name = e.file_name().to_string_lossy().to_string();
+                    if !self.hidden && name.starts_with('.') {
+                        continue;
+                    }
+                    let path = e.path();
+                    if path.is_dir() {
+                        self.entries.push((name, path));
+                    }
+                }
+                self.entries.sort_by_key(|(n, _)| n.to_lowercase());
+            }
+            Err(_) => self.unreadable = true,
+        }
+        self.listed = Some(key);
+    }
+}
+
+/// Handy starting points: the home folder and wherever drives usually show up.
+fn browse_places() -> Vec<(&'static str, PathBuf)> {
+    let user = std::env::var("USER").unwrap_or_default();
+    let mut places = vec![("Home", home())];
+    let more = [
+        ("Drives", PathBuf::from("/Volumes")),
+        ("Drives", PathBuf::from("/media").join(&user)),
+        ("Drives", PathBuf::from("/run/media").join(&user)),
+        ("Mounts", PathBuf::from("/mnt")),
+        ("Computer", PathBuf::from("/")),
+    ];
+    for (name, path) in more {
+        if path.is_dir() {
+            places.push((name, path));
+        }
+    }
+    places
+}
+
+/// The folder browser. `Some(Some(path))` when a folder was chosen, `Some(None)` on cancel.
+fn browse_window(ctx: &egui::Context, b: &mut Browse) -> Option<Option<PathBuf>> {
+    b.relist();
+    let mut result: Option<Option<PathBuf>> = None;
+    let mut go: Option<PathBuf> = None;
+    egui::Window::new("Choose a folder")
+        .collapsible(false)
+        .resizable(false)
+        .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+        .fixed_size([480.0, 470.0])
+        .show(ctx, |ui| {
+            ui.horizontal(|ui| {
+                let has_parent = b.dir.parent().is_some();
+                if ui.add_enabled(has_parent, egui::Button::new("Up")).on_hover_text("The folder around this one").clicked() {
+                    go = b.dir.parent().map(|p| p.to_path_buf());
+                }
+                for (name, path) in browse_places() {
+                    if ui.button(name).clicked() {
+                        go = Some(path);
+                    }
+                }
+            });
+            ui.add(egui::Label::new(RichText::new(b.dir.to_string_lossy()).monospace().small().color(MUTED)).truncate());
+            egui::ScrollArea::vertical().min_scrolled_height(250.0).max_height(250.0).auto_shrink([false, false]).show(ui, |ui| {
+                if b.unreadable {
+                    ui.label(RichText::new("This folder can't be opened.").color(RED));
+                } else if b.entries.is_empty() {
+                    ui.label(RichText::new("No folders in here.").color(MUTED));
+                }
+                for (name, path) in &b.entries {
+                    if icon_row(ui, Glyph::Folder, name, false, 30.0).clicked() {
+                        go = Some(path.clone());
+                    }
+                }
+            });
+            ui.horizontal(|ui| {
+                ui.add(egui::TextEdit::singleline(&mut b.new_name).hint_text("Name for a new folder").desired_width(210.0));
+                let name = b.new_name.trim().to_string();
+                let ok = !name.is_empty() && !name.contains('/') && name != "." && name != "..";
+                if ui.add_enabled(ok, egui::Button::new("Create folder")).clicked() {
+                    let target = b.dir.join(&name);
+                    match std::fs::create_dir(&target) {
+                        Ok(()) => {
+                            b.new_name.clear();
+                            b.error = None;
+                            go = Some(target);
+                        }
+                        Err(e) => b.error = Some(format!("Can't create it: {}", e)),
+                    }
+                }
+                ui.checkbox(&mut b.hidden, "Hidden");
+            });
+            if let Some(e) = &b.error {
+                ui.label(RichText::new(e).color(RED).small());
+            }
+            ui.horizontal(|ui| {
+                if ui.add(primary("Use this folder")).clicked() {
+                    result = Some(Some(b.dir.clone()));
+                }
+                if ui.button("Cancel").clicked() {
+                    result = Some(None);
+                }
+            });
+        });
+    if let Some(p) = go {
+        b.dir = p;
+        b.error = None;
+    }
+    result
+}
+
 /// The pairing check: both people compare this code with the other screen. Returns the answer
 /// once it is given.
 fn verify_window(ctx: &egui::Context, v: &Verify) -> Option<bool> {
@@ -1001,7 +1338,7 @@ fn verify_window(ctx: &egui::Context, v: &Verify) -> Option<bool> {
             });
             ui.add_space(6.0);
             ui.vertical_centered(|ui| {
-                ui.label(RichText::new(&v.code).monospace().size(38.0).strong().color(BLUE));
+                ui.label(RichText::new(&v.code).monospace().size(38.0).strong().color(ACCENT));
             });
             ui.add_space(6.0);
             egui::Grid::new("verify_grid").num_columns(2).spacing([12.0, 4.0]).show(ui, |ui| {
@@ -1142,23 +1479,37 @@ impl eframe::App for App {
             ctx.request_repaint_after(Duration::from_millis(300));
         }
 
+        let (online, status_text) = match &self.status {
+            Some(st) => (true, format!("{} is running", st.name)),
+            None => (false, "Not running".to_string()),
+        };
+        let mut refresh = false;
         egui::TopBottomPanel::top("top_bar").exact_height(60.0).show(ctx, |ui| {
             ui.horizontal_centered(|ui| {
-                ui.add_space(8.0);
-                ui.label(RichText::new("◆").size(24.0).color(BLUE));
+                ui.add_space(10.0);
+                ui.add(egui::Image::new(&self.logo).fit_to_exact_size(Vec2::splat(36.0)));
                 ui.vertical(|ui| {
-                    ui.label(RichText::new("rustsync").size(19.0).strong());
-                    ui.label(RichText::new("Simple, encrypted file sync").size(11.0).weak());
+                    ui.label(RichText::new("RustSync").size(19.0).strong());
+                    ui.label(RichText::new("Simple, encrypted file sync").size(11.0).color(MUTED));
                 });
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    ui.add_space(8.0);
-                    match &self.status {
-                        Some(s) => ui.label(RichText::new(format!("●  {} is running", s.name)).color(GREEN)),
-                        None => ui.label(RichText::new("●  not running").color(RED)),
-                    };
+                    ui.add_space(10.0);
+                    egui::Frame::new()
+                        .fill(if online { GREEN_SOFT } else { RED_SOFT })
+                        .corner_radius(CornerRadius::same(14))
+                        .inner_margin(egui::Margin::symmetric(12, 5))
+                        .show(ui, |ui| {
+                            ui.label(RichText::new(format!("●  {}", status_text)).small().color(if online { GREEN } else { RED }));
+                        });
+                    if online && icon_button(ui, Glyph::Refresh, "Ask connected devices for their library lists again and look for backups") {
+                        refresh = true;
+                    }
                 });
             });
         });
+        if refresh {
+            self.perform(Action::Refresh);
+        }
 
         egui::TopBottomPanel::bottom("status_bar").exact_height(32.0).show(ctx, |ui| {
             ui.horizontal_centered(|ui| match &self.message {
@@ -1181,25 +1532,25 @@ impl eframe::App for App {
         egui::SidePanel::left("sidebar")
             .resizable(false)
             .exact_width(180.0)
-            .frame(egui::Frame::side_top_panel(&ctx.style()).fill(Color32::from_rgb(17, 22, 32)))
+            .frame(egui::Frame::side_top_panel(&ctx.style()).fill(SIDEBAR))
             .show(ctx, |ui| {
                 ui.add_space(16.0);
                 section(ui, "SYNC");
                 ui.add_space(6.0);
-                if nav_button(ui, "⚙", "This device", self.page == Page::ThisDevice) {
-                    self.page = Page::ThisDevice;
+                if icon_row(ui, Glyph::Home, "Home", self.page == Page::Home, 38.0).clicked() {
+                    self.page = Page::Home;
                 }
-                if nav_button(ui, "▦", "Libraries", self.page == Page::Libraries) {
+                if icon_row(ui, Glyph::Folder, "Libraries", self.page == Page::Libraries, 38.0).clicked() {
                     self.page = Page::Libraries;
                 }
-                if nav_button(ui, "⌂", "Devices", self.page == Page::Devices) {
+                if icon_row(ui, Glyph::Devices, "Devices", self.page == Page::Devices, 38.0).clicked() {
                     self.page = Page::Devices;
                 }
                 if let Some(s) = &self.status {
                     let waiting = s.offers.len();
                     if waiting > 0 {
                         ui.add_space(16.0);
-                        ui.label(RichText::new(format!("{} waiting for you", waiting)).color(BLUE).small());
+                        ui.label(RichText::new(format!("{} waiting for you", waiting)).color(ACCENT).small());
                     }
                 }
             });
@@ -1214,7 +1565,7 @@ impl eframe::App for App {
                 egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| match self.page {
                     Page::Libraries => self.show_libraries(ui),
                     Page::Devices => self.show_devices(ui),
-                    Page::ThisDevice => self.show_this_device(ui),
+                    Page::Home => self.show_home(ui),
                 });
             });
 
@@ -1224,7 +1575,7 @@ impl eframe::App for App {
 
 impl App {
     fn show_offline(&mut self, ui: &mut egui::Ui) {
-        heading(ui, "rustsync is not running", "The background service does the syncing; this window only controls it.");
+        heading(ui, "RustSync is not running", "The background service does the syncing; this window only controls it.");
         card(ui, |ui| {
             ui.label(format!("Config: {}", self.config.display()));
             if !self.offline_reason.is_empty() {
@@ -1236,7 +1587,7 @@ impl App {
                     ui.spinner();
                     ui.label("Starting…");
                 });
-            } else if ui.button(RichText::new("Start rustsync").strong()).clicked() {
+            } else if ui.add(primary("Start RustSync")).clicked() {
                 self.start_service();
             }
             ui.label(
@@ -1256,7 +1607,7 @@ impl App {
             for o in &status.offers {
                 card(ui, |ui| {
                     ui.horizontal(|ui| {
-                        ui.label(RichText::new("＋").size(22.0).color(BLUE));
+                        tile(ui, Glyph::Plus, ACCENT, ACCENT_SOFT);
                         ui.vertical(|ui| {
                             if o.again {
                                 ui.label(RichText::new("Use the encrypted backup again").strong());
@@ -1315,18 +1666,11 @@ impl App {
         ui.horizontal(|ui| {
             section(ui, "YOUR LIBRARIES");
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                if ui.button("＋  New library").clicked() {
+                if ui.add(primary("New library")).clicked() {
                     self.dialog = Dialog::NewLibrary { name: String::new(), folder: String::new() };
                 }
                 if ui.add_enabled(!status.devices.is_empty(), egui::Button::new("Restore from backup…")).clicked() {
                     self.dialog = Dialog::Restore { code: String::new(), folder: String::new(), device: 0 };
-                }
-                if ui
-                    .button("Refresh")
-                    .on_hover_text("Ask connected devices for their library lists again and look for backups")
-                    .clicked()
-                {
-                    self.perform(Action::Refresh);
                 }
                 if status.libraries.iter().any(|l| !l.backup_only) && ui.button("Recovery kit…").clicked() {
                     self.perform(Action::ShowRecovery { id: None, name: "all libraries".to_string() });
@@ -1342,7 +1686,7 @@ impl App {
         for l in &status.libraries {
             card(ui, |ui| {
                 ui.horizontal(|ui| {
-                    ui.label(RichText::new("▦").size(24.0).color(BLUE));
+                    tile(ui, Glyph::Folder, ACCENT, ACCENT_SOFT);
                     ui.vertical(|ui| {
                         ui.label(RichText::new(&l.name).strong().size(16.0));
                         ui.label(RichText::new(&l.folder).small().weak());
@@ -1469,7 +1813,11 @@ impl App {
         for d in &status.devices {
             card(ui, |ui| {
                 ui.horizontal(|ui| {
-                    ui.label(dot(d.online));
+                    if d.online {
+                        tile(ui, Glyph::Devices, GREEN, GREEN_SOFT);
+                    } else {
+                        tile(ui, Glyph::Devices, MUTED, HOVER);
+                    }
                     ui.vertical(|ui| {
                         ui.label(RichText::new(&d.name).strong());
                         let mut line = format!("{}…", short(&d.key));
@@ -1489,9 +1837,9 @@ impl App {
         }
     }
 
-    fn show_this_device(&mut self, ui: &mut egui::Ui) {
+    fn show_home(&mut self, ui: &mut egui::Ui) {
         let Some(status) = self.status.clone() else { return };
-        heading(ui, "This device", "How this machine identifies itself to the others.");
+        heading(ui, "Home", "This device: how it identifies itself to the others, and how it starts.");
 
         card(ui, |ui| {
             ui.label(RichText::new("Name").small().weak());
@@ -1517,12 +1865,30 @@ impl App {
             let mut auto = service_installed(&self.config);
             if ui
                 .checkbox(&mut auto, AUTOSTART_LABEL)
-                .on_hover_text("A systemd user service. Turning it off also stops rustsync now.")
+                .on_hover_text("A systemd user service. Turning it off also stops RustSync now.")
                 .changed()
             {
                 self.set_service(auto);
             }
-            if ui.button("Stop rustsync").clicked() {
+            if tray_supported() {
+                let mut on = tray_login_on(&self.config);
+                let label = if cfg!(target_os = "macos") {
+                    "Show the RustSync icon in the menu bar when I log in"
+                } else {
+                    "Show the RustSync tray icon when I log in"
+                };
+                if ui
+                    .checkbox(&mut on, label)
+                    .on_hover_text("Opening this window also shows the icon. Quit it from its own menu.")
+                    .changed()
+                {
+                    set_tray_login(&self.config, on);
+                    if on {
+                        ensure_tray_running(&self.config);
+                    }
+                }
+            }
+            if ui.button("Stop RustSync").clicked() {
                 self.run(Request::Stop);
             }
         });
@@ -1542,6 +1908,7 @@ impl App {
         let devices: Vec<DeviceInfo> = self.status.as_ref().map(|s| s.devices.clone()).unwrap_or_default();
         let mut action: Option<Action> = None;
         let mut close = false;
+        let mut want_browse: Option<String> = None;
 
         let window = |title: &str| {
             egui::Window::new(title)
@@ -1558,20 +1925,13 @@ impl App {
                 window("New library").show(ctx, |ui| {
                     ui.label("Name");
                     ui.add(egui::TextEdit::singleline(name).hint_text("e.g. photos").desired_width(f32::INFINITY));
-                    ui.label("Folder to sync (full path)");
-                    ui.add(
-                        egui::TextEdit::singleline(folder)
-                            .hint_text("e.g. ~/Photos")
-                            .desired_width(f32::INFINITY),
-                    );
+                    ui.label("Folder to sync");
+                    folder_picker(ui, folder, "No folder chosen yet", &mut want_browse);
                     let folder_full = expand(folder);
                     let valid_folder = folder_full.starts_with('/');
-                    if !folder.trim().is_empty() && !valid_folder {
-                        ui.label(RichText::new("Enter a full path, like /home/me/Photos or ~/Photos").color(RED).small());
-                    }
                     ui.horizontal(|ui| {
                         let ok = !name.trim().is_empty() && valid_folder;
-                        if ui.add_enabled(ok, egui::Button::new(RichText::new("Create").strong())).clicked() {
+                        if ui.add_enabled(ok, primary("Create")).clicked() {
                             action = Some(Action::Create { name: name.trim().to_string(), folder: folder_full.clone() });
                             close = true;
                         }
@@ -1627,16 +1987,13 @@ impl App {
                                 .small()
                                 .weak(),
                         );
-                        ui.label("Store it in this folder (full path):");
+                        ui.label("Store it in this folder:");
                     } else {
-                        ui.label(format!("Sync “{}” into this folder (full path):", name));
+                        ui.label(format!("Sync “{}” into this folder:", name));
                     }
-                    ui.add(egui::TextEdit::singleline(folder).desired_width(f32::INFINITY));
+                    folder_picker(ui, folder, "No folder chosen yet", &mut want_browse);
                     let folder_full = expand(folder);
                     let mut valid = folder_full.starts_with('/');
-                    if !valid {
-                        ui.label(RichText::new("Enter a full path, like /home/me/Photos or ~/Photos").color(RED).small());
-                    }
                     let mut quota_bytes = 0u64;
                     if *backup {
                         ui.label("Size limit (optional), e.g. 500G or 2T:");
@@ -1650,7 +2007,7 @@ impl App {
                         }
                     }
                     ui.horizontal(|ui| {
-                        if ui.add_enabled(valid, egui::Button::new(RichText::new("Accept").strong())).clicked() {
+                        if ui.add_enabled(valid, primary("Accept")).clicked() {
                             action = Some(Action::Accept { offer: offer_id.clone(), folder: folder_full.clone(), quota: quota_bytes });
                             close = true;
                         }
@@ -1697,7 +2054,7 @@ impl App {
                                 ui.vertical_centered(|ui| {
                                     qr_view(ui, &c, 230.0);
                                     ui.label(
-                                        RichText::new("or scan this with the rustsync app on the other device")
+                                        RichText::new("or scan this with the RustSync app on the other device")
                                             .small()
                                             .weak(),
                                     );
@@ -1815,12 +2172,12 @@ impl App {
                                 ui.selectable_value(device, i, &d.name);
                             }
                         });
-                    ui.label("Restore into this empty folder (full path; a kit makes one subfolder per library):");
-                    ui.add(egui::TextEdit::singleline(folder).hint_text("e.g. ~/Restored").desired_width(f32::INFINITY));
+                    ui.label("Restore into this empty folder (a kit makes one subfolder per library):");
+                    folder_picker(ui, folder, "No folder chosen yet", &mut want_browse);
                     let folder_full = expand(folder);
                     let valid = folder_full.starts_with('/') && (code.trim().starts_with("rsr1-") || code.trim().starts_with("rsk1-"));
                     ui.horizontal(|ui| {
-                        if ui.add_enabled(valid, egui::Button::new(RichText::new("Restore").strong())).clicked() {
+                        if ui.add_enabled(valid, primary("Restore")).clicked() {
                             action = Some(Action::Restore {
                                 code: code.trim().to_string(),
                                 folder: folder_full.clone(),
@@ -1955,6 +2312,24 @@ impl App {
             }
         }
 
+        if close {
+            self.browse = None;
+        } else if let Some(start) = want_browse {
+            self.browse = Some(Browse::new(&start));
+        }
+        if let Some(b) = self.browse.as_mut() {
+            if let Some(choice) = browse_window(ctx, b) {
+                if let Some(path) = choice {
+                    if let Dialog::NewLibrary { folder, .. } | Dialog::Accept { folder, .. } | Dialog::Restore { folder, .. } =
+                        &mut dialog
+                    {
+                        *folder = path.to_string_lossy().to_string();
+                    }
+                }
+                self.browse = None;
+            }
+        }
+
         // Keep the dialog open unless it asked to close (an invite keeps its dialog while it waits).
         if close {
             self.stop_scan();
@@ -2037,7 +2412,7 @@ fn ensure_launcher(config: &Path) {
         return;
     }
     let text = format!(
-        "[Desktop Entry]\nType=Application\nName=rustsync\nComment=Simple encrypted file sync\nExec={} -c {}\nIcon={}\nTerminal=false\nCategories=Network;FileTransfer;\nStartupWMClass=rustsync\n",
+        "[Desktop Entry]\nType=Application\nName=RustSync\nComment=Simple encrypted file sync\nExec={} -c {}\nIcon={}\nTerminal=false\nCategories=Network;FileTransfer;\nStartupWMClass=rustsync\n",
         exe_q, cfg_q, icon_s
     );
     write_if_changed(&icon, ICON_PNG);
@@ -2117,17 +2492,18 @@ fn open_window(config: &Path) {
     }
 }
 
-#[cfg(not(all(feature = "tray", unix, not(any(target_os = "macos", target_os = "ios", target_os = "android")))))]
+#[cfg(not(all(feature = "tray", unix, not(any(target_os = "ios", target_os = "android")))))]
 fn run_tray(_config: &Path) -> i32 {
-    eprintln!("rustsync-gui: this build has no tray icon support (macOS has none; elsewhere build with the \"tray\" feature)");
+    eprintln!("rustsync-gui: this build has no tray icon support (build with the \"tray\" feature)");
     1
 }
 
-#[cfg(not(all(feature = "tray", unix, not(any(target_os = "macos", target_os = "ios", target_os = "android")))))]
+#[cfg(not(all(feature = "tray", unix, not(any(target_os = "ios", target_os = "android")))))]
 fn ensure_tray_running(_config: &Path) {}
 
-/// Start the tray icon process if it is not running (the window does this when it opens).
-#[cfg(all(feature = "tray", unix, not(any(target_os = "macos", target_os = "ios", target_os = "android"))))]
+/// Start the tray icon (menu bar icon on macOS) process if it is not running (the window does
+/// this when it opens).
+#[cfg(all(feature = "tray", unix, not(any(target_os = "ios", target_os = "android"))))]
 fn ensure_tray_running(config: &Path) {
     use std::os::unix::process::CommandExt;
     match lock_file(&tray_lock_path(config)) {
@@ -2150,6 +2526,56 @@ fn ensure_tray_running(config: &Path) {
 #[cfg(all(feature = "tray", unix, not(any(target_os = "macos", target_os = "ios", target_os = "android"))))]
 fn run_tray(config: &Path) -> i32 {
     tray::run(config)
+}
+
+#[cfg(all(feature = "tray", target_os = "macos"))]
+fn run_tray(config: &Path) -> i32 {
+    menubar::run(config)
+}
+
+/// Is the icon set to start when the person logs in?
+#[cfg(all(feature = "tray", unix, not(any(target_os = "macos", target_os = "ios", target_os = "android"))))]
+fn tray_login_on(_config: &Path) -> bool {
+    tray::autostart_path().exists()
+}
+
+#[cfg(all(feature = "tray", unix, not(any(target_os = "macos", target_os = "ios", target_os = "android"))))]
+fn set_tray_login(config: &Path, on: bool) {
+    if tray::autostart_path().exists() != on {
+        tray::toggle_autostart(config);
+    }
+}
+
+#[cfg(all(feature = "tray", target_os = "macos"))]
+fn tray_login_on(config: &Path) -> bool {
+    menubar::login_path(config).exists()
+}
+
+#[cfg(all(feature = "tray", target_os = "macos"))]
+fn set_tray_login(config: &Path, on: bool) {
+    menubar::set_login(config, on);
+}
+
+#[cfg(not(any(
+    all(feature = "tray", target_os = "macos"),
+    all(feature = "tray", unix, not(any(target_os = "macos", target_os = "ios", target_os = "android")))
+)))]
+fn tray_login_on(_config: &Path) -> bool {
+    false
+}
+
+#[cfg(not(any(
+    all(feature = "tray", target_os = "macos"),
+    all(feature = "tray", unix, not(any(target_os = "macos", target_os = "ios", target_os = "android")))
+)))]
+fn set_tray_login(_config: &Path, _on: bool) {}
+
+/// Does this build have a tray / menu bar icon at all?
+fn tray_supported() -> bool {
+    cfg!(any(
+        all(feature = "tray", target_os = "macos"),
+        all(feature = "tray", unix, not(any(target_os = "macos", target_os = "ios", target_os = "android")))
+    ))
 }
 
 #[cfg(all(feature = "tray", unix, not(any(target_os = "macos", target_os = "ios", target_os = "android"))))]
@@ -2200,7 +2626,7 @@ mod tray {
                     let d = ((x as f32 + 0.5 - cx).powi(2) + (y as f32 + 0.5 - cy).powi(2)).sqrt();
                     let px = [255u8, 255, 255, 255];
                     let color = if d <= dot {
-                        Some([255u8, 45, 156, 255])
+                        Some([255u8, 82, 201, 140])
                     } else if d <= ring {
                         Some(px)
                     } else {
@@ -2223,11 +2649,11 @@ mod tray {
 
         fn title(&self) -> String {
             if !self.online {
-                "rustsync (not running)".into()
+                "RustSync (not running)".into()
             } else if self.offers > 0 {
-                format!("rustsync: {} offer(s) waiting", self.offers)
+                format!("RustSync: {} offer(s) waiting", self.offers)
             } else {
-                "rustsync".into()
+                "RustSync".into()
             }
         }
 
@@ -2249,7 +2675,7 @@ mod tray {
             let summary = if self.online {
                 format!("{} of {} devices online", self.devices_online, self.devices)
             } else {
-                "rustsync is not running".to_string()
+                "RustSync is not running".to_string()
             };
             m.push(StandardItem { label: summary, enabled: false, ..Default::default() }.into());
             if self.offers > 0 {
@@ -2266,7 +2692,7 @@ mod tray {
             }
             m.push(
                 StandardItem {
-                    label: "Open rustsync".into(),
+                    label: "Open RustSync".into(),
                     activate: Box::new(|t: &mut Self| {
                         let _ = t.tx.send(Cmd::Open);
                     }),
@@ -2278,7 +2704,7 @@ mod tray {
             if self.online {
                 m.push(
                     StandardItem {
-                        label: "Stop the rustsync service".into(),
+                        label: "Stop the RustSync service".into(),
                         activate: Box::new(|t: &mut Self| {
                             let _ = t.tx.send(Cmd::Stop);
                         }),
@@ -2289,7 +2715,7 @@ mod tray {
             } else {
                 m.push(
                     StandardItem {
-                        label: "Start the rustsync service".into(),
+                        label: "Start the RustSync service".into(),
                         activate: Box::new(|t: &mut Self| {
                             let _ = t.tx.send(Cmd::Start);
                         }),
@@ -2300,7 +2726,7 @@ mod tray {
             }
             m.push(
                 CheckmarkItem {
-                    label: "Start rustsync at boot / login".into(),
+                    label: "Start RustSync at boot / login".into(),
                     checked: self.service,
                     activate: Box::new(|t: &mut Self| {
                         let _ = t.tx.send(Cmd::ToggleService);
@@ -2337,7 +2763,7 @@ mod tray {
 
     // -------- start the icon at login (an XDG autostart entry)
 
-    fn autostart_path() -> PathBuf {
+    pub fn autostart_path() -> PathBuf {
         let base = match std::env::var("XDG_CONFIG_HOME") {
             Ok(d) if !d.is_empty() => PathBuf::from(d),
             _ => home().join(".config"),
@@ -2345,7 +2771,7 @@ mod tray {
         base.join("autostart").join("rustsync-tray.desktop")
     }
 
-    fn toggle_autostart(config: &Path) {
+    pub fn toggle_autostart(config: &Path) {
         let path = autostart_path();
         if path.exists() {
             let _ = std::fs::remove_file(&path);
@@ -2359,7 +2785,7 @@ mod tray {
             return;
         };
         let text = format!(
-            "[Desktop Entry]\nType=Application\nName=rustsync\nComment=rustsync tray icon\nExec={} --tray -c {}\nTerminal=false\nX-GNOME-Autostart-enabled=true\n",
+            "[Desktop Entry]\nType=Application\nName=RustSync\nComment=RustSync tray icon\nExec={} --tray -c {}\nTerminal=false\nX-GNOME-Autostart-enabled=true\n",
             exe_q, cfg_q
         );
         if let Some(dir) = path.parent() {
@@ -2478,6 +2904,283 @@ mod tray {
     }
 }
 
+// ---------------------------------------------------------------- macOS menu bar icon
+//
+// The same idea as the tray icon on Linux: a small separate process (`rustsync-gui --tray`) that
+// shows an icon at the top right of the screen, with no window and no Dock icon. Its menu opens
+// the window. It is started when the window opens, and (if you ask for it on the Home page) at
+// login through a launch agent.
+
+#[cfg(all(feature = "tray", target_os = "macos"))]
+mod menubar {
+    use super::*;
+    use tray_icon::menu::{CheckMenuItem, Menu, MenuEvent, MenuItem, PredefinedMenuItem};
+    use tray_icon::{Icon, TrayIcon, TrayIconBuilder};
+    use winit::application::ApplicationHandler;
+    use winit::event::{StartCause, WindowEvent};
+    use winit::event_loop::{ActiveEventLoop, EventLoop, EventLoopProxy};
+    use winit::platform::macos::{ActivationPolicy, EventLoopBuilderExtMacOS};
+    use winit::window::WindowId;
+
+    /// The icon in black on transparent (a "template": macOS colours it for light and dark bars).
+    const BASE: &[u8] = include_bytes!("../assets/menubar-44.rgba");
+    const SIZE: u32 = 44;
+
+    fn login_label(config: &Path) -> String {
+        match service_slug(config) {
+            None => "com.rustsync.tray".to_string(),
+            Some(slug) => format!("com.rustsync.tray.{}", slug),
+        }
+    }
+
+    /// The launch agent that shows the icon at login.
+    pub fn login_path(config: &Path) -> PathBuf {
+        home().join("Library").join("LaunchAgents").join(format!("{}.plist", login_label(config)))
+    }
+
+    pub fn set_login(config: &Path, on: bool) {
+        let path = login_path(config);
+        if !on {
+            let _ = std::fs::remove_file(&path);
+            return;
+        }
+        let Ok(exe) = std::env::current_exe() else { return };
+        let xml = |s: &str| s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;");
+        let label = xml(&login_label(config));
+        let exe = xml(&exe.to_string_lossy());
+        let cfg = xml(&config.to_string_lossy());
+        let text = format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>{label}</string>
+  <key>ProgramArguments</key>
+  <array><string>{exe}</string><string>--tray</string><string>-c</string><string>{cfg}</string></array>
+  <key>RunAtLoad</key><true/>
+  <key>LimitLoadToSessionType</key><string>Aqua</string>
+</dict>
+</plist>
+"#
+        );
+        if let Some(dir) = path.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        if let Err(e) = std::fs::write(&path, text) {
+            eprintln!("rustsync-gui: cannot write {}: {}", path.display(), e);
+        }
+    }
+
+    enum Msg {
+        Status(Option<StatusInfo>),
+        Menu(MenuEvent),
+    }
+
+    /// What the icon and its menu show (they are only redrawn when this changes).
+    #[derive(Clone, PartialEq)]
+    struct Snap {
+        online: bool,
+        devices: usize,
+        devices_online: usize,
+        offers: usize,
+        service: bool,
+        login: bool,
+    }
+
+    struct Bar {
+        config: PathBuf,
+        sock: PathBuf,
+        tray: Option<TrayIcon>,
+        shown: Option<Snap>,
+    }
+
+    impl Bar {
+        fn snap(&self, st: &Option<StatusInfo>) -> Snap {
+            Snap {
+                online: st.is_some(),
+                devices: st.as_ref().map_or(0, |s| s.devices.len()),
+                devices_online: st.as_ref().map_or(0, |s| s.devices.iter().filter(|d| d.online).count()),
+                offers: st.as_ref().map_or(0, |s| s.offers.len()),
+                service: service_installed(&self.config),
+                login: login_path(&self.config).exists(),
+            }
+        }
+
+        fn icon(snap: &Snap) -> Icon {
+            let mut px = BASE.to_vec();
+            if !snap.online {
+                // Fainter while the service is not running.
+                for p in px.chunks_exact_mut(4) {
+                    p[3] = (p[3] as f32 * 0.4) as u8;
+                }
+            }
+            if snap.offers > 0 {
+                // A dot in the top right corner while something waits for an answer.
+                let (cx, cy) = (36.0f32, 8.0f32);
+                for y in 0..SIZE {
+                    for x in 0..SIZE {
+                        let d = ((x as f32 - cx).powi(2) + (y as f32 - cy).powi(2)).sqrt();
+                        let i = ((y * SIZE + x) * 4) as usize;
+                        if d <= 6.0 {
+                            px[i + 3] = 255;
+                        } else if d <= 9.0 {
+                            px[i + 3] = 0;
+                        }
+                    }
+                }
+            }
+            Icon::from_rgba(px, SIZE, SIZE).expect("the menu bar icon is 44x44 RGBA")
+        }
+
+        fn menu(snap: &Snap) -> Menu {
+            let menu = Menu::new();
+            let summary = if snap.online {
+                format!("{} of {} devices online", snap.devices_online, snap.devices)
+            } else {
+                "RustSync is not running".to_string()
+            };
+            let _ = menu.append(&MenuItem::new(summary, false, None));
+            if snap.offers > 0 {
+                let _ = menu.append(&MenuItem::with_id("offers", format!("{} offer(s) waiting…", snap.offers), true, None));
+            }
+            let _ = menu.append(&MenuItem::with_id("open", "Open RustSync", true, None));
+            let _ = menu.append(&PredefinedMenuItem::separator());
+            if snap.online {
+                let _ = menu.append(&MenuItem::with_id("stop", "Stop the RustSync service", true, None));
+            } else {
+                let _ = menu.append(&MenuItem::with_id("start", "Start the RustSync service", true, None));
+            }
+            let _ = menu.append(&CheckMenuItem::with_id("service", "Start RustSync at login", true, snap.service, None));
+            let _ = menu.append(&CheckMenuItem::with_id("login", "Show this icon at login", true, snap.login, None));
+            let _ = menu.append(&PredefinedMenuItem::separator());
+            let _ = menu.append(&MenuItem::with_id("quit", "Quit the icon (syncing continues)", true, None));
+            menu
+        }
+
+        fn apply(&mut self, snap: Snap) {
+            if let Some(tray) = &self.tray {
+                let _ = tray.set_icon_with_as_template(Some(Self::icon(&snap)), true);
+                tray.set_menu(Some(Box::new(Self::menu(&snap))));
+                let tip = if !snap.online {
+                    "RustSync (not running)".to_string()
+                } else if snap.offers > 0 {
+                    format!("RustSync: {} offer(s) waiting", snap.offers)
+                } else {
+                    "RustSync".to_string()
+                };
+                let _ = tray.set_tooltip(Some(tip));
+            }
+            self.shown = Some(snap);
+        }
+    }
+
+    impl ApplicationHandler<Msg> for Bar {
+        fn resumed(&mut self, _event_loop: &ActiveEventLoop) {}
+
+        fn window_event(&mut self, _event_loop: &ActiveEventLoop, _id: WindowId, _event: WindowEvent) {}
+
+        fn new_events(&mut self, event_loop: &ActiveEventLoop, cause: StartCause) {
+            // The icon can only be made once the event loop runs.
+            if matches!(cause, StartCause::Init) && self.tray.is_none() {
+                let snap = self.snap(&None);
+                let built = TrayIconBuilder::new()
+                    .with_icon(Self::icon(&snap))
+                    .with_icon_as_template(true)
+                    .with_menu(Box::new(Self::menu(&snap)))
+                    .with_tooltip("RustSync")
+                    .build();
+                match built {
+                    Ok(tray) => {
+                        self.tray = Some(tray);
+                        self.shown = Some(snap);
+                    }
+                    Err(e) => {
+                        eprintln!("rustsync-gui: cannot show the menu bar icon: {}", e);
+                        event_loop.exit();
+                    }
+                }
+            }
+        }
+
+        fn user_event(&mut self, event_loop: &ActiveEventLoop, msg: Msg) {
+            match msg {
+                Msg::Status(st) => {
+                    let snap = self.snap(&st);
+                    if self.shown.as_ref() != Some(&snap) {
+                        self.apply(snap);
+                    }
+                }
+                Msg::Menu(ev) => match ev.id.0.as_str() {
+                    "open" | "offers" => open_window(&self.config),
+                    "start" => {
+                        let _ = Command::new(rustsync_bin())
+                            .arg("-c")
+                            .arg(&self.config)
+                            .arg("start")
+                            .stdin(Stdio::null())
+                            .stdout(Stdio::null())
+                            .stderr(Stdio::null())
+                            .spawn();
+                    }
+                    "stop" => {
+                        let sock = self.sock.clone();
+                        std::thread::spawn(move || {
+                            let _ = call(&sock, &Request::Stop, None, |_| {});
+                        });
+                    }
+                    "service" => {
+                        let config = self.config.clone();
+                        std::thread::spawn(move || {
+                            let _ = set_service_blocking(&config, !service_installed(&config));
+                        });
+                    }
+                    "login" => set_login(&self.config, !login_path(&self.config).exists()),
+                    "quit" => event_loop.exit(),
+                    _ => {}
+                },
+            }
+        }
+    }
+
+    pub fn run(config: &Path) -> i32 {
+        // One icon per configuration.
+        let Some(_lock) = lock_file(&tray_lock_path(config)) else { return 0 };
+        let mut builder = EventLoop::<Msg>::with_user_event();
+        // No Dock icon and no application menu: this is only the icon at the top right.
+        builder.with_activation_policy(ActivationPolicy::Accessory);
+        builder.with_default_menu(false);
+        let event_loop = match builder.build() {
+            Ok(l) => l,
+            Err(e) => {
+                eprintln!("rustsync-gui: cannot start the menu bar icon: {}", e);
+                return 1;
+            }
+        };
+        let proxy: EventLoopProxy<Msg> = event_loop.create_proxy();
+        let menu_proxy = proxy.clone();
+        MenuEvent::set_event_handler(Some(move |ev| {
+            let _ = menu_proxy.send_event(Msg::Menu(ev));
+        }));
+        let sock = state_dir(config).join("control.sock");
+        {
+            let sock = sock.clone();
+            std::thread::spawn(move || loop {
+                let st = fetch_status(&sock).ok();
+                if proxy.send_event(Msg::Status(st)).is_err() {
+                    break; // the icon was quit
+                }
+                std::thread::sleep(Duration::from_secs(2));
+            });
+        }
+        let mut bar = Bar { config: config.to_path_buf(), sock, tray: None, shown: None };
+        if let Err(e) = event_loop.run_app(&mut bar) {
+            eprintln!("rustsync-gui: the menu bar icon stopped: {}", e);
+            return 1;
+        }
+        0
+    }
+}
+
 fn config_from_args() -> PathBuf {
     let args: Vec<String> = std::env::args().collect();
     let mut i = 1;
@@ -2515,7 +3218,7 @@ fn main() -> eframe::Result<()> {
 
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_title("rustsync")
+            .with_title("RustSync")
             .with_app_id("rustsync")
             .with_icon(window_icon())
             .with_inner_size([900.0, 620.0])

@@ -33,6 +33,15 @@
             </intent-filter>
         </activity>
 
+        <!-- the QR scanner, upright (the library's own screen is landscape only) -->
+        <activity
+            android:name=".PortraitCaptureActivity"
+            android:exported="false"
+            android:screenOrientation="sensorPortrait"
+            android:stateNotNeeded="true"
+            android:theme="@style/zxing_CaptureTheme"
+            android:windowSoftInputMode="stateAlwaysHidden" />
+
         <service
             android:name=".SyncService"
             android:exported="false"

@@ -19,7 +19,7 @@ identical. Nothing goes through anybody's cloud.
 - **Encrypted backups.** Give a server an *encrypted* copy of a folder that it cannot read, and
   restore from it if every machine is lost.
 - **Command line and a desktop window.** Everything the window does, the command line can do too.
-  On Linux and the BSDs there is also a tray icon.
+  There is a tray icon on Linux and the BSDs, and an icon in the menu bar on macOS.
 
 Contents: [How it works](#how-it-works-in-one-minute) ·
 [Compared with Syncthing](#how-rustsync-differs-from-syncthing) · [Design](#design-simple-and-managed-from-the-tool) ·
@@ -106,7 +106,7 @@ You need [Rust](https://rustup.rs) (1.81 or newer).
 | | Sync service and command line | Window | Tray icon | Starts by itself |
 |---|---|---|---|---|
 | **Linux** | yes | yes (X11 and Wayland) | yes | systemd user service (at login, or at boot) |
-| **macOS** (Apple silicon and Intel) | yes | yes | no | launch agent (at login) |
+| **macOS** (Apple silicon and Intel) | yes | yes | yes (menu bar) | launch agent (at login) |
 | **FreeBSD, OpenBSD, NetBSD** | yes | yes (X11 and Wayland) | yes, on desktops with a tray | login entry for the desktop; cron `@reboot` for servers |
 | **Android** (64-bit ARM phones) | yes, inside the app | the app | no | a notification keeps it running; restarts after a reboot |
 
@@ -221,17 +221,24 @@ rustsync status
 Prefer clicking? Start the window with `rustsync-gui` (it has a *Start* button if the service isn't
 running yet). It has three pages, and opens on the first:
 
-- **This device**: your name, public key, the address you're listening on, and the switch for
-  starting rustsync automatically.
+- **Home**: this device: its name, public key, the address it's listening on, and the switches for
+  starting RustSync automatically and for showing its tray (menu bar) icon when you log in.
 - **Libraries**: your libraries, who they're shared with, how much encrypted-backup space is used,
   and offers waiting for you to accept.
 - **Devices**: the machines you've paired and whether they're online, plus *Show a pairing code* and
   *Enter a pairing code* for adding another.
 
+Wherever a library needs a folder (*New library*, *Accept…*, *Restore from backup…*), you choose it
+with a **folder browser** instead of typing a path: shortcuts for your home folder and drives, a
+button to make a new folder, and a switch for hidden folders.
+
 To pair, *Show a pairing code* on one machine: the window shows the code **and a QR code**. On the
 other machine, *Enter a pairing code* lets you paste the code or press *Scan its QR code with the
 camera* (Linux and macOS; macOS asks permission to use the camera the first time). Then both
 windows show the same verification code: compare, and press *The codes match* on both.
+
+The window and the Android app share one look: a dark graphite background with the logo's orange as
+the only accent (the Android app also has a light version that follows the phone's setting).
 
 <p align="center">
   <img src="docs/screenshots/libraries.png" width="760" alt="The Libraries page: an offer waiting to be accepted, and libraries with their backup usage bars">
@@ -240,13 +247,16 @@ windows show the same verification code: compare, and press *The codes match* on
   <img src="docs/screenshots/devices.png" width="760" alt="The Devices page: pairing buttons and the list of paired machines">
 </p>
 <p align="center">
-  <img src="docs/screenshots/this-device.png" width="760" alt="The This device page: name, public key, and the start-automatically switch">
+  <img src="docs/screenshots/home.png" width="760" alt="The Home page: name, public key, and the start-automatically switches">
 </p>
 <p align="center">
   <img src="docs/screenshots/pairing.png" width="760" alt="Pairing: the QR code on one device, and the verification code both devices must agree on">
 </p>
 <p align="center">
   <img src="docs/screenshots/tray.png" width="420" alt="The tray icon in its three states, and its menu">
+</p>
+<p align="center">
+  <img src="docs/screenshots/menubar.png" width="520" alt="The menu bar icon on macOS, and its menu">
 </p>
 
 <sub>These pictures are drawn from the window's layout and colours with made-up example data (names,
@@ -319,7 +329,7 @@ rustsync uninstall-service      # stop doing that (also stops rustsync now)
 ```
 
 The first time you run `rustsync start` in a terminal it offers this too (once). With it set up,
-`start` and `stop` simply work with it. The window's *This device* page has the same switch.
+`start` and `stop` simply work with it. The window's *Home* page has the same switch.
 
 - **Linux:** a systemd *user* service, `~/.config/systemd/user/rustsync.service` (other configs get
   their own name). It restarts rustsync if it crashes and logs to the usual `daemon.log`.
@@ -341,8 +351,8 @@ The first time you run `rustsync start` in a terminal it offers this too (once).
 ### The tray icon (Linux and BSD desktops)
 
 `rustsync-gui` puts an icon in the system tray (StatusNotifierItem over D-Bus). It is in colour
-when rustsync is running, **greyed out** when it is not, and gets a **blue badge** when libraries
-are being offered to you. Click it (or choose *Open rustsync*) to get the window; closing the
+when rustsync is running, **greyed out** when it is not, and gets a **green badge** when libraries
+are being offered to you. Click it (or choose *Open RustSync*) to get the window; closing the
 window leaves the icon, and syncing, running. The menu also starts or stops the service and has
 *Show this icon at login*.
 
@@ -365,15 +375,25 @@ works as before. At login it waits a few minutes for the panel to be ready; what
 to `tray.log` in the state directory. To build without it:
 `cargo build --release --no-default-features --features gui`.
 
-**macOS** has no tray icon here: use the window (and the launch agent keeps syncing running when
-it is closed).
+### The menu bar icon (macOS)
+
+On a Mac the same small program puts an icon at the top right of the screen, in the menu bar (no
+Dock icon). It follows the light or dark menu bar, is fainter when rustsync is not running, and
+gets a dot when libraries are being offered to you. Its menu opens the window, starts or stops the
+service, and has *Show this icon at login*. Opening the window (for example from the app) also
+shows the icon, and it stays when the window is closed. The *Home* page has the same login switch;
+it adds a launch agent, `~/Library/LaunchAgents/com.rustsync.tray.plist`. To quit the icon, use
+its menu.
 
 ## The Android app
 
 An Android app (a phone or tablet, Android 8 or newer) lives in [`android/`](android/). It runs
 the same sync service inside the app, so the phone is a full device: pair it, share libraries
-with it, accept ones from the others. It has the same three pages as the window (*This device*
-first), shows a QR code for pairing, and scans one with the camera.
+with it, accept ones from the others. It has the same three pages as the window (*Home* first),
+shows a QR code for pairing, and scans one with the camera. To pair, *Devices* opens the camera
+straight from the big *Scan a code* button (upright, like any QR scanner); *Show a code on this
+phone* shows one for the other device to scan, and a small *Enter a code by hand* link is there
+for when a camera isn't handy.
 
 **Get the app.** You don't need to build anything: the `android` GitHub Actions workflow builds an
 APK on every push (open the run, download the `dist-android` artifact), and tagged releases have
@@ -386,7 +406,7 @@ allow installing from that source.
   repository secrets it prints (`ANDROID_KEYSTORE_BASE64`, `ANDROID_KEYSTORE_PASSWORD`,
   `ANDROID_KEY_ALIAS`, `ANDROID_KEY_PASSWORD`). Keep the `rustsync.jks` file safe; it is not in git.
 - **Folders.** To sync folders like Documents or Pictures the app needs Android's "all files
-  access" (the *This device* page has a button for it). Libraries are then created from any folder
+  access" (the *Home* page has a button for it). Libraries are then created from any folder
   you pick.
 - **Staying alive.** The app shows a notification while it runs: that is what lets Android leave it
   running in the background. Phones that aggressively stop apps (battery savers) may need rustsync
@@ -418,12 +438,12 @@ touches the Rust code, and `Control.kt` speaks the same local JSON protocol as t
   `--target x86_64-apple-darwin` (after `rustup target add x86_64-apple-darwin`), and the other way
   round on an Intel Mac.
 - To get a double-clickable app with the logo, run `just macos-app` (see
-  [Building and releasing](#building-and-releasing)). It makes `dist/rustsync.app` and a zip of it.
+  [Building and releasing](#building-and-releasing)). It makes `dist/RustSync.app` and a zip of it.
   Put the app in `/Applications`.
 
   The app is not signed by a developer. One you built yourself opens normally; one you downloaded needs
   a right-click, *Open*, the first time (or *Open Anyway* in System Settings, Privacy & Security, or
-  `xattr -dr com.apple.quarantine rustsync.app`).
+  `xattr -dr com.apple.quarantine RustSync.app`).
 - macOS asks whether `rustsync` may accept incoming connections the first time it runs: allow it,
   or other machines cannot reach this one.
 - The Mac's file system is usually **case-insensitive**, so two files whose names differ only in
@@ -457,7 +477,7 @@ with `cargo install just`, `brew install just`, or `pkg install just`). Run `jus
 | `just test` | Run the tests. |
 | `just install` | Build and install both programs into `~/.local/bin` (`PREFIX=/usr/local just install` to change it). |
 | `just package` | Make `dist/rustsync-<version>-<os>-<cpu>.tar.gz` with the programs and docs. |
-| `just macos-app` | On a Mac: make `dist/rustsync.app` (with the logo) and a zip of it. |
+| `just macos-app` | On a Mac: make `dist/RustSync.app` (with the logo) and a zip of it. |
 | `just android-apk` | Make `dist/rustsync-<version>-android.apk` (see [The Android app](#the-android-app)). |
 | `just android-keystore` | Make the signing key for the Android app, and print the secrets to add on GitHub. |
 | `just clean` | Remove build output and `dist/`. |
