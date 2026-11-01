@@ -547,7 +547,32 @@ impl Config {
         use std::os::unix::fs::PermissionsExt;
         std::fs::create_dir_all(&self.dir)
             .map_err(|e| anyhow!("cannot create {}: {}", self.dir.display(), e))?;
-        let _ = std::fs::set_permissions(&self.dir, std::fs::Permissions::from_mode(0o700));
+        // Try to make it private, then check what we really got: the keys live here. If the
+        // permissions cannot be enforced (some network and FAT-style file systems ignore
+        // them), stop instead of carrying on with secrets other users could read.
+        let chmod = std::fs::set_permissions(&self.dir, std::fs::Permissions::from_mode(0o700));
+        use std::os::unix::fs::MetadataExt;
+        let md = std::fs::metadata(&self.dir)
+            .map_err(|e| anyhow!("cannot inspect {}: {}", self.dir.display(), e))?;
+        // SAFETY: geteuid has no preconditions.
+        let me = unsafe { libc::geteuid() };
+        if md.mode() & 0o077 != 0 {
+            bail!(
+                "{} is not private (mode {:o}{}); it holds this device's keys. Fix its permissions (chmod 700) or choose another state_dir",
+                self.dir.display(),
+                md.mode() & 0o7777,
+                match chmod {
+                    Err(e) => format!(", and changing it failed: {}", e),
+                    Ok(()) => String::new(),
+                }
+            );
+        }
+        if md.uid() != me {
+            if me != 0 {
+                bail!("{} belongs to another user; choose a state_dir of your own", self.dir.display());
+            }
+            tracing::warn!("{} belongs to another user, who can read this device's keys", self.dir.display());
+        }
         Ok(())
     }
 }

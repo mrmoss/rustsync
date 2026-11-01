@@ -1,0 +1,31 @@
+# Checks the locked dependencies against the RustSec advisory database (known vulnerabilities).
+# Runs when dependencies change, and every week, because advisories appear without any commit here.
+name: audit
+
+on:
+  push:
+    paths: ['Cargo.toml', 'Cargo.lock', '.github/workflows/audit.yml']
+  pull_request:
+    paths: ['Cargo.toml', 'Cargo.lock', '.github/workflows/audit.yml']
+  schedule:
+    - cron: '17 4 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  cargo-audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit
+      - name: Audit
+        run: |
+          [ -f Cargo.lock ] || cargo generate-lockfile
+          cargo audit

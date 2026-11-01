@@ -16,8 +16,9 @@ use crate::config::{self, Config};
 use crate::depot::Depot;
 use crate::index::{self, Entry, Folder, CHUNK};
 use crate::net::{self, Keys, Reassembler};
-use crate::proto::{fmt_size, BackupUsage, DeviceInfo, LibraryInfo, OfferInfo, Reply, Request, StatusInfo};
+use crate::proto::{fmt_size, BackupUsage, DeviceInfo, LibraryInfo, OfferInfo, Reply, Request, StatusInfo, SyncInfo};
 use crate::state::{Device, LibMode, Library, Member, Offer, Role, State};
+use crate::traffic::Traffic;
 use crate::vault::{self, Vault};
 use anyhow::{anyhow, bail, Context, Result};
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
@@ -55,6 +56,10 @@ const MAX_SERVE: usize = 16; // requests from one device answered at the same ti
 const WRITE_TIMEOUT: Duration = Duration::from_secs(60); // a device that stops reading is dropped
 const MAX_HANDSHAKES: usize = 32; // connections that have not proven who they are yet
 const MAX_HANDSHAKES_PER_IP: u32 = 4;
+/// Too many failed handshakes from one address in a short time: ignore it for a while.
+const HANDSHAKE_FAILS_MAX: u32 = 8;
+const HANDSHAKE_FAIL_WINDOW: Duration = Duration::from_secs(60);
+const HANDSHAKE_BAN: Duration = Duration::from_secs(120);
 pub const KIND_BLOB: u8 = 0;
 pub const KIND_RECORD: u8 = 1;
 const INVITE_SECS: u64 = 600;
@@ -100,6 +105,8 @@ pub enum Msg {
     DepotDelete { req: u64, lib: String, ids: Vec<String> },
     /// Please send me your library list again (I just paired with someone new).
     Resync,
+    /// How much of a library I am still fetching from you (for showing on your screen).
+    Progress { lib: String, files: u64, bytes: u64 },
 }
 
 impl Msg {
@@ -209,9 +216,18 @@ pub struct Remote {
     pending: Pending,
     next: Arc<AtomicU64>,
     vault: Option<Arc<Vault>>,
+    /// Counts what arrives, for the progress shown in the window.
+    traffic: Option<Arc<Traffic>>,
 }
 
 impl Remote {
+    /// One file of a batch from this device is finished.
+    pub fn file_done(&self, lib: &str) {
+        if let Some(t) = &self.traffic {
+            t.file_done(lib);
+        }
+    }
+
     fn with_vault(&self, vault: Arc<Vault>) -> Remote {
         let mut r = self.clone();
         r.vault = Some(vault);
@@ -239,15 +255,21 @@ impl Remote {
 
     /// Fetch one plaintext chunk: from a peer directly, or from the depot (then decrypted here).
     pub async fn get_chunk(&self, lib: String, path: String, index: u32, hash: String) -> Result<Vec<u8>> {
-        if let Some(vault) = &self.vault {
+        let lib_id = lib.clone();
+        let data = if let Some(vault) = &self.vault {
             let id = vault.blob_id(&hash);
             let id2 = id.clone();
             let sealed = self
                 .call(move |req| Msg::DepotGet { req, kind: KIND_BLOB, lib, id: id2 })
                 .await?;
-            return vault.open_blob(&id, &sealed);
+            vault.open_blob(&id, &sealed)?
+        } else {
+            self.call(move |req| Msg::GetChunk { req, lib, path, index, hash }).await?
+        };
+        if let Some(t) = &self.traffic {
+            t.got(&lib_id, data.len());
         }
-        self.call(move |req| Msg::GetChunk { req, lib, path, index, hash }).await
+        Ok(data)
     }
 }
 
@@ -277,6 +299,41 @@ impl SessionHandle {
                 });
             }
             Err(mpsc::error::TrySendError::Closed(_)) => {}
+        }
+    }
+}
+
+impl Node {
+    /// Is this address being ignored after repeated failed handshakes?
+    fn handshake_banned(&self, ip: IpAddr) -> bool {
+        if ip.is_loopback() {
+            return false;
+        }
+        let m = self.ip_fails.lock().unwrap();
+        matches!(m.get(&ip), Some((_, _, Some(until))) if Instant::now() < *until)
+    }
+
+    /// Remember a failed handshake; after too many in a minute the address is ignored for a while.
+    fn note_failed_handshake(&self, ip: IpAddr) {
+        if ip.is_loopback() {
+            return;
+        }
+        let now = Instant::now();
+        let mut m = self.ip_fails.lock().unwrap();
+        if m.len() > 4096 {
+            // Forget old, quiet addresses so this cannot grow without bound.
+            m.retain(|_, (_, start, until)| {
+                until.map_or(false, |u| now < u) || now.duration_since(*start) < HANDSHAKE_FAIL_WINDOW
+            });
+        }
+        let e = m.entry(ip).or_insert((0, now, None));
+        if now.duration_since(e.1) >= HANDSHAKE_FAIL_WINDOW {
+            *e = (0, now, None);
+        }
+        e.0 += 1;
+        if e.0 >= HANDSHAKE_FAILS_MAX && e.2.is_none() {
+            e.2 = Some(now + HANDSHAKE_BAN);
+            debug!("ignoring {} for a while after repeated failed handshakes", ip);
         }
     }
 }
@@ -333,10 +390,14 @@ pub struct Node {
     state: Mutex<State>,
     libs: Mutex<HashMap<String, Arc<LibRuntime>>>,
     sessions: Mutex<HashMap<String, SessionHandle>>,
+    /// What went to and came from each device (by device key).
+    traffic: Mutex<HashMap<String, Arc<Traffic>>>,
     invites: Mutex<Vec<Invite>>,
     dialers: Mutex<HashSet<String>>,
     handshakes: Arc<Semaphore>,
     ip_conns: Mutex<HashMap<IpAddr, u32>>,
+    /// Failed handshakes per address: (count in the current window, window start, ignored until).
+    ip_fails: Mutex<HashMap<IpAddr, (u32, Instant, Option<Instant>)>>,
     next_session: AtomicU64,
     /// The port we listen on (can be changed while running).
     port: std::sync::atomic::AtomicU16,
@@ -418,6 +479,10 @@ impl Node {
         if let Err(e) = st.save(&self.cfg.state_file()) {
             warn!("cannot save state: {:#}", e);
         }
+    }
+
+    fn traffic_for(&self, dev: &str) -> Arc<Traffic> {
+        self.traffic.lock().unwrap().entry(dev.to_string()).or_default().clone()
     }
 
     fn is_connected(&self, key: &str) -> bool {
@@ -1412,6 +1477,7 @@ impl Node {
 
     pub fn status(&self) -> StatusInfo {
         let online: HashSet<String> = self.sessions.lock().unwrap().keys().cloned().collect();
+        let traffic: HashMap<String, Arc<Traffic>> = self.traffic.lock().unwrap().clone();
         let st = self.state.lock().unwrap();
         let devices: Vec<DeviceInfo> = st
             .devices
@@ -1425,6 +1491,10 @@ impl Node {
                     _ => None,
                 },
                 last_seen: d.last_seen,
+                up_rate: traffic.get(&d.key).map(|t| t.rates().0).unwrap_or(0),
+                down_rate: traffic.get(&d.key).map(|t| t.rates().1).unwrap_or(0),
+                sent: traffic.get(&d.key).map(|t| t.totals().0).unwrap_or(0),
+                received: traffic.get(&d.key).map(|t| t.totals().1).unwrap_or(0),
             })
             .collect();
         let names = |keys: &Vec<String>| -> Vec<String> { keys.iter().map(|k| st.device_name(k)).collect() };
@@ -1440,6 +1510,24 @@ impl Node {
                 backup_only: l.mode == LibMode::Backup,
                 kept_for: names(&l.devices(Role::Client)),
                 syncing_with: names(&l.devices(Role::Peer)),
+                sync: l
+                    .devices(Role::Peer)
+                    .iter()
+                    .map(|k| {
+                        let t = traffic.get(k);
+                        let (down_files, down_bytes) = t.map(|t| t.left(&l.id)).unwrap_or((0, 0));
+                        let (up_files, up_bytes) = t.map(|t| t.remote_left(&l.id)).unwrap_or((0, 0));
+                        SyncInfo {
+                            key: k.clone(),
+                            device: st.device_name(k),
+                            online: online.contains(k),
+                            down_files,
+                            down_bytes,
+                            up_files,
+                            up_bytes,
+                        }
+                    })
+                    .collect(),
                 backed_up_on: names(&l.devices(Role::Store)),
                 used: depots.get(&l.id).map(|d| d.used()).unwrap_or(0),
                 quota: depots.get(&l.id).map(|d| d.quota()).unwrap_or(l.quota),
@@ -1824,10 +1912,12 @@ pub async fn run_daemon(cfg: Config, keys: Keys) -> Result<()> {
         state: Mutex::new(state),
         libs: Mutex::new(HashMap::new()),
         sessions: Mutex::new(HashMap::new()),
+        traffic: Mutex::new(HashMap::new()),
         invites: Mutex::new(Vec::new()),
         dialers: Mutex::new(HashSet::new()),
         handshakes: Arc::new(Semaphore::new(MAX_HANDSHAKES)),
         ip_conns: Mutex::new(HashMap::new()),
+        ip_fails: Mutex::new(HashMap::new()),
         next_session: AtomicU64::new(1),
         port: std::sync::atomic::AtomicU16::new(port),
         listener_stop: Mutex::new(CancellationToken::new()),
@@ -1838,7 +1928,9 @@ pub async fn run_daemon(cfg: Config, keys: Keys) -> Result<()> {
         .with_context(|| format!("cannot create the control socket {}", sock.display()))?;
     {
         use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&sock, std::fs::Permissions::from_mode(0o600));
+        // Anyone who can use this socket can administer the daemon: if it cannot be locked down, do not run.
+        std::fs::set_permissions(&sock, std::fs::Permissions::from_mode(0o600))
+            .with_context(|| format!("cannot restrict the control socket {} to its owner", sock.display()))?;
     }
 
     let libs: Vec<Library> = node.state.lock().unwrap().libraries.clone();
@@ -1865,6 +1957,23 @@ pub async fn run_daemon(cfg: Config, keys: Keys) -> Result<()> {
 
     tokio::spawn(listen(node.clone()));
     tokio::spawn(control_loop(node.clone(), listener));
+    {
+        // The speeds shown in the window: measured once a second.
+        let node = node.clone();
+        tokio::spawn(async move {
+            let mut every = tokio::time::interval(Duration::from_secs(1));
+            loop {
+                tokio::select! {
+                    _ = node.shutdown.cancelled() => break,
+                    _ = every.tick() => {}
+                }
+                let all: Vec<Arc<Traffic>> = node.traffic.lock().unwrap().values().cloned().collect();
+                for t in all {
+                    t.tick();
+                }
+            }
+        });
+    }
 
     tokio::select! {
         _ = tokio::signal::ctrl_c() => {}
@@ -1891,6 +2000,11 @@ async fn control_loop(node: Arc<Node>, listener: UnixListener) {
             _ = node.shutdown.cancelled() => break,
             accepted = listener.accept() => match accepted {
                 Ok((stream, _)) => {
+                    // Belt and braces next to the 0600 permissions: only our own user (or root) may talk to us.
+                    if !control_peer_ok(&stream) {
+                        warn!("refused a control connection from another user");
+                        continue;
+                    }
                     let node = node.clone();
                     tokio::spawn(async move {
                         if let Err(e) = serve_control(node, stream).await {
@@ -1904,6 +2018,14 @@ async fn control_loop(node: Arc<Node>, listener: UnixListener) {
                 }
             }
         }
+    }
+}
+
+fn control_peer_ok(stream: &UnixStream) -> bool {
+    match stream.peer_cred() {
+        // SAFETY: geteuid has no preconditions.
+        Ok(c) => c.uid() == unsafe { libc::geteuid() } || c.uid() == 0,
+        Err(_) => false,
     }
 }
 
@@ -2217,6 +2339,9 @@ async fn accept_loop(node: Arc<Node>, listener: TcpListener, stop: CancellationT
             Ok((stream, peer)) => {
                 // Limit connections that have not authenticated yet (overall and per address).
                 let ip = peer.ip();
+                if node.handshake_banned(ip) {
+                    continue; // dropped without any work
+                }
                 let Ok(permit) = node.handshakes.clone().try_acquire_owned() else {
                     debug!("too many connections; dropping {}", peer);
                     continue;
@@ -2250,10 +2375,18 @@ async fn handle_inbound(node: Arc<Node>, mut stream: TcpStream, pre: PreAuth) ->
     stream.set_nodelay(true).ok();
     let cands = node.candidates();
     let psks: Vec<Vec<u8>> = cands.iter().map(|(_, p)| p.clone()).collect();
-    let (transport, remote, idx) =
-        tokio::time::timeout(Duration::from_secs(10), net::handshake_responder(&mut stream, &node.keys, &psks))
-            .await
-            .context("handshake timed out")??;
+    let ip = pre.ip;
+    let shaken = tokio::time::timeout(Duration::from_secs(10), net::handshake_responder(&mut stream, &node.keys, &psks))
+        .await
+        .context("handshake timed out")
+        .and_then(|r| r);
+    let (transport, remote, idx) = match shaken {
+        Ok(v) => v,
+        Err(e) => {
+            node.note_failed_handshake(ip);
+            return Err(e);
+        }
+    };
     drop(pre); // authenticated: no longer counts as an anonymous connection
     let remote_hex = net::hex(&remote);
     match &cands[idx].0 {
@@ -2454,11 +2587,13 @@ async fn recv_bytes_for(stream: &mut TcpStream, t: &mut snow::TransportState, se
     Ok(bytes)
 }
 
-async fn send(wr: &mut OwnedWriteHalf, t: &mut snow::TransportState, msg: &Msg) -> Result<()> {
+/// Send one message; returns how many bytes it was.
+async fn send(wr: &mut OwnedWriteHalf, t: &mut snow::TransportState, msg: &Msg) -> Result<usize> {
     let bytes = postcard::to_allocvec(msg)?;
     tokio::time::timeout(WRITE_TIMEOUT, net::send_message(wr, t, &bytes))
         .await
-        .map_err(|_| anyhow!("the other side stopped reading"))?
+        .map_err(|_| anyhow!("the other side stopped reading"))??;
+    Ok(bytes.len())
 }
 
 /// Both sides have proven who they are. Exchange roles before anything else is sent, so a
@@ -2522,27 +2657,31 @@ async fn session_loop(
         }
     });
 
+    let traffic = node.traffic_for(&dev.key);
+    traffic.new_session();
     let pending: Pending = Arc::new(Mutex::new(HashMap::new()));
     let handle = Remote {
         tx: tx.clone(),
         pending: pending.clone(),
         next: Arc::new(AtomicU64::new(1)),
         vault: None,
+        traffic: Some(traffic.clone()),
     };
 
     // Libraries we sync with this device: its index batches are applied one after another.
     // `queued` counts the bytes waiting; beyond the budget new batches are skipped (they are
     // re-sent at the next full scan), so a flood cannot grow our memory without limit.
     let queued = Arc::new(AtomicUsize::new(0));
-    let (apply_tx, mut apply_rx) = mpsc::unbounded_channel::<(String, Vec<Entry>, usize)>();
+    let (apply_tx, mut apply_rx) = mpsc::unbounded_channel::<(String, Vec<Entry>, usize, u64, u64)>();
     {
         let node = node.clone();
         let origin = dev.key.clone();
         let origin_name = dev.name.clone();
         let handle = handle.clone();
         let queued = queued.clone();
+        let traffic = traffic.clone();
         tokio::spawn(async move {
-            while let Some((lib, entries, cost)) = apply_rx.recv().await {
+            while let Some((lib, entries, cost, files_left, bytes_left)) = apply_rx.recv().await {
                 if let Some(rt) = node.lib_rt(&lib) {
                     match apply::apply_entries(&rt.folder, &handle, entries).await {
                         Ok(applied) => {
@@ -2554,6 +2693,7 @@ async fn session_loop(
                         Err(e) => warn!(device = %origin_name, library = %node.lib_label(&lib), "could not apply changes: {:#}", e),
                     }
                 }
+                traffic.finish(&lib, files_left, bytes_left);
                 queued.fetch_sub(cost, Ordering::Relaxed);
             }
         });
@@ -2575,14 +2715,35 @@ async fn session_loop(
     let serve_slots = Arc::new(Semaphore::new(MAX_SERVE));
     let mut asm = Reassembler::default();
     let mut ping = tokio::time::interval(Duration::from_secs(15));
+    let mut progress = tokio::time::interval(Duration::from_secs(1));
     let res: Result<()> = loop {
         tokio::select! {
             _ = cancel.cancelled() => { break Ok(()); }
             _ = ping.tick() => {
-                if let Err(e) = send(&mut wr, &mut transport, &Msg::Ping).await { break Err(e); }
+                match send(&mut wr, &mut transport, &Msg::Ping).await {
+                    Ok(n) => traffic.add_sent(n),
+                    Err(e) => break Err(e),
+                }
             }
             Some(m) = out_rx.recv() => {
-                if let Err(e) = send(&mut wr, &mut transport, &m).await { break Err(e); }
+                match send(&mut wr, &mut transport, &m).await {
+                    Ok(n) => traffic.add_sent(n),
+                    Err(e) => break Err(e),
+                }
+            }
+            _ = progress.tick() => {
+                // Tell the device how much we still have to fetch from it (it shows that).
+                let mut failed = None;
+                for (lib, files, bytes) in traffic.report() {
+                    match send(&mut wr, &mut transport, &Msg::Progress { lib, files, bytes }).await {
+                        Ok(n) => traffic.add_sent(n),
+                        Err(e) => {
+                            failed = Some(e);
+                            break;
+                        }
+                    }
+                }
+                if let Some(e) = failed { break Err(e); }
             }
             f = frame_rx.recv() => {
                 let frame = match f {
@@ -2595,12 +2756,18 @@ async fn session_loop(
                     Ok(None) => continue,
                     Ok(Some(b)) => b,
                 };
+                traffic.add_received(bytes.len());
                 let msg: Msg = match postcard::from_bytes(&bytes) {
                     Ok(m) => m,
                     Err(e) => break Err(anyhow::Error::from(e)),
                 };
                 match msg {
                     Msg::Ping | Msg::Hello { .. } => {}
+                    Msg::Progress { lib, files, bytes } => {
+                        if node.is_peer(&lib, &dev.key) {
+                            traffic.set_remote(&lib, files, bytes);
+                        }
+                    }
                     Msg::Resync => {
                         let _ = tx.try_send(node.libraries_msg_for(&dev.key));
                     }
@@ -2646,9 +2813,23 @@ async fn session_loop(
                             if queued.load(Ordering::Relaxed) + cost > MAX_QUEUED_APPLY {
                                 warn!(device = %dev.name, "sending faster than we can apply; skipped an update (it is re-sent at the next full scan)");
                             } else {
+                                // How much of this we do not have yet (for the progress shown).
+                                let (files, size) = match node.lib_rt(&lib) {
+                                    Some(rt) => {
+                                        let idx = rt.folder.index.lock().unwrap();
+                                        entries
+                                            .iter()
+                                            .filter(|e| e.is_live_file() && index::remote_wins(idx.get(&e.path), e))
+                                            .fold((0u64, 0u64), |(f, b), e| (f + 1, b.saturating_add(e.size.min(1 << 50))))
+                                    }
+                                    None => (0, 0),
+                                };
+                                traffic.queue(&lib, files, size);
                                 queued.fetch_add(cost, Ordering::Relaxed);
-                                if apply_tx.send((lib, entries, cost)).is_err() {
+                                let lib2 = lib.clone();
+                                if apply_tx.send((lib, entries, cost, files, size)).is_err() {
                                     queued.fetch_sub(cost, Ordering::Relaxed);
+                                    traffic.finish(&lib2, files, size);
                                 }
                             }
                         }

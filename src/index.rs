@@ -159,7 +159,7 @@ pub fn open_nofollow(path: &Path, root: &Path) -> std::io::Result<fs::File> {
     if !fd_inside(f.as_raw_fd(), root) {
         return Err(std::io::Error::new(
             std::io::ErrorKind::PermissionDenied,
-            "path leaves the library folder",
+            "cannot confirm the file is inside the library folder (or it is not; on Linux this needs /proc mounted)",
         ));
     }
     Ok(f)
@@ -167,13 +167,15 @@ pub fn open_nofollow(path: &Path, root: &Path) -> std::io::Result<fs::File> {
 
 /// Is the file behind this open descriptor located under `root`? This is the check that catches a
 /// folder being swapped for a symlink between our checks and the open. Linux, Android and macOS can tell us
-/// where an open descriptor really is; on the BSDs there is no portable way, so we rely on the
+/// where an open descriptor really is (and say "no" when they cannot, e.g. no /proc); on the BSDs there is no portable way, so we rely on the
 /// other safeguards there (O_NOFOLLOW and the ancestor checks).
 #[cfg(any(target_os = "linux", target_os = "android"))]
 pub fn fd_inside(fd: std::os::fd::RawFd, root: &Path) -> bool {
     let proc_fd = Path::new("/proc/self/fd");
+    // Without /proc we cannot tell where the descriptor points, so we cannot vouch for it:
+    // refuse rather than assume it is fine (a container without /proc mounted will see errors).
     if !proc_fd.is_dir() {
-        return true;
+        return false;
     }
     match fs::read_link(proc_fd.join(fd.to_string())) {
         Ok(real) => {

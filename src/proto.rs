@@ -100,6 +100,64 @@ pub struct DeviceInfo {
     /// When it was last connected (seconds since 1970); 0 = never seen.
     #[serde(default)]
     pub last_seen: u64,
+    /// Bytes per second going to and coming from it right now, and the totals since this
+    /// program started.
+    #[serde(default)]
+    pub up_rate: u64,
+    #[serde(default)]
+    pub down_rate: u64,
+    #[serde(default)]
+    pub sent: u64,
+    #[serde(default)]
+    pub received: u64,
+}
+
+/// "1.2 MB/s"
+pub fn fmt_rate(bytes_per_sec: u64) -> String {
+    format!("{}/s", fmt_size(bytes_per_sec))
+}
+
+fn files_text(n: u64) -> String {
+    if n == 1 {
+        "1 file".to_string()
+    } else {
+        format!("{} files", n)
+    }
+}
+
+/// How a library is syncing with one device.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct SyncInfo {
+    /// The device's key, and its name.
+    #[serde(default)]
+    pub key: String,
+    pub device: String,
+    pub online: bool,
+    /// Still to be fetched from that device: files and bytes (at most; pieces we already have
+    /// are not fetched again).
+    pub down_files: u64,
+    pub down_bytes: u64,
+    /// Still to be fetched by that device from us, as it tells us.
+    pub up_files: u64,
+    pub up_bytes: u64,
+}
+
+impl SyncInfo {
+    /// One line: "up to date", "receiving 3 files, 120 MB left; sending 1 file, 4 MB left", "offline".
+    pub fn summary(&self) -> String {
+        let mut parts = Vec::new();
+        if self.down_files > 0 || self.down_bytes > 0 {
+            parts.push(format!("receiving {}, {} left", files_text(self.down_files), fmt_size(self.down_bytes)));
+        }
+        if self.up_files > 0 || self.up_bytes > 0 {
+            parts.push(format!("sending {}, {} left", files_text(self.up_files), fmt_size(self.up_bytes)));
+        }
+        match (parts.is_empty(), self.online) {
+            (false, _) => parts.join("; "),
+            (true, true) => "up to date".to_string(),
+            (true, false) => "offline".to_string(),
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -113,6 +171,9 @@ pub struct LibraryInfo {
     pub kept_for: Vec<String>,
     /// Names of the devices that sync it with us.
     pub syncing_with: Vec<String>,
+    /// The same devices, with how far along the syncing with each is.
+    #[serde(default)]
+    pub sync: Vec<SyncInfo>,
     /// Names of the devices that keep an encrypted backup of it.
     pub backed_up_on: Vec<String>,
     /// Offers not confirmed yet, e.g. "beta" or "charlie (encrypted backup)".

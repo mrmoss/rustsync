@@ -86,7 +86,8 @@ sequenceDiagram
   growing delay, up to 15 s). The device that *showed* the pairing code stores no address, so it waits for
   the joiner to call; give it one with `set-address` if it should dial too.
 - **Before the handshake finishes** a connection counts as anonymous: at most 32 at once, 4 per
-  IP address, 10 s to complete. Frames are `[u16 length][ciphertext]`, records carry up to 60,000
+  IP address, 10 s to complete. An address with 8 failed handshakes within a minute is ignored for
+  2 minutes (connections from it are dropped without any work); loopback is exempt. Frames are `[u16 length][ciphertext]`, records carry up to 60,000
   bytes of payload, and a message is capped at 24 MiB.
 
 ### Pairing
@@ -243,9 +244,9 @@ never applied silently.
 | Backup size | Each encrypted backup can have a size limit (`quota`) that the machine keeping it enforces on every write, so a paired device cannot fill the drive past it. Unused chunks are only ever deleted by a machine holding the key, only if older than 7 days, and only after every record in the backup was read and decrypted. |
 | Memory / CPU | Small bounded queues everywhere a peer controls the input; a byte budget for pending index updates; at most 16 requests per device served at once (extras refused); index messages capped by size and count; library/offer/backup lists capped; a device that stops reading is dropped after 60 s. |
 | Temporary files | The files rustsync writes before renaming them into place (in encrypted backups and for the public key) get unpredictable names, are created exclusively (they fail if anything, a symlink included, is already there), are never opened through a symlink, and, for backups, are readable by the owner only. |
-| Local control socket | `control.sock` is owner-only (`0600`) in a `0700` directory, and a request is one line of at most 1 MiB. |
+| Local control socket | `control.sock` is owner-only (`0600`) in a `0700` directory, and a request is one line of at most 1 MiB. If the directory cannot be made private (or is not owned by you) or the socket cannot be restricted, the daemon refuses to start instead of carrying on. Each connection's user id is also checked, and only your own user (or root) is served. |
 | Logs | `activity.log` (and its `.1` copy) are created `0600` in the state directory and capped in size (`logging.max_size`). They hold device and library names, folder paths and error messages, never keys, pairing codes, recovery codes or file contents; line breaks and control characters in names and messages are replaced by spaces, so a hostile device name cannot start a log line of its own. |
-| Connection floods | At most 32 unauthenticated connections at once and 4 per IP address, 10 s handshake deadline. |
+| Connection floods | At most 32 unauthenticated connections at once and 4 per IP address, 10 s handshake deadline, and a temporary ban for an address that keeps failing handshakes. |
 
 ## Known limits
 
@@ -254,7 +255,7 @@ never applied silently.
   have write access. (A send-only / receive-only role would be a natural next step.)
 - The last step of replacing a file is a `rename`, which cannot be made fully race-free with
   portable APIs. Do not give untrusted local users write access to a synced folder.
-- The descriptor check (is the open file really inside the library folder?) works on Linux (`/proc`) and macOS (`F_GETPATH`). On FreeBSD, OpenBSD and NetBSD only `O_NOFOLLOW` and the ancestor checks guard against a symlink being swapped in while a file is replaced, so do not let untrusted local users write to a synced folder there.
+- The descriptor check (is the open file really inside the library folder?) works on Linux (`/proc`) and macOS (`F_GETPATH`). If it cannot be done (for example `/proc` is not mounted in a container), files are refused rather than trusted. On FreeBSD, OpenBSD and NetBSD only `O_NOFOLLOW` and the ancestor checks guard against a symlink being swapped in while a file is replaced, so do not let untrusted local users write to a synced folder there.
 - On case-insensitive file systems (the macOS default) a peer's files whose names differ only in case collide: one replaces the other. They stay inside the library, but a sync between such a machine and a case-sensitive one can lose one of the two files.
 - An encrypted backup cannot check its own contents (it has no key). If a stored chunk is damaged, or a machine holding the library key uploaded a bad one first, the backup keeps it: restoring that file fails (it is detected, not silently wrong) until the chunk is deleted and uploaded again. There is no automatic repair yet.
 - Treat "holds the library key" as "fully trusted for that backup": such a device can already read, delete and overwrite everything in it.
@@ -263,7 +264,8 @@ never applied silently.
 - Library names are not sent to a machine that only keeps a backup (its offer shows `backup-<id>`); every library shows its id in `status` and the GUI. A restore from a single code takes the name from the folder; a kit carries the names.
 - Files larger than 16 GiB are skipped (with a warning).
 - Conflict resolution is last-writer-wins on wall-clock time; keep clocks in sync (NTP).
-- Dependencies are not audited here: commit `Cargo.lock` and run `cargo audit` regularly.
+- Dependencies: the `audit` workflow runs `cargo audit` on every dependency change and weekly; commit `Cargo.lock` so it checks what you actually ship.
+- **Build and release pipeline.** The workflows run with read-only repository access; only the final job that creates the draft release may write, and the Android build gets just its four signing secrets. The third-party actions are referenced by version tag; for the strongest protection pin each to a full commit hash (Dependabot, set up in `.github/dependabot.yml`, then proposes the updates), and check downloads against `SHA256SUMS`.
 - **Android.** The app keeps its keys in its private storage (not in the phone's hardware key store), and
   turns off Android's cloud backup for them. Syncing folders outside the app needs "all files access",
   which lets the app (and so anything that can drive it) read and write every file on shared storage:

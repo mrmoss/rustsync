@@ -12,7 +12,28 @@ import java.io.OutputStream
 // What the daemon says about itself. These mirror src/proto.rs in the Rust core: the control
 // socket speaks one JSON value per line.
 
-data class DeviceInfo(val key: String, val name: String, val online: Boolean, val addr: String?, val lastSeen: Long)
+data class DeviceInfo(
+    val key: String,
+    val name: String,
+    val online: Boolean,
+    val addr: String?,
+    val lastSeen: Long,
+    val upRate: Long = 0L,
+    val downRate: Long = 0L,
+)
+
+/** How a library is syncing with one device: what is still to be fetched, each way. */
+data class SyncInfo(
+    val key: String,
+    val device: String,
+    val online: Boolean,
+    val downFiles: Long,
+    val downBytes: Long,
+    val upFiles: Long,
+    val upBytes: Long,
+) {
+    fun busy() = downFiles > 0 || downBytes > 0 || upFiles > 0 || upBytes > 0
+}
 
 data class LibraryInfo(
     val id: String,
@@ -24,6 +45,7 @@ data class LibraryInfo(
     val pending: List<String>,
     val used: Long,
     val quota: Long,
+    val sync: List<SyncInfo> = emptyList(),
 )
 
 data class OfferInfo(val id: String, val name: String, val fromName: String, val backup: Boolean, val again: Boolean)
@@ -78,6 +100,8 @@ private fun parseStatus(o: JSONObject): Status {
                 online = d.optBoolean("online"),
                 addr = if (d.isNull("addr")) null else d.optString("addr"),
                 lastSeen = d.optLong("last_seen", 0L),
+                upRate = d.optLong("up_rate", 0L),
+                downRate = d.optLong("down_rate", 0L),
             )
         },
         libraries = (0 until (libraries?.length() ?: 0)).map {
@@ -92,6 +116,18 @@ private fun parseStatus(o: JSONObject): Status {
                 pending = l.optJSONArray("pending").strings(),
                 used = l.optLong("used"),
                 quota = l.optLong("quota"),
+                sync = (0 until (l.optJSONArray("sync")?.length() ?: 0)).map { n ->
+                    val s = l.getJSONArray("sync").getJSONObject(n)
+                    SyncInfo(
+                        key = s.optString("key"),
+                        device = s.optString("device"),
+                        online = s.optBoolean("online"),
+                        downFiles = s.optLong("down_files"),
+                        downBytes = s.optLong("down_bytes"),
+                        upFiles = s.optLong("up_files"),
+                        upBytes = s.optLong("up_bytes"),
+                    )
+                },
             )
         },
         offers = (0 until (offers?.length() ?: 0)).map {

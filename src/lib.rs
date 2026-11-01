@@ -39,6 +39,8 @@ pub enum Cmd {
     Start,
     /// Stop the daemon
     Stop,
+    /// Stop the daemon and start it again (also starts it if it is not running)
+    Restart,
     /// Start rustsync by itself whenever you log in (a systemd user service on Linux, a launch
     /// agent on macOS, a login entry on the BSDs). On Linux it offers to also start it at boot
     InstallService {
@@ -203,6 +205,7 @@ pub mod vault;
 pub mod depot;
 pub mod proto;
 pub mod sync;
+pub mod traffic;
 pub mod cli;
 #[cfg(target_os = "android")]
 pub mod android;

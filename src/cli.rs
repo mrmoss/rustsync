@@ -243,7 +243,7 @@ fn print_status(config: &Path, s: &StatusInfo) {
     }
     for d in &s.devices {
         println!(
-            "  {:<16} {}  {}{}{}",
+            "  {:<16} {}  {}{}{}{}",
             d.name,
             if d.online { "online " } else { "offline" },
             &d.key[..8.min(d.key.len())],
@@ -252,6 +252,15 @@ fn print_status(config: &Path, s: &StatusInfo) {
                 String::new()
             } else {
                 format!("  (last seen {})", crate::activity::ago(crate::activity::unix_now(), d.last_seen))
+            },
+            if d.online && (d.up_rate > 0 || d.down_rate > 0) {
+                format!(
+                    "  down {}  up {}",
+                    crate::proto::fmt_rate(d.down_rate),
+                    crate::proto::fmt_rate(d.up_rate)
+                )
+            } else {
+                String::new()
             }
         );
     }
@@ -279,7 +288,11 @@ fn print_status(config: &Path, s: &StatusInfo) {
             let u = if b.known { usage_line(b.used, b.quota, true) } else { "usage not reported yet".to_string() };
             line.push_str(&format!("\n  {:<16} backup on {}: {}", "", b.device, u));
         }
-        if !l.syncing_with.is_empty() {
+        if !l.sync.is_empty() {
+            for si in &l.sync {
+                line.push_str(&format!("\n  {:<16} syncing with {}: {}", "", si.device, si.summary()));
+            }
+        } else if !l.syncing_with.is_empty() {
             line.push_str(&format!("\n  {:<16} syncing with: {}", "", l.syncing_with.join(", ")));
         }
         if !l.pending.is_empty() {
@@ -900,11 +913,24 @@ async fn start(config_path: &Path, cfg: &Config) -> Result<()> {
     spawn_daemon(config_path, cfg).await
 }
 
+/// Stop the daemon (if it is running), wait for it to let go of its socket, and start it again:
+/// through the service when it is set up to start by itself, otherwise as a background copy.
+async fn restart(config_path: &Path, cfg: &Config) -> Result<()> {
+    if UnixStream::connect(cfg.socket_path()).await.is_ok() {
+        let ctl = Ctl { sock: cfg.socket_path(), config: config_path.to_path_buf() };
+        let _ = call(&ctl, &Request::Stop).await;
+        if !wait_socket(cfg, false, 100).await {
+            bail!("rustsync did not stop; see {}", cfg.log_path().display());
+        }
+    }
+    start(config_path, cfg).await
+}
+
 // ---------------------------------------------------------------- commands
 
 pub async fn run(config_path: &Path, cmd: Cmd) -> Result<()> {
     // `start` also works on a brand-new machine (and from the GUI): it creates the config.
-    if matches!(cmd, Cmd::Start | Cmd::InstallService { .. }) {
+    if matches!(cmd, Cmd::Start | Cmd::Restart | Cmd::InstallService { .. }) {
         ensure_config(config_path, None)?;
     }
     if !config_path.exists() {
@@ -919,6 +945,7 @@ pub async fn run(config_path: &Path, cmd: Cmd) -> Result<()> {
 
     match cmd {
         Cmd::Start => start(config_path, &cfg).await,
+        Cmd::Restart => restart(config_path, &cfg).await,
         Cmd::InstallService { yes } => install_service(config_path, &cfg, yes).await,
         Cmd::UninstallService => uninstall_service(config_path, &cfg).await,
         Cmd::Stop => {

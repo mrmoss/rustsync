@@ -286,7 +286,38 @@ private fun Libraries(model: Model, status: Status) {
                     }
                     Text(lib.folder, fontFamily = FontFamily.Monospace, fontSize = 12.sp)
                     if (lib.backupOnly) Text("Encrypted backup (unreadable here)")
-                    if (lib.syncingWith.isNotEmpty()) Text("Syncing with: ${lib.syncingWith.joinToString(", ")}")
+                    if (lib.sync.isNotEmpty()) {
+                        var open by remember(lib.id) { mutableStateOf(false) }
+                        val busy = lib.sync.any { it.busy() }
+                        val names = lib.syncingWith.joinToString(", ")
+                        TextButton(onClick = { open = !open }) {
+                            Text(
+                                when {
+                                    busy -> "Syncing now (tap for details)"
+                                    lib.sync.none { it.online } -> "Syncing with $names (offline)"
+                                    else -> "Up to date with $names"
+                                },
+                            )
+                        }
+                        if (open) {
+                            for (s in lib.sync) {
+                                Text("${s.device}: ${syncSummary(s)}")
+                                val dev = status.devices.firstOrNull { it.key == s.key }
+                                if (dev != null && s.online) {
+                                    Text(
+                                        "Speed with this device (all libraries): receiving ${fmtRate(dev.downRate)}, sending ${fmtRate(dev.upRate)}",
+                                        style = MaterialTheme.typography.bodySmall,
+                                    )
+                                }
+                            }
+                            Text(
+                                "\"Left\" is the most that is still to be transferred; parts a device already has are not sent again.",
+                                style = MaterialTheme.typography.bodySmall,
+                            )
+                        }
+                    } else if (lib.syncingWith.isNotEmpty()) {
+                        Text("Syncing with: ${lib.syncingWith.joinToString(", ")}")
+                    }
                     if (lib.backedUpOn.isNotEmpty()) Text("Backed up on: ${lib.backedUpOn.joinToString(", ")}")
                     if (lib.pending.isNotEmpty()) Text("Waiting for: ${lib.pending.joinToString(", ")}")
                     Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -446,6 +477,12 @@ private fun Devices(model: Model, status: Status) {
                                 (if (!d.online && d.lastSeen > 0) "  ·  last seen ${agoText(d.lastSeen)}" else ""),
                             style = MaterialTheme.typography.bodySmall,
                         )
+                        if (d.online && (d.downRate > 0 || d.upRate > 0)) {
+                            Text(
+                                "Receiving ${fmtRate(d.downRate)}  ·  sending ${fmtRate(d.upRate)}",
+                                style = MaterialTheme.typography.bodySmall,
+                            )
+                        }
                     }
                     Column(horizontalAlignment = Alignment.End) {
                         TextButton(onClick = { model.showLog("Log: ${d.name}", d.name, null) }) { Text("Log") }
@@ -626,6 +663,32 @@ private fun QrImage(text: String, size: Dp = 240.dp) {
 }
 
 /** "5 minutes ago" for a time in seconds since 1970. */
+private fun fmtBytes(b: Long): String {
+    val units = listOf("B", "KB", "MB", "GB", "TB", "PB")
+    var v = b.toDouble()
+    var i = 0
+    while (v >= 1000.0 && i < units.size - 1) {
+        v /= 1000.0
+        i++
+    }
+    return if (i == 0) "$b B" else String.format(java.util.Locale.US, "%.1f %s", v, units[i])
+}
+
+private fun fmtRate(perSecond: Long) = fmtBytes(perSecond) + "/s"
+
+private fun filesText(n: Long) = if (n == 1L) "1 file" else "$n files"
+
+private fun syncSummary(s: SyncInfo): String {
+    val parts = mutableListOf<String>()
+    if (s.downFiles > 0 || s.downBytes > 0) parts.add("receiving ${filesText(s.downFiles)}, ${fmtBytes(s.downBytes)} left")
+    if (s.upFiles > 0 || s.upBytes > 0) parts.add("sending ${filesText(s.upFiles)}, ${fmtBytes(s.upBytes)} left")
+    return when {
+        parts.isNotEmpty() -> parts.joinToString("; ")
+        s.online -> "up to date"
+        else -> "offline"
+    }
+}
+
 private fun agoText(then: Long): String {
     val s = System.currentTimeMillis() / 1000 - then
     return when {

@@ -87,7 +87,9 @@ pub async fn apply_entries(folder: &Arc<Folder>, remote: &Remote, entries: Vec<E
     }
 
     for e in files {
-        match apply_file(folder, remote, &e).await {
+        let res = apply_file(folder, remote, &e).await;
+        remote.file_done(&folder.id);
+        match res {
             Ok(true) => {
                 debug!("synced {}", e.path);
                 applied.push(e);
@@ -240,7 +242,7 @@ async fn build_temp(
         if !fd_inside(f.as_raw_fd(), &root) {
             drop(f);
             let _ = tokio::fs::remove_file(&tmp).await;
-            bail!("{} would be written outside the library folder", e.path);
+            bail!("{} would be written outside the library folder (or that could not be confirmed: on Linux this needs /proc mounted)", e.path);
         }
         f
     };

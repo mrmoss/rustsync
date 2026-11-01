@@ -7,6 +7,9 @@ on:
   push:
   pull_request:
 
+permissions:
+  contents: read
+
 jobs:
   unix:
     name: ${{ matrix.os }}
@@ -18,6 +21,8 @@ jobs:
         os: [ubuntu-latest, ubuntu-24.04-arm, macos-latest]
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
       - name: Linux build libraries
         if: startsWith(matrix.os, 'ubuntu')
@@ -49,6 +54,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - uses: cross-platform-actions/action@v1.7.0
         with:
           operating_system: freebsd

@@ -99,6 +99,32 @@ struct DeviceInfo {
     addr: Option<String>,
     #[serde(default)]
     last_seen: u64,
+    /// Bytes per second to and from it right now.
+    #[serde(default)]
+    up_rate: u64,
+    #[serde(default)]
+    down_rate: u64,
+}
+
+/// How a library is syncing with one device.
+#[derive(Deserialize, Debug, Clone)]
+struct SyncInfo {
+    #[serde(default)]
+    key: String,
+    device: String,
+    online: bool,
+    /// Still to be fetched from that device (files, bytes) ...
+    down_files: u64,
+    down_bytes: u64,
+    /// ... and still to be fetched by that device from us, as it tells us.
+    up_files: u64,
+    up_bytes: u64,
+}
+
+impl SyncInfo {
+    fn busy(&self) -> bool {
+        self.down_files > 0 || self.down_bytes > 0 || self.up_files > 0 || self.up_bytes > 0
+    }
 }
 
 #[derive(Deserialize, Debug, Clone)]
@@ -113,6 +139,8 @@ struct LibraryInfo {
     kept_for: Vec<String>,
     #[serde(default)]
     syncing_with: Vec<String>,
+    #[serde(default)]
+    sync: Vec<SyncInfo>,
     #[serde(default)]
     backed_up_on: Vec<String>,
     #[serde(default)]
@@ -410,6 +438,34 @@ fn ago_text(then: u64) -> String {
 }
 
 /// Bytes as megabytes for the log size box: "2" or "0.5".
+fn fmt_rate(bytes_per_sec: u64) -> String {
+    format!("{}/s", fmt_size(bytes_per_sec))
+}
+
+fn files_text(n: u64) -> String {
+    if n == 1 {
+        "1 file".to_string()
+    } else {
+        format!("{} files", n)
+    }
+}
+
+/// "receiving 3 files, 120 MB left; sending 1 file, 4 MB left", "up to date" or "offline".
+fn sync_summary(s: &SyncInfo) -> String {
+    let mut parts = Vec::new();
+    if s.down_files > 0 || s.down_bytes > 0 {
+        parts.push(format!("receiving {}, {} left", files_text(s.down_files), fmt_size(s.down_bytes)));
+    }
+    if s.up_files > 0 || s.up_bytes > 0 {
+        parts.push(format!("sending {}, {} left", files_text(s.up_files), fmt_size(s.up_bytes)));
+    }
+    match (parts.is_empty(), s.online) {
+        (false, _) => parts.join("; "),
+        (true, true) => "up to date".to_string(),
+        (true, false) => "offline".to_string(),
+    }
+}
+
 fn fmt_mb(bytes: u64) -> String {
     let v = bytes as f64 / 1e6;
     if (v - v.round()).abs() < 1e-9 {
@@ -687,6 +743,39 @@ impl App {
                 )),
             };
             if let Some(msg) = ev {
+                let _ = tx.send(Ev::Op { ok: false, msg });
+            }
+            ctx.request_repaint();
+        });
+    }
+
+    /// Stop the service and start it again (the same as `rustsync -c <config> restart`).
+    fn restart_service(&mut self) {
+        self.starting_since = Some(Instant::now());
+        let (tx, ctx, config) = (self.tx.clone(), self.ctx.clone(), self.config.clone());
+        std::thread::spawn(move || {
+            let bin = rustsync_bin();
+            let res = Command::new(&bin)
+                .arg("-c")
+                .arg(&config)
+                .arg("restart")
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+            let msg = match res {
+                Ok(s) if s.success() => None,
+                Ok(_) => Some(format!(
+                    "RustSync did not restart; see daemon.log in {}",
+                    state_dir(&config).display()
+                )),
+                Err(e) => Some(format!(
+                    "cannot run {} ({}). Put the rustsync program next to this one, or set RUSTSYNC_BIN.",
+                    bin.display(),
+                    e
+                )),
+            };
+            if let Some(msg) = msg {
                 let _ = tx.send(Ev::Op { ok: false, msg });
             }
             ctx.request_repaint();
@@ -1488,6 +1577,7 @@ mod camera {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::mpsc::Sender;
     use std::sync::Arc;
+    use std::time::{Duration, Instant};
 
     pub const AVAILABLE: bool = true;
 
@@ -1523,10 +1613,13 @@ mod camera {
 
         #[cfg(target_os = "macos")]
         ask_permission()?;
-        let format = RequestedFormat::new::<RgbFormat>(RequestedFormatType::AbsoluteHighestFrameRate);
+        // A pairing code is a dense QR code, so ask for the biggest picture the camera has (the
+        // fastest format is often a small one, too coarse to read it).
+        let format = RequestedFormat::new::<RgbFormat>(RequestedFormatType::AbsoluteHighestResolution);
         let mut cam = Camera::new(CameraIndex::Index(0), format)
             .map_err(|e| format!("cannot open the camera: {}", e))?;
         cam.open_stream().map_err(|e| format!("cannot start the camera: {}", e))?;
+        let (mut last_try, mut invert) = (Instant::now(), false);
         while !stop.load(Ordering::Relaxed) {
             let frame = cam.frame().map_err(|e| format!("camera error: {}", e))?;
             let img = frame.decode_image::<RgbFormat>().map_err(|e| format!("camera error: {}", e))?;
@@ -1535,11 +1628,35 @@ mod camera {
             if w == 0 || h == 0 || rgb.len() < w * h * 3 {
                 continue;
             }
-            let _ = tx.send(Ev::CameraFrame(egui::ColorImage::from_rgb([w, h], &rgb[..w * h * 3])));
+            // What is shown in the window: small enough to send to the screen quickly.
+            let pstep = (w / 960).max(1);
+            let (pw, ph) = (w / pstep, h / pstep);
+            let mut small = Vec::with_capacity(pw * ph * 3);
+            for y in 0..ph {
+                for x in 0..pw {
+                    let i = ((y * pstep) * w + x * pstep) * 3;
+                    small.extend_from_slice(&rgb[i..i + 3]);
+                }
+            }
+            let _ = tx.send(Ev::CameraFrame(egui::ColorImage::from_rgb([pw, ph], &small)));
             ctx.request_repaint();
-            let mut prepared = rqrr::PreparedImage::prepare_from_greyscale(w, h, |x, y| {
-                let i = (y * w + x) * 3;
-                ((rgb[i] as u32 * 299 + rgb[i + 1] as u32 * 587 + rgb[i + 2] as u32 * 114) / 1000) as u8
+            // Looking for a code takes longer than showing the picture: a few times a second is
+            // enough, and every other try is on the inverted picture (light squares on dark).
+            if last_try.elapsed() < Duration::from_millis(120) {
+                continue;
+            }
+            last_try = Instant::now();
+            invert = !invert;
+            let dstep = (w / 1600).max(1);
+            let (dw, dh) = (w / dstep, h / dstep);
+            let mut prepared = rqrr::PreparedImage::prepare_from_greyscale(dw, dh, |x, y| {
+                let i = ((y * dstep) * w + x * dstep) * 3;
+                let g = ((rgb[i] as u32 * 299 + rgb[i + 1] as u32 * 587 + rgb[i + 2] as u32 * 114) / 1000) as u8;
+                if invert {
+                    255 - g
+                } else {
+                    g
+                }
             });
             for grid in prepared.detect_grids() {
                 if let Ok((_meta, text)) = grid.decode() {
@@ -1888,7 +2005,47 @@ impl App {
                         self.perform(Action::Prune { id: l.id.clone() });
                     }
                 }
-                if !l.syncing_with.is_empty() {
+                if !l.sync.is_empty() {
+                    let busy = l.sync.iter().any(|s| s.busy());
+                    let title = if busy {
+                        "Syncing now".to_string()
+                    } else if l.sync.iter().all(|s| !s.online) {
+                        format!("Syncing with {} (offline)", l.syncing_with.join(", "))
+                    } else {
+                        format!("Up to date with {}", l.syncing_with.join(", "))
+                    };
+                    egui::CollapsingHeader::new(RichText::new(title).color(if busy { ACCENT } else { TEXT }))
+                        .id_salt(format!("sync-{}", l.id))
+                        .show(ui, |ui| {
+                            for s in &l.sync {
+                                ui.horizontal_wrapped(|ui| {
+                                    status_dot(ui, if s.online { GREEN } else { MUTED });
+                                    ui.label(RichText::new(&s.device).strong());
+                                    ui.label(sync_summary(s));
+                                });
+                                if let Some(d) = status.devices.iter().find(|d| d.key == s.key) {
+                                    if s.online {
+                                        ui.label(
+                                            RichText::new(format!(
+                                                "Speed with this device (all libraries): receiving {}, sending {}",
+                                                fmt_rate(d.down_rate),
+                                                fmt_rate(d.up_rate)
+                                            ))
+                                            .small()
+                                            .weak(),
+                                        );
+                                    } else if d.last_seen > 0 {
+                                        ui.label(RichText::new(format!("Last seen {}", ago_text(d.last_seen))).small().weak());
+                                    }
+                                }
+                            }
+                            ui.label(
+                                RichText::new("“Left” is the most that is still to be transferred; parts a device already has are not sent again.")
+                                    .small()
+                                    .weak(),
+                            );
+                        });
+                } else if !l.syncing_with.is_empty() {
                     ui.label(format!("Syncing with: {}", l.syncing_with.join(", ")));
                 }
                 if !l.pending.is_empty() {
@@ -1966,6 +2123,13 @@ impl App {
                             line.push_str(&format!("  ·  last seen {}", ago_text(d.last_seen)));
                         }
                         ui.label(RichText::new(line).small().weak());
+                        if d.online && (d.down_rate > 0 || d.up_rate > 0) {
+                            ui.label(
+                                RichText::new(format!("Receiving {}  ·  sending {}", fmt_rate(d.down_rate), fmt_rate(d.up_rate)))
+                                    .small()
+                                    .color(ACCENT),
+                            );
+                        }
                         ui.horizontal_wrapped(|ui| {
                             if ui
                                 .button("Change address…")
@@ -2033,6 +2197,54 @@ impl App {
             });
             ui.add_space(8.0);
         }
+        card(ui, |ui| {
+            ui.label(RichText::new("Service").strong());
+            ui.label("Syncing continues in the background when you close this window.");
+            let mut auto = service_installed(&self.config);
+            if ui
+                .checkbox(&mut auto, AUTOSTART_LABEL)
+                .on_hover_text("A systemd user service. Turning it off also stops RustSync now.")
+                .changed()
+            {
+                self.set_service(auto);
+            }
+            if tray_supported() {
+                let mut on = tray_login_on(&self.config);
+                let label = if cfg!(target_os = "macos") {
+                    "Show the RustSync icon in the menu bar when I log in"
+                } else {
+                    "Show the RustSync tray icon when I log in"
+                };
+                if ui
+                    .checkbox(&mut on, label)
+                    .on_hover_text("Opening this window also shows the icon. Quit it from its own menu.")
+                    .changed()
+                {
+                    match set_tray_login(&self.config, on) {
+                        Ok(()) => {
+                            if on {
+                                ensure_tray_running(&self.config);
+                            }
+                        }
+                        Err(e) => self.say(false, &e),
+                    }
+                }
+            }
+            ui.horizontal(|ui| {
+                if ui
+                    .button("Restart RustSync")
+                    .on_hover_text("Stops the background service and starts it again. Syncing resumes in a moment.")
+                    .clicked()
+                {
+                    self.restart_service();
+                }
+                if ui.button("Stop RustSync").clicked() {
+                    self.run(Request::Stop);
+                }
+            });
+        });
+
+        ui.add_space(8.0);
         card(ui, |ui| {
             ui.label(RichText::new("Network").strong());
             ui.label("Port this machine listens on for the other devices:");
@@ -2114,45 +2326,6 @@ impl App {
                 if let Some(v) = parsed {
                     self.perform(Action::SetLogSize { bytes: (v * 1e6).round() as u64 });
                 }
-            }
-        });
-
-        ui.add_space(8.0);
-        card(ui, |ui| {
-            ui.label(RichText::new("Service").strong());
-            ui.label("Syncing continues in the background when you close this window.");
-            let mut auto = service_installed(&self.config);
-            if ui
-                .checkbox(&mut auto, AUTOSTART_LABEL)
-                .on_hover_text("A systemd user service. Turning it off also stops RustSync now.")
-                .changed()
-            {
-                self.set_service(auto);
-            }
-            if tray_supported() {
-                let mut on = tray_login_on(&self.config);
-                let label = if cfg!(target_os = "macos") {
-                    "Show the RustSync icon in the menu bar when I log in"
-                } else {
-                    "Show the RustSync tray icon when I log in"
-                };
-                if ui
-                    .checkbox(&mut on, label)
-                    .on_hover_text("Opening this window also shows the icon. Quit it from its own menu.")
-                    .changed()
-                {
-                    match set_tray_login(&self.config, on) {
-                        Ok(()) => {
-                            if on {
-                                ensure_tray_running(&self.config);
-                            }
-                        }
-                        Err(e) => self.say(false, &e),
-                    }
-                }
-            }
-            if ui.button("Stop RustSync").clicked() {
-                self.run(Request::Stop);
             }
         });
 
@@ -2561,6 +2734,7 @@ impl App {
                     }
                     if *scanning {
                         ui.label("Point the camera at the QR code on the other device.");
+                        ui.label(RichText::new("Hold it still, as big in the picture as you can, with good light on it.").small().weak());
                         match &self.scan_tex {
                             Some(tex) => {
                                 let w = ui.available_width().min(380.0);
@@ -2993,6 +3167,7 @@ mod tray {
         Open,
         Start,
         Stop,
+        Restart,
         ToggleAutostart,
         ToggleService,
         Quit,
@@ -3105,6 +3280,16 @@ mod tray {
             );
             m.push(MenuItem::Separator);
             if self.online {
+                m.push(
+                    StandardItem {
+                        label: "Restart the RustSync service".into(),
+                        activate: Box::new(|t: &mut Self| {
+                            let _ = t.tx.send(Cmd::Restart);
+                        }),
+                        ..Default::default()
+                    }
+                    .into(),
+                );
                 m.push(
                     StandardItem {
                         label: "Stop the RustSync service".into(),
@@ -3283,6 +3468,16 @@ mod tray {
                 }
                 Ok(Cmd::Stop) => {
                     let _ = call(&sock, &Request::Stop, None, |_| {});
+                }
+                Ok(Cmd::Restart) => {
+                    let _ = Command::new(rustsync_bin())
+                        .arg("-c")
+                        .arg(config)
+                        .arg("restart")
+                        .stdin(Stdio::null())
+                        .stdout(Stdio::null())
+                        .stderr(Stdio::null())
+                        .spawn();
                 }
                 Ok(Cmd::ToggleAutostart) => toggle_autostart(config),
                 Ok(Cmd::ToggleService) => {
@@ -3465,6 +3660,7 @@ mod menubar {
             let _ = menu.append(&MenuItem::with_id("open", "Open RustSync", true, None));
             let _ = menu.append(&PredefinedMenuItem::separator());
             if snap.online {
+                let _ = menu.append(&MenuItem::with_id("restart", "Restart the RustSync service", true, None));
                 let _ = menu.append(&MenuItem::with_id("stop", "Stop the RustSync service", true, None));
             } else {
                 let _ = menu.append(&MenuItem::with_id("start", "Start the RustSync service", true, None));
@@ -3536,6 +3732,16 @@ mod menubar {
                             .arg("-c")
                             .arg(&self.config)
                             .arg("start")
+                            .stdin(Stdio::null())
+                            .stdout(Stdio::null())
+                            .stderr(Stdio::null())
+                            .spawn();
+                    }
+                    "restart" => {
+                        let _ = Command::new(rustsync_bin())
+                            .arg("-c")
+                            .arg(&self.config)
+                            .arg("restart")
                             .stdin(Stdio::null())
                             .stdout(Stdio::null())
                             .stderr(Stdio::null())

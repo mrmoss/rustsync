@@ -299,14 +299,17 @@ running yet). It has four pages, and opens on the first:
 
 - **Home**: this device: its name, public key and the address it's listening on.
 - **Libraries**: your libraries, who they're shared with, how much encrypted-backup space is used,
-  and offers waiting for you to accept.
+  and offers waiting for you to accept. Each library has an arrow that shows its **sync status** ("Up to date" or "Syncing…"): open it to see,
+  for every device, whether it is up to date or how many files and bytes are still to send or
+  receive (and whether that device is offline).
 - **Devices**: the machines you've paired and whether they're online, plus *Show a pairing code* and
   *Enter a pairing code* for adding another. When you show a code, the address comes from a
   drop-down of this machine's own IP addresses and host names, or *Set manually…* to type one.
   *Change address…* updates where a device is reached when its IP address changes (the Android
   app has the same button). A device that is offline shows when it was *last seen*, and each
-  device and library has a *Log…* button showing just what concerns it.
-- **Settings**: the **port** this machine listens on; the **logs** (show them, and set how big
+  device and library has a *Log…* button showing just what concerns it. An online device shows
+  the current **download and upload speed** while data is moving.
+- **Settings**: the **Service** (start, **restart** or stop RustSync) at the top; the **port** this machine listens on; the **logs** (show them, and set how big
   they may grow); the switches for starting RustSync automatically and for showing its tray (menu
   bar) icon when you log in; and *About* (version, author and license).
 
@@ -363,6 +366,7 @@ rustsync [-c CONFIG] <COMMAND>
 Getting going
   start               Start the service in the background
   stop                Stop it
+  restart             Stop it and start it again (also starts it if it is not running)
   status              Show this device, paired devices (with when an offline one was last seen), libraries and waiting offers
   log [-d DEVICE] [-l LIBRARY] [-n LINES] [--path]
                       Show the activity log (newest last), or just what concerns one device or library;
@@ -446,7 +450,7 @@ The first time you run `rustsync start` in a terminal it offers this too (once).
 `rustsync-gui` puts an icon in the system tray (StatusNotifierItem over D-Bus). It is in colour
 when rustsync is running, **greyed out** when it is not, and gets a **green badge** when libraries
 are being offered to you. Click it (or choose *Open RustSync*) to get the window; closing the
-window leaves the icon, and syncing, running. The menu also starts or stops the service and has
+window leaves the icon, and syncing, running. The menu also starts, **restarts** or stops the service and has
 *Show this icon at login*.
 
 ```sh
@@ -472,7 +476,7 @@ to `tray.log` in the state directory. To build without it:
 
 On a Mac the same small program puts an icon at the top right of the screen, in the menu bar (no
 Dock icon). It follows the light or dark menu bar, is fainter when rustsync is not running, and
-gets a dot when libraries are being offered to you. Its menu opens the window, starts or stops the
+gets a dot when libraries are being offered to you. Its menu opens the window, starts, restarts or stops the
 service, and has *Show this icon at login*. Opening the window (for example from the app) also
 shows the icon, and it stays when the window is closed. The *Settings* page has the same login switch;
 it adds a launch agent, `~/Library/LaunchAgents/com.rustsync.tray.plist`. To quit the icon, use
@@ -732,7 +736,9 @@ different `name` and `server.port`, and pass `-c` to every command.
 | Start at login doesn't start anything (macOS) | Move *RustSync.app* to *Applications*, then switch the option off and on again; check *Login Items & Extensions* in System Settings and `daemon.log` in the state directory. |
 | Pairing fails | The code is one-time and only valid while `invite` is still waiting. Check the address you gave to `invite` is reachable from the other machine, and that the port (default 3032) isn't blocked by a firewall. |
 | The two verification codes differ | Answer no on both and start again. A different number means the two machines did not talk to each other directly, or someone else used the code first. |
+| The camera opens but never reads the code | Hold the code steady, fill much of the picture, and avoid glare and reflections; a long code is a dense picture, so a closer, brighter view helps. A QR shown on another screen reads best at full size. If it still does not scan, use the pasted code. |
 | The camera does not open (window) | Use the pasted code instead. On Linux the camera must be a normal video device (`/dev/video0`) your user can open; on macOS allow the camera in System Settings, Privacy & Security. |
+| The window shows a library as "syncing" for a long time | Open its sync-status arrow: it lists what is left per device. A device that is offline keeps its share of the work until it comes back. `rustsync status` prints the same. Both devices need to be on the same RustSync version: a mismatch refuses to connect (`rustsync restart` after updating). |
 | A device shows as offline | It must be running and reachable at the address it was paired with. Changes sync when it comes back. |
 | Nothing happens after `share` | The other side has to `accept` (look in `rustsync status` or the window for the offer). |
 | A backup stopped accepting data | It reached its size limit: raise it with `rustsync quota`, or free space with `rustsync prune`. |
@@ -755,3 +761,4 @@ Remember the note at the top: this code is AI-generated and has not been indepen
 
 rustsync is free software, released under the [GNU General Public License, version 2](LICENSE)
 (`GPL-2.0-only`). You may use, study, change and share it under those terms; there is no warranty.
+

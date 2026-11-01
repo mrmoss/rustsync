@@ -1,9 +1,9 @@
 [package]
 name = "rustsync"
-version = "0.7.1"
+version = "0.8.0"
 edition = "2021"
 # The service and command line build with this; the window (eframe) needs a recent Rust, 1.95 or newer.
-rust-version = "1.95"
+rust-version = "1.81"
 license = "GPL-2.0-only"
 
 # The program is a library (the core, also used by the Android app) plus thin command-line and

@@ -1,0 +1,12 @@
+# Keeps the GitHub Actions the workflows use up to date. If you pin the actions to full commit
+# hashes (recommended; see SECURITY.md), this proposes the hash bumps for you to review.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
