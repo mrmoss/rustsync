@@ -56,7 +56,12 @@ import com.journeyapps.barcodescanner.BarcodeEncoder
 import com.journeyapps.barcodescanner.ScanContract
 import com.journeyapps.barcodescanner.ScanOptions
 
-private val tabs = listOf("Home" to Glyph.Home, "Libraries" to Glyph.Folder, "Devices" to Glyph.Devices)
+private val tabs = listOf(
+    "Home" to Glyph.Home,
+    "Libraries" to Glyph.Folder,
+    "Devices" to Glyph.Devices,
+    "Settings" to Glyph.Settings,
+)
 
 @Composable
 fun App(model: Model, hasAllFilesAccess: () -> Boolean, askAllFilesAccess: () -> Unit) {
@@ -91,9 +96,10 @@ fun App(model: Model, hasAllFilesAccess: () -> Boolean, askAllFilesAccess: () ->
                 Offline(model.offline ?: "")
             } else {
                 when (tab) {
-                    0 -> ThisDevice(model, status, hasAllFilesAccess, askAllFilesAccess)
+                    0 -> ThisDevice(status, hasAllFilesAccess, askAllFilesAccess)
                     1 -> Libraries(model, status)
-                    else -> Devices(model, status)
+                    2 -> Devices(model, status)
+                    else -> SettingsPage(model, status)
                 }
             }
         }
@@ -126,7 +132,7 @@ private fun Offline(reason: String) {
 // ---------------------------------------------------------------- Home
 
 @Composable
-private fun ThisDevice(model: Model, status: Status, hasAllFilesAccess: () -> Boolean, askAllFilesAccess: () -> Unit) {
+private fun ThisDevice(status: Status, hasAllFilesAccess: () -> Boolean, askAllFilesAccess: () -> Unit) {
     var allFiles by remember { mutableStateOf(hasAllFilesAccess()) }
     LaunchedEffect(Unit) { allFiles = hasAllFilesAccess() }
     val clipboard = LocalClipboardManager.current
@@ -157,9 +163,17 @@ private fun ThisDevice(model: Model, status: Status, hasAllFilesAccess: () -> Bo
                 }
             }
         }
+    }
+}
+
+// ---------------------------------------------------------------- Settings
+
+@Composable
+private fun SettingsPage(model: Model, status: Status) {
+    Page("Settings", "How this phone listens, and about RustSync.") {
         RsCard(Modifier.fillMaxWidth()) {
             Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                Text("Settings", style = MaterialTheme.typography.titleMedium)
+                Text("Network", style = MaterialTheme.typography.titleMedium)
                 Text("Port this phone listens on for the other devices:")
                 var port by remember(status.port) { mutableStateOf(status.port.toString()) }
                 val parsed = port.trim().toIntOrNull()?.takeIf { it in 1..65535 }

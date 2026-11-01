@@ -275,11 +275,9 @@ rustsync status
 ## The desktop window
 
 Prefer clicking? Start the window with `rustsync-gui` (it has a *Start* button if the service isn't
-running yet). It has three pages, and opens on the first:
+running yet). It has four pages, and opens on the first:
 
-- **Home**: this device: its name, public key, the address it's listening on, and the switches for
-  starting RustSync automatically and for showing its tray (menu bar) icon when you log in. The
-  *Settings* card changes the **port** it listens on.
+- **Home**: this device: its name, public key and the address it's listening on.
 - **Libraries**: your libraries, who they're shared with, how much encrypted-backup space is used,
   and offers waiting for you to accept.
 - **Devices**: the machines you've paired and whether they're online, plus *Show a pairing code* and
@@ -287,6 +285,9 @@ running yet). It has three pages, and opens on the first:
   drop-down of this machine's own IP addresses and host names, or *Set manually…* to type one.
   *Change address…* updates where a device is reached when its IP address changes (the Android
   app has the same button).
+- **Settings**: the **port** this machine listens on; the switches for starting RustSync
+  automatically and for showing its tray (menu bar) icon when you log in; and *About* (version,
+  author and license).
 
 Wherever a library needs a folder (*New library*, *Accept…*, *Restore from backup…*), you choose it
 with a **folder browser** instead of typing a path: shortcuts for your home folder and drives, a
@@ -307,7 +308,10 @@ the only accent (the Android app also has a light version that follows the phone
   <img src="docs/screenshots/devices.png" width="760" alt="The Devices page: pairing buttons and the list of paired machines">
 </p>
 <p align="center">
-  <img src="docs/screenshots/home.png" width="760" alt="The Home page: name, public key, and the start-automatically switches">
+  <img src="docs/screenshots/home.png" width="760" alt="The Home page: name, public key and listening address">
+</p>
+<p align="center">
+  <img src="docs/screenshots/settings.png" width="760" alt="The Settings page: port, start-automatically switches and About">
 </p>
 <p align="center">
   <img src="docs/screenshots/pairing.png" width="760" alt="Pairing: the QR code on one device, and the verification code both devices must agree on">
@@ -393,7 +397,7 @@ rustsync uninstall-service      # stop doing that (also stops rustsync now)
 ```
 
 The first time you run `rustsync start` in a terminal it offers this too (once). With it set up,
-`start` and `stop` simply work with it. The window's *Home* page has the same switch.
+`start` and `stop` simply work with it. The window's *Settings* page has the same switch.
 
 - **Linux:** a systemd *user* service, `~/.config/systemd/user/rustsync.service` (other configs get
   their own name). It restarts rustsync if it crashes and logs to the usual `daemon.log`.
@@ -445,7 +449,7 @@ On a Mac the same small program puts an icon at the top right of the screen, in 
 Dock icon). It follows the light or dark menu bar, is fainter when rustsync is not running, and
 gets a dot when libraries are being offered to you. Its menu opens the window, starts or stops the
 service, and has *Show this icon at login*. Opening the window (for example from the app) also
-shows the icon, and it stays when the window is closed. The *Home* page has the same login switch;
+shows the icon, and it stays when the window is closed. The *Settings* page has the same login switch;
 it adds a launch agent, `~/Library/LaunchAgents/com.rustsync.tray.plist`. To quit the icon, use
 its menu.
 
@@ -464,7 +468,7 @@ if the login entry is broken.
 
 An Android app (a phone or tablet, Android 8 or newer) lives in [`android/`](android/). It runs
 the same sync service inside the app, so the phone is a full device: pair it, share libraries
-with it, accept ones from the others. It has the same three pages as the window (*Home* first),
+with it, accept ones from the others. It has the same four pages as the window (*Home* first, *Settings* last),
 shows a QR code for pairing, and scans one with the camera. To pair, *Devices* opens the camera
 straight from the big *Scan a code* button (upright, like any QR scanner); *Show a code on this
 phone* shows one for the other device to scan, and a small *Enter a code by hand* link is there
@@ -481,14 +485,15 @@ allow installing from that source.
   repository secrets it prints (`ANDROID_KEYSTORE_BASE64`, `ANDROID_KEYSTORE_PASSWORD`,
   `ANDROID_KEY_ALIAS`, `ANDROID_KEY_PASSWORD`). Keep the `rustsync.jks` file safe; it is not in git.
 - **Folders.** To sync folders like Documents or Pictures the app needs Android's "all files
-  access" (the *Home* page has a button for it). Libraries are then created from any folder
-  you pick.
+  access" (the app asks when you first open it, and the *Home* page has a button if you said
+  no). It also asks for notifications and for the camera (to scan pairing codes). Libraries are then
+  created from any folder you pick.
 - **Staying alive.** The app shows a notification while it runs: that is what lets Android leave it
   running in the background. Phones that aggressively stop apps (battery savers) may need rustsync
   set to "unrestricted" battery use.
 - **Reaching the phone.** Other devices connect to the phone, so when you show a pairing code on it
   the address must be one they can reach: pick the Wi-Fi address from the drop-down (it works at
-  home) or choose *Set manually…*. The port it listens on can be changed on the *Home* page.
+  home) or choose *Set manually…*. The port it listens on can be changed on the *Settings* page.
   Pairing the other way round (phone enters the code) works from anywhere the phone can reach the
   other machine.
 
@@ -513,9 +518,11 @@ touches the Rust code, and `Control.kt` speaks the same local JSON protocol as t
   A build on Apple silicon makes an Apple-silicon program; to make an Intel one add
   `--target x86_64-apple-darwin` (after `rustup target add x86_64-apple-darwin`), and the other way
   round on an Intel Mac.
-- To get a double-clickable app with the logo, run `just macos-app` (see
-  [Building and releasing](#building-and-releasing)). It makes `dist/RustSync.app` and a zip of it.
-  Put the app in `/Applications`.
+- The download is a disk image (`rustsync-<version>-macos-<cpu>.dmg`): open it and drag RustSync
+  onto the *Applications* shortcut, then open it from *Applications*. (Running it straight from the
+  disk image or Downloads stops it starting at login: see below.) To make the image yourself, run
+  `just macos-dmg`; `just macos-app` makes just `dist/RustSync.app` (see
+  [Building and releasing](#building-and-releasing)).
 
   The app is not signed by a developer. One you built yourself opens normally; one you downloaded needs
   a right-click, *Open*, the first time (or *Open Anyway* in System Settings, Privacy & Security, or
@@ -553,12 +560,13 @@ with `cargo install just`, `brew install just`, or `pkg install just`). Run `jus
 | `just test` | Run the tests. |
 | `just install` | Build and install both programs into `~/.local/bin` (`PREFIX=/usr/local just install` to change it). |
 | `just package` | Make `dist/rustsync-<version>-<os>-<cpu>.tar.gz` with the programs and docs. |
-| `just macos-app` | On a Mac: make `dist/RustSync.app` (with the logo) and a zip of it. |
+| `just macos-app` | On a Mac: make `dist/RustSync.app` (with the logo). |
+| `just macos-dmg` | On a Mac: make the `.dmg` disk image to hand out (drag the app into Applications). |
 | `just android-apk` | Make `dist/rustsync-<version>-android.apk` (see [The Android app](#the-android-app)). |
 | `just android-keystore` | Make the signing key for the Android app, and print the secrets to add on GitHub. |
 | `just clean` | Remove build output and `dist/`. |
 
-To build for the other kind of CPU on a Mac, set the target: `TARGET=x86_64-apple-darwin just macos-app`.
+To build for the other kind of CPU on a Mac, set the target: `TARGET=x86_64-apple-darwin just macos-dmg`.
 
 **Releases are made by GitHub Actions.** Pushing a tag builds the programs for Linux (Intel/AMD and
 ARM), macOS (Apple silicon and Intel), FreeBSD and Android, and puts them in a **draft** release:

@@ -424,6 +424,7 @@ enum Page {
     Home,
     Libraries,
     Devices,
+    Settings,
 }
 
 #[derive(Default)]
@@ -989,6 +990,7 @@ enum Glyph {
     Home,
     Folder,
     Devices,
+    Settings,
     Plus,
     Refresh,
 }
@@ -1025,6 +1027,13 @@ fn paint_glyph(painter: &egui::Painter, glyph: Glyph, rect: egui::Rect, color: C
             poly(vec![at(0.10, 0.20), at(0.90, 0.20), at(0.90, 0.64), at(0.10, 0.64)], true);
             poly(vec![at(0.50, 0.64), at(0.50, 0.82)], false);
             poly(vec![at(0.30, 0.84), at(0.70, 0.84)], false);
+        }
+        Glyph::Settings => {
+            // Three sliders.
+            for (y, x) in [(0.24f32, 0.66f32), (0.50, 0.34), (0.76, 0.58)] {
+                poly(vec![at(0.12, y), at(0.88, y)], false);
+                painter.circle_filled(at(x, y), size * 0.11, color);
+            }
         }
         Glyph::Plus => {
             poly(vec![at(0.50, 0.18), at(0.50, 0.82)], false);
@@ -1573,6 +1582,9 @@ impl eframe::App for App {
                 if icon_row(ui, Glyph::Devices, "Devices", self.page == Page::Devices, 38.0).clicked() {
                     self.page = Page::Devices;
                 }
+                if icon_row(ui, Glyph::Settings, "Settings", self.page == Page::Settings, 38.0).clicked() {
+                    self.page = Page::Settings;
+                }
                 if let Some(s) = &self.status {
                     let waiting = s.offers.len();
                     if waiting > 0 {
@@ -1593,6 +1605,7 @@ impl eframe::App for App {
                     Page::Libraries => self.show_libraries(ui),
                     Page::Devices => self.show_devices(ui),
                     Page::Home => self.show_home(ui),
+                    Page::Settings => self.show_settings(ui),
                 });
             });
 
@@ -1885,7 +1898,7 @@ impl App {
 
     fn show_home(&mut self, ui: &mut egui::Ui) {
         let Some(status) = self.status.clone() else { return };
-        heading(ui, "Home", "This device: how it identifies itself to the others, and how it starts.");
+        heading(ui, "Home", "This device: how it identifies itself to the others.");
         if let Some(problem) = app_location_problem() {
             card(ui, |ui| {
                 ui.label(RichText::new("Move this app first").strong().color(AMBER));
@@ -1909,10 +1922,20 @@ impl App {
             ui.label(RichText::new("Listening on").small().weak());
             ui.label(&status.listen);
         });
+    }
 
-        ui.add_space(8.0);
+    fn show_settings(&mut self, ui: &mut egui::Ui) {
+        let Some(status) = self.status.clone() else { return };
+        heading(ui, "Settings", "How this device listens and starts, and about RustSync.");
+        if let Some(problem) = app_location_problem() {
+            card(ui, |ui| {
+                ui.label(RichText::new("Move this app first").strong().color(AMBER));
+                ui.add(egui::Label::new(problem).wrap());
+            });
+            ui.add_space(8.0);
+        }
         card(ui, |ui| {
-            ui.label(RichText::new("Settings").strong());
+            ui.label(RichText::new("Network").strong());
             ui.label("Port this machine listens on for the other devices:");
             let current = status.port.to_string();
             let mut text = self.port_edit.clone().unwrap_or_else(|| current.clone());

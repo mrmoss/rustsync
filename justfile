@@ -120,7 +120,7 @@ deb: build
     rm -rf "$pkg"
     echo "made $out"
 
-# macOS only: make dist/RustSync.app (with the logo) and a zip of it to hand out
+# macOS only: make dist/RustSync.app (with the logo)
 macos-app: build
     #!/bin/sh
     set -eu
@@ -155,8 +155,22 @@ macos-app: build
     PLIST
     # Not signed by a developer, but sign it "ad hoc" so macOS accepts the pieces as one app.
     codesign --force --deep --sign - "$app"
-    ditto -c -k --keepParent "$app" "dist/rustsync-{{version}}-macos-{{cpu}}.app.zip"
-    echo "made $app and dist/rustsync-{{version}}-macos-{{cpu}}.app.zip"
+    echo "made $app"
+
+# macOS only: make dist/rustsync-<version>-macos-<cpu>.dmg, a disk image to open and drag RustSync into Applications
+macos-dmg: macos-app
+    #!/bin/sh
+    set -eu
+    [ "$(uname)" = Darwin ] || { echo "macos-dmg only works on a Mac"; exit 1; }
+    stage=dist/dmg-stage
+    dmg="dist/rustsync-{{version}}-macos-{{cpu}}.dmg"
+    rm -rf "$stage" "$dmg"
+    mkdir -p "$stage"
+    ditto dist/RustSync.app "$stage/RustSync.app"
+    ln -s /Applications "$stage/Applications"
+    hdiutil create -volname "RustSync" -srcfolder "$stage" -ov -format UDZO "$dmg" >/dev/null
+    rm -rf "$stage"
+    echo "made $dmg"
 
 # Android: build the Rust core for phones (needs the Android NDK and `cargo install cargo-ndk`)
 android-core:

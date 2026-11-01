@@ -104,7 +104,7 @@ fun RsCard(modifier: Modifier = Modifier, content: @Composable ColumnScope.() ->
 
 // ---- icons, drawn with lines so they look the same everywhere (and the same as on the desktop)
 
-enum class Glyph { Home, Folder, Devices, Plus, Refresh }
+enum class Glyph { Home, Folder, Devices, Settings, Plus, Refresh }
 
 @Composable
 fun GlyphIcon(glyph: Glyph, modifier: Modifier = Modifier.size(24.dp), color: Color = LocalContentColor.current) {
@@ -133,6 +133,13 @@ fun GlyphIcon(glyph: Glyph, modifier: Modifier = Modifier.size(24.dp), color: Co
                 poly(listOf(at(0.10f, 0.20f), at(0.90f, 0.20f), at(0.90f, 0.64f), at(0.10f, 0.64f)), closed = true)
                 poly(listOf(at(0.50f, 0.64f), at(0.50f, 0.82f)))
                 poly(listOf(at(0.30f, 0.84f), at(0.70f, 0.84f)))
+            }
+            Glyph.Settings -> {
+                // three sliders
+                for ((y, x) in listOf(0.24f to 0.66f, 0.50f to 0.34f, 0.76f to 0.58f)) {
+                    poly(listOf(at(0.12f, y), at(0.88f, y)))
+                    drawCircle(color, radius = 0.11f * s, center = at(x, y))
+                }
             }
             Glyph.Plus -> {
                 poly(listOf(at(0.50f, 0.18f), at(0.50f, 0.82f)))

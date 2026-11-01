@@ -50,13 +50,13 @@ jobs:
         run: just deb
       - name: macOS app
         if: startsWith(matrix.runner, 'macos')
-        run: just macos-app
+        run: just macos-dmg
       - uses: actions/upload-artifact@v4
         with:
           name: dist-${{ matrix.name }}
           path: |
             dist/*.tar.gz
-            dist/*.app.zip
+            dist/*.dmg
             dist/*.deb
           if-no-files-found: error
 
@@ -116,8 +116,9 @@ jobs:
           - **Linux:** `rustsync-<version>-linux-<cpu>.tar.gz`, built on Ubuntu 22.04.
             For Debian and Ubuntu (22.04 / Debian 12 or newer) there is also `rustsync_<version>_amd64.deb` (or `arm64`):
             `sudo apt install ./rustsync_<version>_amd64.deb`.
-          - **macOS:** `rustsync-<version>-macos-<cpu>.app.zip` is the app; the `.tar.gz` is just the programs. The builds are
-            unsigned, so the first time, right-click the app and choose Open (or allow it in System Settings, Privacy & Security).
+          - **macOS:** `rustsync-<version>-macos-<cpu>.dmg`: open it and drag RustSync into Applications, then open it from there
+            (the `.tar.gz` is just the programs). The app is unsigned, so the first time, right-click it and choose Open
+            (or allow it in System Settings, Privacy & Security).
           - **FreeBSD:** `rustsync-<version>-freebsd-x86_64.tar.gz` has the service and command line only (no window).
           - **Android:** `rustsync-<version>-android.apk` (64-bit ARM phones). Allow installing from your browser or file manager
             when Android asks. Unless the project has its own signing key set up, a new build can only be installed over an
