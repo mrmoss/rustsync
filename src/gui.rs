@@ -1001,7 +1001,11 @@ const FIELD: Color32 = Color32::from_rgb(11, 11, 13);
 const HOVER: Color32 = Color32::from_rgb(38, 38, 44);
 
 fn configure_style(ctx: &egui::Context) {
-    let mut style = (*ctx.style()).clone();
+    // The window is dark whatever the system theme is: change both of egui's styles.
+    ctx.all_styles_mut(style_dark);
+}
+
+fn style_dark(style: &mut egui::Style) {
     style.visuals = egui::Visuals::dark();
     let v = &mut style.visuals;
     v.panel_fill = PANEL;
@@ -1033,7 +1037,6 @@ fn configure_style(ctx: &egui::Context) {
     }
     style.spacing.item_spacing = Vec2::new(10.0, 10.0);
     style.spacing.button_padding = Vec2::new(14.0, 8.0);
-    ctx.set_style(style);
 }
 
 fn card(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui)) {
@@ -1571,7 +1574,8 @@ mod camera {
 // ---------------------------------------------------------------- screens
 
 impl eframe::App for App {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+    /// Work that is not drawing: take in what the background threads found.
+    fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         while let Ok(ev) = self.rx.try_recv() {
             self.handle(ev);
         }
@@ -1582,13 +1586,18 @@ impl eframe::App for App {
             }
             ctx.request_repaint_after(Duration::from_millis(300));
         }
+    }
+
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        let ctx = ui.ctx().clone();
+        let style = ui.style().clone();
 
         let (online, status_text) = match &self.status {
             Some(st) => (true, format!("{} is running", st.name)),
             None => (false, "Not running".to_string()),
         };
         let mut refresh = false;
-        egui::TopBottomPanel::top("top_bar").exact_height(60.0).show(ctx, |ui| {
+        egui::Panel::top("top_bar").exact_size(60.0).show(ui, |ui| {
             ui.horizontal_centered(|ui| {
                 ui.add_space(10.0);
                 ui.add(egui::Image::new(&self.logo).fit_to_exact_size(Vec2::splat(36.0)));
@@ -1620,7 +1629,7 @@ impl eframe::App for App {
             self.perform(Action::Refresh);
         }
 
-        egui::TopBottomPanel::bottom("status_bar").exact_height(32.0).show(ctx, |ui| {
+        egui::Panel::bottom("status_bar").exact_size(32.0).show(ui, |ui| {
             ui.horizontal_centered(|ui| match &self.message {
                 Some((ok, msg)) => {
                     status_dot(ui, if *ok { GREEN } else { RED });
@@ -1638,11 +1647,11 @@ impl eframe::App for App {
             });
         });
 
-        egui::SidePanel::left("sidebar")
+        egui::Panel::left("sidebar")
             .resizable(false)
-            .exact_width(180.0)
-            .frame(egui::Frame::side_top_panel(&ctx.style()).fill(SIDEBAR))
-            .show(ctx, |ui| {
+            .exact_size(180.0)
+            .frame(egui::Frame::side_top_panel(&style).fill(SIDEBAR))
+            .show(ui, |ui| {
                 ui.add_space(16.0);
                 section(ui, "SYNC");
                 ui.add_space(6.0);
@@ -1668,8 +1677,8 @@ impl eframe::App for App {
             });
 
         egui::CentralPanel::default()
-            .frame(egui::Frame::central_panel(&ctx.style()).inner_margin(egui::Margin::same(24)))
-            .show(ctx, |ui| {
+            .frame(egui::Frame::central_panel(&style).inner_margin(egui::Margin::same(24)))
+            .show(ui, |ui| {
                 if self.status.is_none() {
                     self.show_offline(ui);
                     return;
@@ -1682,7 +1691,7 @@ impl eframe::App for App {
                 });
             });
 
-        self.dialogs(ctx);
+        self.dialogs(&ctx);
     }
 }
 

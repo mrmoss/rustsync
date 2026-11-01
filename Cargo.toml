@@ -1,7 +1,8 @@
 [package]
 name = "rustsync"
-version = "0.6.1"
+version = "0.7.0"
 edition = "2021"
+# The service and command line build with this; the window (eframe) needs a recent Rust, 1.95 or newer.
 rust-version = "1.81"
 license = "GPL-2.0-only"
 
@@ -17,7 +18,12 @@ anyhow = "1"
 blake3 = "1"
 chacha20poly1305 = "0.10"
 # the desktop window (rustsync-gui); servers can skip it with --no-default-features
-eframe = { version = "0.31", optional = true }
+eframe = { version = "0.37", optional = true, default-features = false, features = [
+    # the OpenGL renderer (the default is now wgpu, a much bigger dependency), the Linux windowing
+    # systems, copy and paste, links, the built-in fonts, and screen-reader support. If you do not
+    # need screen readers, dropping "accesskit" also drops a few D-Bus/XML crates.
+    "glow", "x11", "wayland", "clipboard", "links", "default_fonts", "accesskit",
+] }
 rqrr = { version = "0.8", optional = true }
 clap = { version = "4", features = ["derive"] }
 futures-util = "0.3"
