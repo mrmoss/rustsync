@@ -173,6 +173,7 @@ class Model(app: Application) : AndroidViewModel(app) {
     // ---------------------------------------------------------------- everything else
 
     fun forget(device: String) = run(Req.forget(device))
+    fun setAddress(device: String, addr: String) = run(Req.setAddress(device, addr))
     fun createLibrary(name: String, folder: String) = run(Req.create(name, folder))
     fun removeLibrary(id: String) = run(Req.removeLibrary(id))
     fun share(library: String, device: String, backup: Boolean) = run(Req.share(library, device, backup))

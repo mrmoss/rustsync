@@ -75,6 +75,13 @@ pub enum Cmd {
         #[arg(short, long)]
         yes: bool,
     },
+    /// Change the address used to reach a paired device (after its IP address changed)
+    SetAddress {
+        /// Number or name of the device (listed if omitted)
+        device: Option<String>,
+        /// New address, `host` or `host:port` (asked if omitted; the current one is the default)
+        address: Option<String>,
+    },
     /// Create a library: a named folder to sync
     Create {
         /// Library name (asked if omitted)

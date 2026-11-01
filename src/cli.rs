@@ -902,6 +902,28 @@ pub async fn run(config_path: &Path, cmd: Cmd) -> Result<()> {
             call(&ctl, &Request::Forget { device: info.devices[i].key.clone() }).await?;
             Ok(())
         }
+        Cmd::SetAddress { device, address } => {
+            let info = status(&ctl).await?;
+            if info.devices.is_empty() {
+                bail!("no paired devices yet");
+            }
+            let labels: Vec<String> = info
+                .devices
+                .iter()
+                .map(|d| format!("{} ({})", d.name, d.addr.as_deref().unwrap_or("no address: it calls us")))
+                .collect();
+            let devices = &info.devices;
+            let i = pick("device", &labels, device, |i, t| name_or_prefix(&devices[i].name, &devices[i].key, t))?;
+            let addr = match address {
+                Some(a) => a,
+                None => ask(
+                    "New address (host or host:port)",
+                    devices[i].addr.as_deref().unwrap_or(""),
+                )?,
+            };
+            call(&ctl, &Request::SetAddress { device: info.devices[i].key.clone(), addr }).await?;
+            Ok(())
+        }
         Cmd::Create { name, folder } => {
             let name = match name {
                 Some(n) => n,

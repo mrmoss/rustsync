@@ -35,6 +35,7 @@ enum Request {
     Join { token: String },
     PairDecision { accept: bool },
     Forget { device: String },
+    SetAddress { device: String, addr: String },
     Create { name: String, folder: String },
     RemoveLibrary { library: String },
     Share { library: String, device: String, backup: bool },
@@ -431,6 +432,7 @@ enum Dialog {
     Invite { host: String, code: Option<String>, note: String, error: Option<String>, running: bool, paired: bool },
     Join { code: String, running: bool, error: Option<String>, scanning: bool },
     ConfirmForget { key: String, name: String },
+    Address { key: String, name: String, text: String },
     ConfirmRemove { id: String, name: String },
 }
 
@@ -449,6 +451,7 @@ enum Action {
     StopScan,
     PairDecide { accept: bool },
     Forget { key: String },
+    SetAddress { key: String, addr: String },
     Remove { id: String },
     StartInvite { host: String },
     CancelInvite,
@@ -869,6 +872,7 @@ impl App {
                 self.send_decision(accept);
             }
             Action::Forget { key } => self.run(Request::Forget { device: key }),
+            Action::SetAddress { key, addr } => self.run(Request::SetAddress { device: key, addr }),
             Action::Remove { id } => self.run(Request::RemoveLibrary { library: id }),
             Action::StartInvite { host } => {
                 if let Dialog::Invite { running, code, error, note, .. } = &mut self.dialog {
@@ -1689,47 +1693,48 @@ impl App {
                     tile(ui, Glyph::Folder, ACCENT, ACCENT_SOFT);
                     ui.vertical(|ui| {
                         ui.label(RichText::new(&l.name).strong().size(16.0));
-                        ui.label(RichText::new(&l.folder).small().weak());
-                        ui.horizontal(|ui| {
+                        ui.add(egui::Label::new(RichText::new(&l.folder).small().weak()).wrap());
+                        ui.horizontal_wrapped(|ui| {
                             ui.label(RichText::new(format!("id {}", short(&l.id))).small().weak().monospace());
                             if ui.small_button("Copy full id").clicked() {
                                 ui.ctx().copy_text(l.id.clone());
                                 self.say(true, "Library id copied");
                             }
                         });
-                    });
-                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        if ui.button("Remove").clicked() {
-                            self.dialog = Dialog::ConfirmRemove { id: l.id.clone(), name: l.name.clone() };
-                        }
-                        let related = related_devices(l, &status.devices);
-                        if !related.is_empty() && ui.button("Unshare…").clicked() {
-                            self.dialog = Dialog::Unshare {
-                                lib_id: l.id.clone(),
-                                lib_name: l.name.clone(),
-                                candidates: related,
-                                sel: 0,
-                            };
-                        }
-                        if l.backup_only {
-                            if ui.button("Set limit…").clicked() {
-                                let text = if l.quota == 0 { String::new() } else { fmt_size(l.quota).replace(' ', "") };
-                                self.dialog = Dialog::Quota { id: l.id.clone(), name: l.name.clone(), text };
+                        // The buttons sit under the text, and wrap onto more lines when the window is narrow.
+                        ui.horizontal_wrapped(|ui| {
+                            if l.backup_only {
+                                if ui.button("Set limit…").clicked() {
+                                    let text = if l.quota == 0 { String::new() } else { fmt_size(l.quota).replace(' ', "") };
+                                    self.dialog = Dialog::Quota { id: l.id.clone(), name: l.name.clone(), text };
+                                }
+                            } else {
+                                let can_share = !status.devices.is_empty();
+                                if ui.add_enabled(can_share, egui::Button::new("Share…")).clicked() {
+                                    self.dialog = Dialog::Share {
+                                        lib_id: l.id.clone(),
+                                        lib_name: l.name.clone(),
+                                        device: 0,
+                                        backup: false,
+                                    };
+                                }
+                                if ui.button("Recovery code…").clicked() {
+                                    self.perform(Action::ShowRecovery { id: Some(l.id.clone()), name: l.name.clone() });
+                                }
                             }
-                        } else {
-                            let can_share = !status.devices.is_empty();
-                            if ui.add_enabled(can_share, egui::Button::new("Share…")).clicked() {
-                                self.dialog = Dialog::Share {
+                            let related = related_devices(l, &status.devices);
+                            if !related.is_empty() && ui.button("Unshare…").clicked() {
+                                self.dialog = Dialog::Unshare {
                                     lib_id: l.id.clone(),
                                     lib_name: l.name.clone(),
-                                    device: 0,
-                                    backup: false,
+                                    candidates: related,
+                                    sel: 0,
                                 };
                             }
-                            if ui.button("Recovery code…").clicked() {
-                                self.perform(Action::ShowRecovery { id: Some(l.id.clone()), name: l.name.clone() });
+                            if ui.button("Remove").clicked() {
+                                self.dialog = Dialog::ConfirmRemove { id: l.id.clone(), name: l.name.clone() };
                             }
-                        }
+                        });
                     });
                 });
                 if l.backup_only {
@@ -1826,11 +1831,22 @@ impl App {
                         }
                         line.push_str(if d.online { "  ·  online" } else { "  ·  offline" });
                         ui.label(RichText::new(line).small().weak());
-                    });
-                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        if ui.button("Forget").clicked() {
-                            self.dialog = Dialog::ConfirmForget { key: d.key.clone(), name: d.name.clone() };
-                        }
+                        ui.horizontal_wrapped(|ui| {
+                            if ui
+                                .button("Change address…")
+                                .on_hover_text("Use this when the other machine's IP address or host name changed")
+                                .clicked()
+                            {
+                                self.dialog = Dialog::Address {
+                                    key: d.key.clone(),
+                                    name: d.name.clone(),
+                                    text: d.addr.clone().unwrap_or_default(),
+                                };
+                            }
+                            if ui.button("Forget").clicked() {
+                                self.dialog = Dialog::ConfirmForget { key: d.key.clone(), name: d.name.clone() };
+                            }
+                        });
                     });
                 });
             });
@@ -2256,6 +2272,31 @@ impl App {
                     ui.horizontal(|ui| {
                         if ui.button(RichText::new("Forget").color(RED)).clicked() {
                             action = Some(Action::Forget { key: key.clone() });
+                            close = true;
+                        }
+                        if ui.button("Cancel").clicked() {
+                            close = true;
+                        }
+                    });
+                });
+            }
+
+            Dialog::Address { key, name, text } => {
+                window("Change a device's address").show(ctx, |ui| {
+                    ui.label(format!("Where this machine reaches {}:", name));
+                    ui.add(
+                        egui::TextEdit::singleline(text)
+                            .hint_text("e.g. 192.168.1.20 or myserver.local:3032")
+                            .desired_width(f32::INFINITY),
+                    );
+                    ui.label(
+                        RichText::new("Just the address, and :port if it isn't 3032. Leave it empty if that machine always calls this one.")
+                            .small()
+                            .weak(),
+                    );
+                    ui.horizontal(|ui| {
+                        if ui.add(primary("Save")).clicked() {
+                            action = Some(Action::SetAddress { key: key.clone(), addr: text.trim().to_string() });
                             close = true;
                         }
                         if ui.button("Cancel").clicked() {

@@ -1373,6 +1373,38 @@ impl Node {
         Ok(format!("Forgot {}.", name))
     }
 
+    /// Change the address this machine dials to reach a paired device.
+    pub fn set_device_address(self: &Arc<Self>, key: &str, addr: &str) -> Result<String> {
+        let addr = addr.trim();
+        let target = if addr.is_empty() { None } else { Some(parse_host_port(addr, self.cfg.server.port)?) };
+        let name = {
+            let mut st = self.state.lock().unwrap();
+            let Some(dev) = st.devices.iter_mut().find(|d| d.key == key) else {
+                bail!("no such device");
+            };
+            match &target {
+                Some((h, p)) => {
+                    dev.host = Some(h.clone());
+                    dev.port = Some(*p);
+                }
+                None => {
+                    dev.host = None;
+                    dev.port = None;
+                }
+            }
+            dev.name.clone()
+        };
+        self.save_state();
+        match target {
+            Some((h, p)) => {
+                // Starts dialing if nothing was (the device may have only ever called us).
+                self.ensure_dialer(key);
+                Ok(format!("{} is now reached at {}:{}.", name, h, p))
+            }
+            None => Ok(format!("{} will have to connect to this machine; it is no longer dialed.", name)),
+        }
+    }
+
     pub fn status(&self) -> StatusInfo {
         let online: HashSet<String> = self.sessions.lock().unwrap().keys().cloned().collect();
         let st = self.state.lock().unwrap();
@@ -1613,6 +1645,7 @@ impl Node {
         match req {
             Request::Status => Ok(vec![Reply::Info(self.status()), Reply::Done]),
             Request::Forget { device } => out(self.forget_device(&device)?),
+            Request::SetAddress { device, addr } => out(self.set_device_address(&device, &addr)?),
             Request::Create { name, folder } => out(self.create_library(&name, &folder).await?),
             Request::RemoveLibrary { library } => out(self.remove_library(&library)?),
             Request::Share { library, device, backup } => out(self.share_library(&library, &device, backup)?),
@@ -1633,6 +1666,33 @@ impl Node {
             }
         }
     }
+}
+
+/// `host`, `host:port` or `[v6]:port` -> (host, port); `default_port` when there is none.
+fn parse_host_port(input: &str, default_port: u16) -> Result<(String, u16)> {
+    let s = input.trim();
+    let bad_port = |p: &str| anyhow!("invalid port {:?}", p);
+    if let Some(rest) = s.strip_prefix('[') {
+        let (host, tail) = rest.split_once(']').ok_or_else(|| anyhow!("missing ] in the address"))?;
+        let port = match tail.strip_prefix(':') {
+            Some(p) => p.parse().map_err(|_| bad_port(p))?,
+            None if tail.is_empty() => default_port,
+            None => bail!("cannot read the address {:?}", s),
+        };
+        return Ok((host.to_string(), port));
+    }
+    let (host, port) = match s.matches(':').count() {
+        0 => (s, default_port),
+        1 => {
+            let (h, p) = s.split_once(':').unwrap();
+            (h, p.parse().map_err(|_| bad_port(p))?)
+        }
+        _ => (s, default_port), // a bare IPv6 address
+    };
+    if host.is_empty() || host.contains(char::is_whitespace) || host.contains('/') {
+        bail!("cannot read the address {:?}; use something like 192.168.1.20 or host:3032", s);
+    }
+    Ok((host.to_string(), port))
 }
 
 /// `KEY.SECRET@HOST:PORT` -> (key, one-time secret, host, port)

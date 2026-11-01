@@ -226,7 +226,8 @@ running yet). It has three pages, and opens on the first:
 - **Libraries**: your libraries, who they're shared with, how much encrypted-backup space is used,
   and offers waiting for you to accept.
 - **Devices**: the machines you've paired and whether they're online, plus *Show a pairing code* and
-  *Enter a pairing code* for adding another.
+  *Enter a pairing code* for adding another. *Change address…* updates where a device is reached
+  when its IP address changes (the Android app has the same button).
 
 Wherever a library needs a folder (*New library*, *Accept…*, *Restore from backup…*), you choose it
 with a **folder browser** instead of typing a path: shortcuts for your home folder and drives, a
@@ -287,6 +288,8 @@ Pairing devices
                       Show a one-time code (and QR code) and wait for another machine to `join`
   join [CODE]         Pair with a machine that is waiting in `invite`
   forget [DEVICE]     Stop syncing with a paired device
+  set-address [DEVICE] [HOST[:PORT]]
+                      Change the address used to reach a paired device (when its IP changed)
 
 Libraries (folders to sync)
   create [NAME] [FOLDER]            Create a library from a folder

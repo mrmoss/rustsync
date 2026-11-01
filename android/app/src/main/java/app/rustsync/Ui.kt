@@ -324,6 +324,7 @@ private fun Devices(model: Model, status: Status) {
     var askHost by remember { mutableStateOf(false) }
     var enter by remember { mutableStateOf(false) }
     var forgetting by remember { mutableStateOf<DeviceInfo?>(null) }
+    var readdressing by remember { mutableStateOf<DeviceInfo?>(null) }
     val scan = rememberLauncherForActivityResult(ScanContract()) { result ->
         val text = result.contents
         if (text != null) model.enterCode(text)
@@ -358,7 +359,10 @@ private fun Devices(model: Model, status: Status) {
                             style = MaterialTheme.typography.bodySmall,
                         )
                     }
-                    TextButton(onClick = { forgetting = d }) { Text("Forget") }
+                    Column(horizontalAlignment = Alignment.End) {
+                        TextButton(onClick = { readdressing = d }) { Text("Change address") }
+                        TextButton(onClick = { forgetting = d }) { Text("Forget") }
+                    }
                 }
             }
         }
@@ -418,6 +422,36 @@ private fun Devices(model: Model, status: Status) {
                 ) { Text("Pair") }
             },
             dismissButton = { TextButton(onClick = { enter = false }) { Text("Cancel") } },
+        )
+    }
+
+    readdressing?.let { d ->
+        var addr by remember(d.key) { mutableStateOf(d.addr ?: "") }
+        AlertDialog(
+            onDismissRequest = { readdressing = null },
+            title = { Text("Address of ${d.name}") },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Text("Where this phone reaches it. Change it when that device's IP address or name changed.")
+                    OutlinedTextField(
+                        value = addr,
+                        onValueChange = { addr = it },
+                        singleLine = true,
+                        label = { Text("e.g. 192.168.1.20") },
+                    )
+                    Text(
+                        "Add :port if it isn't 3032. Leave it empty if that device always calls this phone.",
+                        style = MaterialTheme.typography.bodySmall,
+                    )
+                }
+            },
+            confirmButton = {
+                TextButton(onClick = {
+                    readdressing = null
+                    model.setAddress(d.key, addr.trim())
+                }) { Text("Save") }
+            },
+            dismissButton = { TextButton(onClick = { readdressing = null }) { Text("Cancel") } },
         )
     }
 

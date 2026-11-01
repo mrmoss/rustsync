@@ -13,6 +13,9 @@ pub enum Request {
     /// want to pair with this device?
     PairDecision { accept: bool },
     Forget { device: String },
+    /// Change where to reach a paired device (`host` or `host:port`; empty clears it, so that
+    /// only the other side dials).
+    SetAddress { device: String, addr: String },
     Create { name: String, folder: String },
     RemoveLibrary { library: String },
     Share { library: String, device: String, backup: bool },

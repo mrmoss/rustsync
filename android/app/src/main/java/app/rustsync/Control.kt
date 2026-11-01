@@ -134,6 +134,8 @@ object Req {
     fun join(token: String) = obj("Join", JSONObject().put("token", token))
     fun decision(accept: Boolean) = obj("PairDecision", JSONObject().put("accept", accept))
     fun forget(device: String) = obj("Forget", JSONObject().put("device", device))
+    fun setAddress(device: String, addr: String) =
+        obj("SetAddress", JSONObject().put("device", device).put("addr", addr))
     fun create(name: String, folder: String) = obj("Create", JSONObject().put("name", name).put("folder", folder))
     fun removeLibrary(library: String) = obj("RemoveLibrary", JSONObject().put("library", library))
     fun share(library: String, device: String, backup: Boolean) =
