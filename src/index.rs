@@ -93,7 +93,9 @@ pub fn safe_rel(p: &str) -> bool {
 }
 
 fn is_hex64(s: &str) -> bool {
-    s.len() == 64 && s.bytes().all(|c| c.is_ascii_hexdigit())
+    // Lowercase only: every hash we compute ourselves is lowercase, so an uppercase one could
+    // never verify (and would be fetched again and again).
+    s.len() == 64 && s.bytes().all(|c| matches!(c, b'0'..=b'9' | b'a'..=b'f'))
 }
 
 /// Permissions we are willing to set because a peer asked: never setuid/setgid/sticky, never
@@ -525,6 +527,15 @@ fn walk(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hashes_must_be_lowercase_hex() {
+        assert!(is_hex64(&"a".repeat(64)));
+        assert!(is_hex64(&"0123456789abcdef".repeat(4)));
+        assert!(!is_hex64(&"A".repeat(64)));
+        assert!(!is_hex64(&"a".repeat(63)));
+        assert!(!is_hex64(&format!("{}g", "a".repeat(63))));
+    }
 
     fn file_entry(size: u64) -> Entry {
         let n = size.div_ceil(CHUNK as u64) as usize;

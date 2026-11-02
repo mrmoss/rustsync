@@ -22,6 +22,9 @@ use tokio::io::AsyncWriteExt;
 
 const MAX_RECORD: usize = 12 * 1024 * 1024;
 const MAX_DELETE: usize = 1000; // blobs removed per request
+/// A chunk younger than this is never deleted or listed for deletion, whatever a client asks:
+/// the backup itself enforces it, so a stolen laptop or a buggy client cannot empty it at once.
+const MIN_DELETE_AGE: u64 = 7 * 24 * 3600;
 const MAX_BLOB_PAGE: usize = 20_000; // blobs listed per request
 static TMP: AtomicU64 = AtomicU64::new(0);
 
@@ -265,6 +268,7 @@ impl Depot {
     /// Blobs older than `min_age` seconds whose id sorts after `after`, in id order, at most one
     /// page. (Used by a client to clean up chunks nothing refers to any more.)
     async fn old_blobs(&self, after: String, min_age: u64) -> Vec<(String, u64)> {
+        let min_age = min_age.max(MIN_DELETE_AGE);
         let root = self.dir.join("blobs");
         tokio::task::spawn_blocking(move || {
             let now = SystemTime::now();
@@ -316,7 +320,17 @@ impl Depot {
                 continue;
             }
             let path = self.blob_path(&id);
-            let sz = Self::file_len(&path).await;
+            let Ok(md) = tokio::fs::metadata(&path).await else { continue };
+            let age = md
+                .modified()
+                .ok()
+                .and_then(|t| SystemTime::now().duration_since(t).ok())
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            if age < MIN_DELETE_AGE {
+                continue;
+            }
+            let sz = md.len();
             if tokio::fs::remove_file(&path).await.is_ok() {
                 self.release(sz);
                 n += 1;

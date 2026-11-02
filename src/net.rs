@@ -87,15 +87,16 @@ fn check_private_file(path: &Path) -> Result<()> {
 fn write_public(path: &Path, public: &[u8]) -> Result<()> {
     // Unpredictable name, created exclusively and never through a symlink (like the private key).
     let tmp = sibling(path, &format!(".new-{:016x}", rand::random::<u64>()));
-    let written = (|| -> std::io::Result<()> {
-        let mut f = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o644)
-            .custom_flags(libc::O_NOFOLLOW)
-            .open(&tmp)?;
-        f.write_all(format!("{}\n", hex(public)).as_bytes())
-    })();
+    // If this open fails, the name belongs to somebody else: leave it alone and give up.
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o644)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(&tmp)?;
+    // From here the file is ours, so it is ours to clean up.
+    let written = f.write_all(format!("{}\n", hex(public)).as_bytes());
+    drop(f);
     if let Err(e) = written {
         let _ = std::fs::remove_file(&tmp);
         return Err(e.into());

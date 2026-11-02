@@ -29,6 +29,9 @@ pub struct Config {
     /// Show offers from paired devices to keep an encrypted backup of a library here.
     #[serde(default = "default_true")]
     pub accept_backups: bool,
+    /// The desktop window.
+    #[serde(default)]
+    pub gui: GuiConfig,
 
     // Old config format: still parsed so we can tell the user it is ignored.
     #[serde(default)]
@@ -63,6 +66,21 @@ pub struct ServerConfig {
 impl Default for ServerConfig {
     fn default() -> Self {
         ServerConfig { host: default_host(), port: default_port() }
+    }
+}
+
+/// Settings of the desktop window (`rustsync-gui`).
+#[derive(Debug, Deserialize)]
+pub struct GuiConfig {
+    /// On a Wayland desktop, open the window through X11 so the desktop draws its title bar and
+    /// buttons (they then look like every other window). Turn off for native Wayland.
+    #[serde(default = "default_true")]
+    pub x11: bool,
+}
+
+impl Default for GuiConfig {
+    fn default() -> Self {
+        GuiConfig { x11: true }
     }
 }
 
@@ -421,6 +439,11 @@ pub fn set_port(path: &Path, port: u16) -> Result<()> {
     set_in_section(path, "server", "port", toml_edit::value(port as i64))
 }
 
+/// Write the window's X11 setting into the config file (the config file must already exist).
+pub fn set_gui_x11(path: &Path, on: bool) -> Result<()> {
+    set_in_section(path, "gui", "x11", toml_edit::value(on))
+}
+
 /// Write a new size limit for the logs (e.g. `5MB`) into the config file.
 pub fn set_log_size(path: &Path, bytes: u64) -> Result<()> {
     let text = if bytes % 1_000_000 == 0 { format!("{}MB", bytes / 1_000_000) } else { bytes.to_string() };
@@ -583,6 +606,14 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_window_uses_x11_unless_told_otherwise() {
+        let cfg: Config = toml::from_str("").unwrap();
+        assert!(cfg.gui.x11);
+        let cfg: Config = toml::from_str("[gui]\nx11 = false\n").unwrap();
+        assert!(!cfg.gui.x11);
+    }
 
     #[test]
     fn old_yaml_configs_convert() {

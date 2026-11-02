@@ -107,8 +107,14 @@ fn open(c: &XChaCha20Poly1305, aad: &[u8], data: &[u8]) -> Result<Vec<u8>> {
 /// encrypted backup stores this when it first accepts the library; later a paired device
 /// (another of your machines, or a replacement after a loss) that presents the same value is
 /// let in without further questions.
-pub fn access_token(master: &[u8]) -> String {
-    crate::net::hex(&blake3::derive_key("rustsync vault v1 backup access", master))
+///
+/// The value is made for one backup machine (`server` is its public key): what one backup
+/// machine holds is useless at any other, so a backup machine that is lost or hacked cannot use
+/// it to get into the other backups of the same library.
+pub fn access_token(master: &[u8], server: &str) -> String {
+    let mut input = master.to_vec();
+    input.extend_from_slice(server.as_bytes());
+    crate::net::hex(&blake3::derive_key("rustsync vault v2 backup access for one server", &input))
 }
 
 fn recovery_check(id: &str, vault: &str) -> String {
@@ -247,6 +253,16 @@ impl Vault {
 mod tests {
     use super::*;
     use crate::index::Kind;
+
+    #[test]
+    fn the_access_value_is_made_for_one_backup_machine() {
+        let key = [7u8; 32];
+        let (a, b) = ("a".repeat(64), "b".repeat(64));
+        assert_eq!(access_token(&key, &a), access_token(&key, &a));
+        assert_ne!(access_token(&key, &a), access_token(&key, &b));
+        assert_ne!(access_token(&key, &a), access_token(&[8u8; 32], &a));
+        assert_eq!(access_token(&key, &a).len(), 64);
+    }
 
     fn entry() -> Entry {
         Entry {

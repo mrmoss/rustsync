@@ -2395,6 +2395,20 @@ impl App {
                     }
                 }
             }
+            #[cfg(all(unix, not(target_os = "macos")))]
+            if on_wayland() {
+                let mut x11 = gui_x11(&self.config);
+                if ui
+                    .checkbox(&mut x11, "Use the desktop's own window title bar and buttons (X11 mode)")
+                    .on_hover_text("On a Wayland desktop, this makes the close, minimise and maximise buttons look like those of other windows. Turn it off to use native Wayland (RustSync then draws its own buttons, and the picture can be sharper on a scaled display).")
+                    .changed()
+                {
+                    match rustsync::config::set_gui_x11(&self.config, x11) {
+                        Ok(()) => self.say(true, "Saved. Close this window and open it again to apply."),
+                        Err(e) => self.say(false, format!("cannot save that: {:#}", e)),
+                    }
+                }
+            }
             ui.horizontal(|ui| {
                 if ui
                     .button("Restart RustSync")
@@ -4006,6 +4020,22 @@ fn config_from_args() -> PathBuf {
     default_config()
 }
 
+/// Should the window open through X11 on a Wayland desktop? (Yes, unless the config says no.)
+#[cfg(all(unix, not(target_os = "macos")))]
+fn gui_x11(config: &Path) -> bool {
+    std::fs::read_to_string(config)
+        .ok()
+        .and_then(|t| t.parse::<toml::Table>().ok())
+        .and_then(|t| t.get("gui")?.get("x11")?.as_bool())
+        .unwrap_or(true)
+}
+
+/// Is this a Wayland desktop session (so the choice above matters)?
+#[cfg(all(unix, not(target_os = "macos")))]
+fn on_wayland() -> bool {
+    std::env::var("XDG_SESSION_TYPE").map_or(false, |v| v.eq_ignore_ascii_case("wayland"))
+}
+
 fn main() -> eframe::Result<()> {
     // A config from before 0.6 is YAML: convert it once (the same as the program does).
     let wanted = absolute(&config_from_args());
@@ -4029,6 +4059,13 @@ fn main() -> eframe::Result<()> {
     start_raise_listener(&config, ctx_slot.clone());
     ensure_launcher(&config);
 
+    // On Wayland, a window that talks Wayland itself has to draw its own title bar and buttons
+    // (GNOME does not draw them for it), which then differ from every other window. Going through
+    // X11 (XWayland) lets the desktop draw them. Setting in Settings; on unless turned off.
+    #[cfg(all(unix, not(target_os = "macos")))]
+    if gui_x11(&config) && std::env::var_os("DISPLAY").is_some() {
+        std::env::remove_var("WAYLAND_DISPLAY");
+    }
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("RustSync")

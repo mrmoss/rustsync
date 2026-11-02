@@ -204,7 +204,9 @@ fn fingerprint(key: &[u8]) -> String {
 enum DepotJob {
     /// Pull what the depot has and push what it lacks, for every library shared with it.
     SyncAll,
-    Push(String, Vec<Entry>),
+    /// Upload this library's changes (the current index is read when the job runs, so a busy
+    /// worker never holds a queue of old copies).
+    Push(String),
     /// Delete chunks in the backup that no record refers to any more.
     Prune(String),
 }
@@ -282,7 +284,13 @@ struct SessionHandle {
     tx: mpsc::Sender<Msg>,
     jobs: mpsc::UnboundedSender<DepotJob>,
     cancel: CancellationToken,
+    /// Messages waiting for room in `tx` (each in its own task): bounded, see `push`.
+    waiting: Arc<std::sync::atomic::AtomicUsize>,
 }
+
+/// A device that is this far behind (this many messages waiting beyond the full queue) is
+/// disconnected instead of letting its backlog grow without end. It catches up when it reconnects.
+const MAX_WAITING_PUSHES: usize = 32;
 
 impl SessionHandle {
     /// Queue a message without ever blocking the caller. If the queue is full (the other side
@@ -291,13 +299,21 @@ impl SessionHandle {
         match self.tx.try_send(msg) {
             Ok(()) => {}
             Err(mpsc::error::TrySendError::Full(msg)) => {
+                use std::sync::atomic::Ordering::Relaxed;
+                if self.waiting.fetch_add(1, Relaxed) >= MAX_WAITING_PUSHES {
+                    self.waiting.fetch_sub(1, Relaxed);
+                    self.cancel.cancel();
+                    return;
+                }
                 let tx = self.tx.clone();
                 let cancel = self.cancel.clone();
+                let waiting = self.waiting.clone();
                 tokio::spawn(async move {
                     tokio::select! {
                         _ = cancel.cancelled() => {}
                         _ = tx.send(msg) => {}
                     }
+                    waiting.fetch_sub(1, Relaxed);
                 });
             }
             Err(mpsc::error::TrySendError::Closed(_)) => {}
@@ -414,6 +430,8 @@ pub struct Node {
     ip_conns: Mutex<HashMap<IpAddr, u32>>,
     /// Failed handshakes per address: (count in the current window, window start, ignored until).
     ip_fails: Mutex<HashMap<IpAddr, (u32, Instant, Option<Instant>)>>,
+    /// (backup device, library) pairs that already have an upload job waiting.
+    depot_pending: Mutex<HashSet<(String, String)>>,
     next_session: AtomicU64,
     /// The port we listen on (can be changed while running).
     port: std::sync::atomic::AtomicU16,
@@ -602,7 +620,12 @@ impl Node {
                     }
                 }
                 Role::Store => {
-                    let _ = s.jobs.send(DepotJob::Push(lib.to_string(), entries.to_vec()));
+                    // One waiting upload job per backup and library is enough: it reads the
+                    // current index when it runs. (Anything missed is caught by the regular
+                    // sync with the backup.)
+                    if self.depot_pending.lock().unwrap().insert((m.device.clone(), lib.to_string())) {
+                        let _ = s.jobs.send(DepotJob::Push(lib.to_string()));
+                    }
                 }
                 Role::Client => {}
             }
@@ -654,7 +677,7 @@ impl Node {
                 continue;
             }
             let access = net::parse_hex32(&l.vault, "a vault key")
-                .map(|k| vault::access_token(&k))
+                .map(|k| vault::access_token(&k, dev))
                 .unwrap_or_default();
             let dev_is_peer = l.has(dev, Role::Peer);
             for m in l.members.iter().filter(|m| m.device == dev) {
@@ -763,6 +786,15 @@ impl Node {
                         // A paired device wants to keep an encrypted backup here.
                         if !self.cfg.accept_backups || !net::valid_hex(&o.access, 64) {
                             continue;
+                        }
+                        // Access values used to be the same for every backup machine; they are now
+                        // made for each one. A device that already uses this backup brings the new
+                        // value, so the stored one is replaced and others can join with it too.
+                        if let Some(lib) = st.libraries.iter_mut().find(|l| l.id == o.id && l.mode == LibMode::Backup) {
+                            if lib.access != o.access && lib.has(from, Role::Client) {
+                                lib.access = o.access.clone();
+                                changed = true;
+                            }
                         }
                         // (backup mode?, key proof matches?, owner unshared this device before?)
                         let found = st
@@ -1801,9 +1833,10 @@ impl Node {
         cancel: CancellationToken,
     ) -> u64 {
         let id = self.next_session.fetch_add(1, Ordering::Relaxed);
+        self.depot_pending.lock().unwrap().retain(|(d, _)| d != key);
         let mut sessions = self.sessions.lock().unwrap();
         // Newest connection wins: a reconnect replaces a half-dead old one.
-        if let Some(old) = sessions.insert(key.to_string(), SessionHandle { id, tx, jobs, cancel }) {
+        if let Some(old) = sessions.insert(key.to_string(), SessionHandle { id, tx, jobs, cancel, waiting: Arc::new(std::sync::atomic::AtomicUsize::new(0)) }) {
             old.cancel.cancel();
         }
         id
@@ -1813,6 +1846,7 @@ impl Node {
         let mut sessions = self.sessions.lock().unwrap();
         if sessions.get(key).map(|h| h.id == id).unwrap_or(false) {
             sessions.remove(key);
+            self.depot_pending.lock().unwrap().retain(|(d, _)| d != key);
         }
     }
 
@@ -1934,6 +1968,7 @@ pub async fn run_daemon(cfg: Config, keys: Keys) -> Result<()> {
         handshakes: Arc::new(Semaphore::new(MAX_HANDSHAKES)),
         ip_conns: Mutex::new(HashMap::new()),
         ip_fails: Mutex::new(HashMap::new()),
+        depot_pending: Mutex::new(HashSet::new()),
         next_session: AtomicU64::new(1),
         port: std::sync::atomic::AtomicU16::new(port),
         listener_stop: Mutex::new(CancellationToken::new()),
@@ -3001,11 +3036,14 @@ async fn depot_worker(
                     }
                 }
             }
-            DepotJob::Push(lib_id, entries) => {
+            DepotJob::Push(lib_id) => {
+                // Allow the next change to queue another job, then work from the current index.
+                node.depot_pending.lock().unwrap().remove(&(depot_key.clone(), lib_id.clone()));
                 if !node.is_store(&lib_id, &depot_key) {
                     continue;
                 }
                 if let Some(rt) = node.lib_rt(&lib_id) {
+                    let entries = rt.folder.snapshot();
                     if let Err(e) = depot_push(&remote, &lib_id, &rt, entries, &mut known).await {
                         warn!(device = %node.dev_label(&depot_key), library = %node.lib_label(&lib_id), "backup upload failed: {:#}", e);
                     }
@@ -3104,16 +3142,21 @@ async fn depot_pull(
         .map(|e| (rt.vault.slot(&e.path), e.stamp))
         .collect();
 
-    let mut want: Vec<String> = Vec::new();
+    // The backup is not trusted: what it says it holds is only believed for records we already
+    // have a newer-or-equal copy of. For the others we look at the record itself, and remember
+    // the version it really contains (below).
+    let mut want: Vec<(String, u64)> = Vec::new();
     for (slot, dstamp) in list {
-        known.insert((lib.to_string(), slot.clone()), dstamp);
         if local.get(&slot).map_or(true, |&ls| dstamp > ls) {
-            want.push(slot);
+            want.push((slot, dstamp));
+        } else {
+            known.insert((lib.to_string(), slot), dstamp);
         }
     }
 
     let mut entries: Vec<Entry> = Vec::new();
-    for slot in want {
+    for (slot, dstamp) in want {
+        let key = (lib.to_string(), slot.clone());
         let (lib_s, id) = (lib.to_string(), slot.clone());
         let raw = match remote
             .call(move |req| Msg::DepotGet { req, kind: KIND_RECORD, lib: lib_s, id })
@@ -3126,8 +3169,18 @@ async fn depot_pull(
             }
         };
         match rt.vault.open_record(&slot, &raw) {
-            Ok(entry) => entries.push(entry),
-            Err(e) => warn!(device = %node.dev_label(depot_key), library = %node.lib_label(lib), "{:#}", e),
+            Ok(entry) => {
+                if entry.stamp != dstamp {
+                    warn!(device = %node.dev_label(depot_key), library = %node.lib_label(lib), "the backup listed a record with a different version than the one it holds");
+                }
+                known.insert(key, entry.stamp);
+                entries.push(entry);
+            }
+            Err(e) => {
+                // Unreadable or tampered with: do not count it as backed up, so it is uploaded again.
+                known.remove(&key);
+                warn!(device = %node.dev_label(depot_key), library = %node.lib_label(lib), "{:#}", e);
+            }
         }
     }
     if entries.is_empty() {

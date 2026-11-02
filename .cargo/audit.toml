@@ -1,0 +1,12 @@
+# Settings for `cargo audit` (run by the `audit` workflow).
+[advisories]
+ignore = [
+    # glib 0.18.5 "unsound": only reached through tray-icon's Linux GTK code, which is never
+    # built (tray-icon is used on macOS only).
+    "RUSTSEC-2024-0429",
+    # lru 0.12.5 "unsound" (two advisories): reached through rqrr, the QR decoder, which uses
+    # the cache for plain insert/lookup only, not the iteration APIs the advisories are about.
+    # Remove these two lines once rqrr moves to a fixed lru.
+    "RUSTSEC-2026-0002",
+    "RUSTSEC-2026-0253",
+]

@@ -309,7 +309,7 @@ running yet). It has four pages, and opens on the first:
   app has the same button). A device that is offline shows when it was *last seen*, and each
   device and library has a *Log…* button showing just what concerns it. An online device shows
   the current **download and upload speed** while data is moving.
-- **Settings**: the **Service** (start, **restart** or stop RustSync) at the top; the **port** this machine listens on; the **logs** (show them, and set how big
+- **Settings**: the **Service** (start, **restart** or stop RustSync) at the top, and on a Wayland desktop a switch for the window's title bar (below); the **port** this machine listens on; the **logs** (show them, and set how big
   they may grow); the switches for starting RustSync automatically and for showing its tray (menu
   bar) icon when you log in; and *About* (version, author and license).
 
@@ -608,8 +608,9 @@ git push --tags
 # 2. wait for the "release" workflow, look over the draft under Releases, then publish it
 ```
 
-The tag must match the version in `Cargo.toml` or the build stops. The downloads are unsigned and come
-with a `SHA256SUMS` file. A separate workflow (`build`) builds and tests every push. For public
+The tag must match the version in `Cargo.toml` or the build stops. The downloads come with a `SHA256SUMS` file and a build attestation (a statement signed by GitHub that
+the files were built by this workflow from this repository; check one with
+`gh attestation verify FILE --repo OWNER/REPO`). The macOS app is not code-signed. A separate workflow (`build`) builds and tests every push. For public
 repositories, GitHub Actions is free.
 
 ## Encrypted backups (for a server, or if everything is lost)
@@ -736,7 +737,9 @@ different `name` and `server.port`, and pass `-c` to every command.
 | Start at login doesn't start anything (macOS) | Move *RustSync.app* to *Applications*, then switch the option off and on again; check *Login Items & Extensions* in System Settings and `daemon.log` in the state directory. |
 | Pairing fails | The code is one-time and only valid while `invite` is still waiting. Check the address you gave to `invite` is reachable from the other machine, and that the port (default 3032) isn't blocked by a firewall. |
 | The two verification codes differ | Answer no on both and start again. A different number means the two machines did not talk to each other directly, or someone else used the code first. |
-| The camera opens but never reads the code | Hold the code steady, fill much of the picture, and avoid glare and reflections; a long code is a dense picture, so a closer, brighter view helps. A QR shown on another screen reads best at full size. If it still does not scan, use the pasted code. |
+| The camera opens but never reads the code | Under the picture, small grey text says what the scanner sees: the camera and picture format, how light the picture is, and whether it sees a QR code at all (a green box is drawn around one it finds, and it says if it cannot read it yet or if it is not a RustSync code). Then: hold the code steady, fill much of the picture, and avoid glare and reflections; a long code is a dense picture, so a closer, brighter view helps. A QR shown on another screen reads best at full size. If it still does not scan, use the pasted code. |
+| The window's close / minimise / maximise buttons look different from other windows (Linux, Wayland) | On Wayland the program has to draw those itself unless it goes through X11. By default RustSync does, so your desktop draws them. *Settings → Service → Use the desktop's own window title bar and buttons* turns that off (native Wayland: sharper on scaled displays, but RustSync's own buttons); or set `[gui] x11 = false` in the config file. It applies the next time the window opens. |
+| `camera error` or "only sends JPEG video" (Linux) | RustSync asks the camera for an uncompressed picture format; a camera that only offers JPEG cannot be read here. Use the pasted code instead. |
 | The camera does not open (window) | Use the pasted code instead. On Linux the camera must be a normal video device (`/dev/video0`) your user can open; on macOS allow the camera in System Settings, Privacy & Security. |
 | The window shows a library as "syncing" for a long time | Open its sync-status arrow: it lists what is left per device. A device that is offline keeps its share of the work until it comes back. `rustsync status` prints the same. Both devices need to be on the same RustSync version: a mismatch refuses to connect (`rustsync restart` after updating). |
 | A device shows as offline | It must be running and reachable at the address it was paired with. Changes sync when it comes back. |

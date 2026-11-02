@@ -261,6 +261,16 @@ async fn build_temp(
         .map(|(i, want)| (i, want.clone(), local_chunks.get(i) == Some(want)))
         .collect();
     let path = e.path.clone();
+    // The sender chooses the chunks, so check their sizes against what the entry declares: every
+    // chunk is CHUNK bytes except the last, and together they are exactly `size`.
+    let (declared_size, chunk_count) = (e.size, e.chunks.len());
+    let expected_len = move |i: usize| -> u64 {
+        if i + 1 < chunk_count {
+            CHUNK as u64
+        } else {
+            declared_size.saturating_sub((chunk_count.saturating_sub(1) as u64) * CHUNK as u64)
+        }
+    };
 
     // Missing chunks are fetched concurrently (8 in flight); results are consumed in order.
     let fetches = futures_util::stream::iter(items)
@@ -273,6 +283,9 @@ async fn build_temp(
                     return Ok::<Option<Vec<u8>>, anyhow::Error>(None);
                 }
                 let data = remote.get_chunk(folder_id, path, i as u32, want.clone()).await?;
+                if data.len() as u64 != expected_len(i) {
+                    bail!("chunk {} has the wrong size", i);
+                }
                 if blake3::hash(&data).to_hex().as_str() != want {
                     bail!("chunk {} failed verification", i);
                 }
@@ -283,6 +296,7 @@ async fn build_temp(
     futures_util::pin_mut!(fetches);
 
     let mut i = 0usize;
+    let mut total = 0u64;
     while let Some(res) = fetches.next().await {
         let data = match res? {
             Some(d) => d,
@@ -296,11 +310,18 @@ async fn build_temp(
                 buf
             }
         };
+        total += data.len() as u64;
+        if total > e.size {
+            bail!("the file is larger than it says");
+        }
         whole.update(&data);
         out.write_all(&data).await?;
         i += 1;
     }
     out.flush().await?;
+    if total != e.size {
+        bail!("the file is smaller than it says");
+    }
     if whole.finalize().to_hex().as_str() != e.hash {
         bail!("file hash mismatch after assembly");
     }

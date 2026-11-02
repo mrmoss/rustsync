@@ -147,15 +147,18 @@ impl State {
     pub fn save(&self, path: &Path) -> Result<()> {
         // An unpredictable name, created exclusively and never through a symlink.
         let tmp = crate::net::sibling(path, &format!(".tmp-{:016x}", rand::random::<u64>()));
-        let written = (|| -> std::io::Result<()> {
-            let mut f = std::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .mode(0o600)
-                .custom_flags(libc::O_NOFOLLOW)
-                .open(&tmp)?;
-            f.write_all(&serde_json::to_vec_pretty(self).map_err(std::io::Error::other)?)
-        })();
+        // If this open fails, the name belongs to somebody else: leave it alone and give up.
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(&tmp)?;
+        // From here the file is ours, so it is ours to clean up.
+        let written = serde_json::to_vec_pretty(self)
+            .map_err(std::io::Error::other)
+            .and_then(|bytes| f.write_all(&bytes));
+        drop(f);
         if let Err(e) = written {
             let _ = std::fs::remove_file(&tmp);
             return Err(e.into());

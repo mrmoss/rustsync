@@ -30,4 +30,6 @@ jobs:
       - name: Audit
         run: |
           [ -f Cargo.lock ] || cargo generate-lockfile
-          cargo audit
+          # Known vulnerabilities fail the job; so do "unsound" crates (listed exceptions are in
+          # .cargo/audit.toml). Unmaintained crates are shown as warnings only.
+          cargo audit --deny unsound
