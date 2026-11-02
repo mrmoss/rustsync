@@ -492,6 +492,8 @@ enum Ev {
     JoinEnded(Result<(), String>),
     /// A frame from the camera while scanning a QR code, and what came of the scan.
     CameraFrame(egui::ColorImage),
+    /// What the scanner is doing, shown under the picture.
+    ScanDebug(String),
     Scanned(String),
     ScanFailed(String),
     /// The recovery code of one library (kept out of the status bar on purpose).
@@ -579,6 +581,7 @@ struct App {
     verify: Option<Verify>,
     scan_stop: Option<Arc<AtomicBool>>,
     scan_tex: Option<egui::TextureHandle>,
+    scan_debug: String,
     /// The folder browser, while one is open over a dialog.
     browse: Option<Browse>,
     logo: egui::TextureHandle,
@@ -627,6 +630,7 @@ impl App {
             verify: None,
             scan_stop: None,
             scan_tex: None,
+            scan_debug: String::new(),
             browse: None,
             logo,
             port_edit: None,
@@ -855,6 +859,7 @@ impl App {
             stop.store(true, Ordering::Relaxed);
         }
         self.scan_tex = None;
+        self.scan_debug.clear();
     }
 
     fn cancel_invite(&mut self) {
@@ -927,6 +932,11 @@ impl App {
                         let t = self.ctx.load_texture("camera", img, egui::TextureOptions::LINEAR);
                         self.scan_tex = Some(t);
                     }
+                }
+            }
+            Ev::ScanDebug(text) => {
+                if self.scan_stop.is_some() {
+                    self.scan_debug = text;
                 }
             }
             Ev::Scanned(text) => {
@@ -1606,27 +1616,102 @@ mod camera {
         Err("camera access was not allowed (System Settings > Privacy & Security > Camera)".to_string())
     }
 
-    fn scan(tx: &Sender<Ev>, ctx: &egui::Context, stop: &AtomicBool) -> Result<(), String> {
+    /// Picture formats that need no JPEG decoder. Many webcams (on Linux nearly all) send JPEG
+    /// video by default, which this build cannot decode; they nearly always offer a raw format too.
+    #[cfg(target_os = "linux")]
+    static RAW: [nokhwa::utils::FrameFormat; 4] = [
+        nokhwa::utils::FrameFormat::YUYV,
+        nokhwa::utils::FrameFormat::NV12,
+        nokhwa::utils::FrameFormat::GRAY,
+        nokhwa::utils::FrameFormat::RAWRGB,
+    ];
+
+    fn open_camera() -> Result<nokhwa::Camera, String> {
         use nokhwa::pixel_format::RgbFormat;
         use nokhwa::utils::{CameraIndex, RequestedFormat, RequestedFormatType};
         use nokhwa::Camera;
 
-        #[cfg(target_os = "macos")]
-        ask_permission()?;
         // A pairing code is a dense QR code, so ask for the biggest picture the camera has (the
         // fastest format is often a small one, too coarse to read it).
-        let format = RequestedFormat::new::<RgbFormat>(RequestedFormatType::AbsoluteHighestResolution);
-        let mut cam = Camera::new(CameraIndex::Index(0), format)
-            .map_err(|e| format!("cannot open the camera: {}", e))?;
+        let biggest = || RequestedFormat::new::<RgbFormat>(RequestedFormatType::AbsoluteHighestResolution);
+        #[cfg(target_os = "linux")]
+        {
+            let want = RequestedFormat::with_formats(RequestedFormatType::None, &RAW);
+            if let Ok(mut cam) = Camera::new(CameraIndex::Index(0), want) {
+                // Of the raw formats, the biggest picture that still moves at a few frames a second.
+                if let Ok(list) = cam.compatible_camera_formats() {
+                    let best = list.into_iter().filter(|f| RAW.contains(&f.format())).max_by_key(|f| {
+                        (f.frame_rate() >= 5, u64::from(f.width()) * u64::from(f.height()), f.frame_rate())
+                    });
+                    if let Some(best) = best {
+                        let _ = cam.set_camera_format(best);
+                    }
+                }
+                return Ok(cam);
+            }
+        }
+        Camera::new(CameraIndex::Index(0), biggest()).map_err(|e| format!("cannot open the camera: {}", e))
+    }
+
+    /// Draw a line into a small RGB picture (used to outline a QR code that was found).
+    fn draw_line(img: &mut [u8], w: usize, h: usize, a: (i32, i32), b: (i32, i32)) {
+        let steps = (b.0 - a.0).abs().max((b.1 - a.1).abs()).max(1);
+        for i in 0..=steps {
+            let x = a.0 + (b.0 - a.0) * i / steps;
+            let y = a.1 + (b.1 - a.1) * i / steps;
+            for dy in -1..=1 {
+                for dx in -1..=1 {
+                    let (px, py) = (x + dx, y + dy);
+                    if px >= 0 && py >= 0 && (px as usize) < w && (py as usize) < h {
+                        let o = (py as usize * w + px as usize) * 3;
+                        img[o] = 40;
+                        img[o + 1] = 230;
+                        img[o + 2] = 60;
+                    }
+                }
+            }
+        }
+    }
+
+    fn scan(tx: &Sender<Ev>, ctx: &egui::Context, stop: &AtomicBool) -> Result<(), String> {
+        use nokhwa::pixel_format::RgbFormat;
+        use nokhwa::utils::FrameFormat;
+
+        #[cfg(target_os = "macos")]
+        ask_permission()?;
+        let mut cam = open_camera()?;
         cam.open_stream().map_err(|e| format!("cannot start the camera: {}", e))?;
+        let cam_name = cam.info().human_name();
         let (mut last_try, mut invert) = (Instant::now(), false);
+        // What the window shows under the picture, to see what the scanner is doing.
+        let (mut frames, mut frames_at, mut fps, mut last_debug) = (0u32, Instant::now(), 0.0f32, Instant::now());
+        let (mut tries, mut seen_at) = (0u32, None::<Instant>);
+        let mut detect = String::from("looking…");
+        let mut picture = String::new();
+        let mut outline: Option<([(i32, i32); 4], Instant)> = None;
+        let mut format_note = String::new();
         while !stop.load(Ordering::Relaxed) {
             let frame = cam.frame().map_err(|e| format!("camera error: {}", e))?;
-            let img = frame.decode_image::<RgbFormat>().map_err(|e| format!("camera error: {}", e))?;
+            let source = frame.source_frame_format();
+            let img = frame.decode_image::<RgbFormat>().map_err(|e| {
+                if source == FrameFormat::MJPEG {
+                    "this camera only sends JPEG video, which this version of RustSync cannot decode; paste the code instead".to_string()
+                } else {
+                    format!("camera error: {}", e)
+                }
+            })?;
             let (w, h) = (img.width() as usize, img.height() as usize);
             let rgb = img.as_raw();
             if w == 0 || h == 0 || rgb.len() < w * h * 3 {
                 continue;
+            }
+            frames += 1;
+            if frames_at.elapsed() >= Duration::from_secs(1) {
+                fps = frames as f32 / frames_at.elapsed().as_secs_f32();
+                (frames, frames_at) = (0, Instant::now());
+            }
+            if format_note.is_empty() {
+                format_note = format!("{} {}x{}", source, w, h);
             }
             // What is shown in the window: small enough to send to the screen quickly.
             let pstep = (w / 960).max(1);
@@ -1638,7 +1723,23 @@ mod camera {
                     small.extend_from_slice(&rgb[i..i + 3]);
                 }
             }
+            // A green box around a QR code that was seen (for a moment after).
+            if let Some((pts, when)) = &outline {
+                if when.elapsed() < Duration::from_millis(1500) {
+                    let sc = |p: (i32, i32)| (p.0 / pstep as i32, p.1 / pstep as i32);
+                    for k in 0..4 {
+                        draw_line(&mut small, pw, ph, sc(pts[k]), sc(pts[(k + 1) % 4]));
+                    }
+                }
+            }
             let _ = tx.send(Ev::CameraFrame(egui::ColorImage::from_rgb([pw, ph], &small)));
+            if last_debug.elapsed() >= Duration::from_millis(400) {
+                last_debug = Instant::now();
+                let _ = tx.send(Ev::ScanDebug(format!(
+                    "camera: {}\npicture: {} at {:.0} frames/s\n{}\nscanner: {} tries, {}",
+                    cam_name, format_note, fps, picture, tries, detect
+                )));
+            }
             ctx.request_repaint();
             // Looking for a code takes longer than showing the picture: a few times a second is
             // enough, and every other try is on the inverted picture (light squares on dark).
@@ -1647,25 +1748,89 @@ mod camera {
             }
             last_try = Instant::now();
             invert = !invert;
+            tries += 1;
             let dstep = (w / 1600).max(1);
             let (dw, dh) = (w / dstep, h / dstep);
-            let mut prepared = rqrr::PreparedImage::prepare_from_greyscale(dw, dh, |x, y| {
+            let grey = |x: usize, y: usize| -> u8 {
                 let i = ((y * dstep) * w + x * dstep) * 3;
-                let g = ((rgb[i] as u32 * 299 + rgb[i + 1] as u32 * 587 + rgb[i + 2] as u32 * 114) / 1000) as u8;
+                ((rgb[i] as u32 * 299 + rgb[i + 1] as u32 * 587 + rgb[i + 2] as u32 * 114) / 1000) as u8
+            };
+            // How bright and contrasty the picture is (a code needs both).
+            if tries % 4 == 1 {
+                let mut hist = [0u32; 256];
+                let mut n = 0u32;
+                for y in (0..dh).step_by(7) {
+                    for x in (0..dw).step_by(7) {
+                        hist[grey(x, y) as usize] += 1;
+                        n += 1;
+                    }
+                }
+                let at = |q: u32| -> usize {
+                    let (mut acc, target) = (0u32, n * q / 100);
+                    for (v, c) in hist.iter().enumerate() {
+                        acc += c;
+                        if acc >= target {
+                            return v;
+                        }
+                    }
+                    255
+                };
+                let (lo, hi) = (at(2), at(98));
+                let note = if hi.saturating_sub(lo) < 60 {
+                    " (too flat: more light or a brighter screen)"
+                } else if lo > 200 {
+                    " (washed out: glare or too bright)"
+                } else if hi < 60 {
+                    " (too dark)"
+                } else {
+                    ""
+                };
+                picture = format!("light: dark {} to bright {} of 255{}", lo, hi, note);
+            }
+            let mut prepared = rqrr::PreparedImage::prepare_from_greyscale(dw, dh, |x, y| {
+                let g = grey(x, y);
                 if invert {
                     255 - g
                 } else {
                     g
                 }
             });
-            for grid in prepared.detect_grids() {
-                if let Ok((_meta, text)) = grid.decode() {
-                    let text = text.trim().to_string();
-                    if text.contains('@') && text.contains('.') {
-                        let _ = cam.stop_stream();
-                        let _ = tx.send(Ev::Scanned(text));
-                        ctx.request_repaint();
-                        return Ok(());
+            let grids = prepared.detect_grids();
+            if grids.is_empty() {
+                // Keep the last "seen it" message for a moment so it can be read.
+                if seen_at.map_or(true, |t| t.elapsed() > Duration::from_secs(3)) {
+                    detect = format!("no QR code seen ({} view)", if invert { "inverted" } else { "normal" });
+                }
+                continue;
+            }
+            seen_at = Some(Instant::now());
+            for grid in grids {
+                let b = grid.bounds;
+                let pts = [
+                    (b[0].x * dstep as i32, b[0].y * dstep as i32),
+                    (b[1].x * dstep as i32, b[1].y * dstep as i32),
+                    (b[2].x * dstep as i32, b[2].y * dstep as i32),
+                    (b[3].x * dstep as i32, b[3].y * dstep as i32),
+                ];
+                outline = Some((pts, Instant::now()));
+                match grid.decode() {
+                    Ok((_meta, text)) => {
+                        let text = text.trim().to_string();
+                        if text.contains('@') && text.contains('.') {
+                            let _ = cam.stop_stream();
+                            let _ = tx.send(Ev::Scanned(text));
+                            ctx.request_repaint();
+                            return Ok(());
+                        }
+                        let start: String = text.chars().take(24).collect();
+                        detect = format!(
+                            "read a QR code ({} characters) that is not a RustSync pairing code; it starts with \"{}\"",
+                            text.chars().count(),
+                            start
+                        );
+                    }
+                    Err(e) => {
+                        detect = format!("QR code seen but cannot be read yet ({}): hold it still, closer, less glare", e);
                     }
                 }
             }
@@ -2740,6 +2905,9 @@ impl App {
                                 let w = ui.available_width().min(380.0);
                                 let ratio = tex.size()[1] as f32 / tex.size()[0].max(1) as f32;
                                 ui.add(egui::Image::new(tex).fit_to_exact_size(Vec2::new(w, w * ratio)));
+                                if !self.scan_debug.is_empty() {
+                                    ui.label(RichText::new(self.scan_debug.as_str()).monospace().small().weak());
+                                }
                             }
                             None => {
                                 ui.horizontal(|ui| {
