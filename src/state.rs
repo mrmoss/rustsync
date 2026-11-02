@@ -145,16 +145,25 @@ impl State {
     }
 
     pub fn save(&self, path: &Path) -> Result<()> {
-        let tmp = crate::net::sibling(path, ".tmp");
-        let mut f = std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o600)
-            .open(&tmp)?;
-        f.write_all(&serde_json::to_vec_pretty(self)?)?;
-        drop(f);
-        std::fs::rename(&tmp, path)?;
+        // An unpredictable name, created exclusively and never through a symlink.
+        let tmp = crate::net::sibling(path, &format!(".tmp-{:016x}", rand::random::<u64>()));
+        let written = (|| -> std::io::Result<()> {
+            let mut f = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .custom_flags(libc::O_NOFOLLOW)
+                .open(&tmp)?;
+            f.write_all(&serde_json::to_vec_pretty(self).map_err(std::io::Error::other)?)
+        })();
+        if let Err(e) = written {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(e.into());
+        }
+        if let Err(e) = std::fs::rename(&tmp, path) {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(e.into());
+        }
         Ok(())
     }
 

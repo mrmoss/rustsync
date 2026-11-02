@@ -567,11 +567,14 @@ impl Config {
                 }
             );
         }
+        // The owner of a directory controls what is in it whatever its mode says (and root, in
+        // particular, must never write into a directory somebody else owns).
         if md.uid() != me {
-            if me != 0 {
-                bail!("{} belongs to another user; choose a state_dir of your own", self.dir.display());
-            }
-            tracing::warn!("{} belongs to another user, who can read this device's keys", self.dir.display());
+            bail!(
+                "{} belongs to another user (uid {}), who could change what is inside; give it to the user running rustsync (chown) or choose another state_dir",
+                self.dir.display(),
+                md.uid()
+            );
         }
         Ok(())
     }

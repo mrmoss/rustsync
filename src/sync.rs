@@ -60,6 +60,8 @@ const MAX_HANDSHAKES_PER_IP: u32 = 4;
 const HANDSHAKE_FAILS_MAX: u32 = 8;
 const HANDSHAKE_FAIL_WINDOW: Duration = Duration::from_secs(60);
 const HANDSHAKE_BAN: Duration = Duration::from_secs(120);
+/// Hard cap on how many addresses are tracked (memory stays bounded however many sources there are).
+const HANDSHAKE_TRACKED_MAX: usize = 4096;
 pub const KIND_BLOB: u8 = 0;
 pub const KIND_RECORD: u8 = 1;
 const INVITE_SECS: u64 = 600;
@@ -320,11 +322,25 @@ impl Node {
         }
         let now = Instant::now();
         let mut m = self.ip_fails.lock().unwrap();
-        if m.len() > 4096 {
-            // Forget old, quiet addresses so this cannot grow without bound.
+        if m.len() >= HANDSHAKE_TRACKED_MAX && !m.contains_key(&ip) {
+            // Full: forget expired entries first, then the address whose count started longest ago
+            // (never one that is currently banned). If everything is banned, this one goes untracked.
             m.retain(|_, (_, start, until)| {
                 until.map_or(false, |u| now < u) || now.duration_since(*start) < HANDSHAKE_FAIL_WINDOW
             });
+            if m.len() >= HANDSHAKE_TRACKED_MAX {
+                let oldest = m
+                    .iter()
+                    .filter(|(_, (_, _, until))| until.map_or(true, |u| now >= u))
+                    .min_by_key(|(_, (_, start, _))| *start)
+                    .map(|(k, _)| *k);
+                match oldest {
+                    Some(k) => {
+                        m.remove(&k);
+                    }
+                    None => return,
+                }
+            }
         }
         let e = m.entry(ip).or_insert((0, now, None));
         if now.duration_since(e.1) >= HANDSHAKE_FAIL_WINDOW {

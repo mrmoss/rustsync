@@ -157,7 +157,7 @@ you can guess, plain-language output, and as little setup as possible. In practi
 
 ## Install
 
-You need [Rust](https://rustup.rs) (1.95 or newer for the window; the service and command line alone build with older ones, 1.81 or newer).
+You need [Rust](https://rustup.rs) (1.95 or newer for the window; the service and command line alone build with older ones, 1.85 or newer).
 
 **Where it runs** (64-bit Intel/AMD `x86_64` and ARM `aarch64`):
 

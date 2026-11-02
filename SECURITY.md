@@ -87,7 +87,7 @@ sequenceDiagram
   the joiner to call; give it one with `set-address` if it should dial too.
 - **Before the handshake finishes** a connection counts as anonymous: at most 32 at once, 4 per
   IP address, 10 s to complete. An address with 8 failed handshakes within a minute is ignored for
-  2 minutes (connections from it are dropped without any work); loopback is exempt. Frames are `[u16 length][ciphertext]`, records carry up to 60,000
+  2 minutes (connections from it are dropped without any work); loopback is exempt, and at most 4,096 addresses are tracked. Frames are `[u16 length][ciphertext]`, records carry up to 60,000
   bytes of payload, and a message is capped at 24 MiB.
 
 ### Pairing
@@ -244,7 +244,7 @@ never applied silently.
 | Backup size | Each encrypted backup can have a size limit (`quota`) that the machine keeping it enforces on every write, so a paired device cannot fill the drive past it. Unused chunks are only ever deleted by a machine holding the key, only if older than 7 days, and only after every record in the backup was read and decrypted. |
 | Memory / CPU | Small bounded queues everywhere a peer controls the input; a byte budget for pending index updates; at most 16 requests per device served at once (extras refused); index messages capped by size and count; library/offer/backup lists capped; a device that stops reading is dropped after 60 s. |
 | Temporary files | The files rustsync writes before renaming them into place (in encrypted backups and for the public key) get unpredictable names, are created exclusively (they fail if anything, a symlink included, is already there), are never opened through a symlink, and, for backups, are readable by the owner only. |
-| Local control socket | `control.sock` is owner-only (`0600`) in a `0700` directory, and a request is one line of at most 1 MiB. If the directory cannot be made private (or is not owned by you) or the socket cannot be restricted, the daemon refuses to start instead of carrying on. Each connection's user id is also checked, and only your own user (or root) is served. |
+| Local control socket | `control.sock` is owner-only (`0600`) in a `0700` directory, and a request is one line of at most 1 MiB. If the directory cannot be made private, or is not owned by the user running rustsync (root included: root refuses a directory someone else owns), or the socket cannot be restricted, the daemon refuses to start instead of carrying on. Each connection's user id is also checked, and only your own user (or root) is served. |
 | Logs | `activity.log` (and its `.1` copy) are created `0600` in the state directory and capped in size (`logging.max_size`). They hold device and library names, folder paths and error messages, never keys, pairing codes, recovery codes or file contents; line breaks and control characters in names and messages are replaced by spaces, so a hostile device name cannot start a log line of its own. |
 | Connection floods | At most 32 unauthenticated connections at once and 4 per IP address, 10 s handshake deadline, and a temporary ban for an address that keeps failing handshakes. |
 
@@ -265,7 +265,7 @@ never applied silently.
 - Files larger than 16 GiB are skipped (with a warning).
 - Conflict resolution is last-writer-wins on wall-clock time; keep clocks in sync (NTP).
 - Dependencies: the `audit` workflow runs `cargo audit` on every dependency change and weekly; commit `Cargo.lock` so it checks what you actually ship.
-- **Build and release pipeline.** The workflows run with read-only repository access; only the final job that creates the draft release may write, and the Android build gets just its four signing secrets. The third-party actions are referenced by version tag; for the strongest protection pin each to a full commit hash (Dependabot, set up in `.github/dependabot.yml`, then proposes the updates), and check downloads against `SHA256SUMS`.
+- **Build and release pipeline.** The workflows run with read-only repository access; only the final job that creates the draft release may write, and the Android build gets just its four signing secrets. Every third-party action is pinned to a full commit hash (the version is in a comment beside it); Dependabot, set up in `.github/dependabot.yml`, proposes the updates for review. Check downloads against `SHA256SUMS`.
 - **Android.** The app keeps its keys in its private storage (not in the phone's hardware key store), and
   turns off Android's cloud backup for them. Syncing folders outside the app needs "all files access",
   which lets the app (and so anything that can drive it) read and write every file on shared storage:

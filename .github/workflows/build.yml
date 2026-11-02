@@ -20,10 +20,12 @@ jobs:
         # Linux x86_64, Linux aarch64, macOS aarch64 (Apple silicon)
         os: [ubuntu-latest, ubuntu-24.04-arm, macos-latest]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          toolchain: stable
       - name: Linux build libraries
         if: startsWith(matrix.os, 'ubuntu')
         run: sudo apt-get update && sudo apt-get install -y libxkbcommon-dev libwayland-dev
@@ -31,7 +33,9 @@ jobs:
         run: cargo build --release
       - name: Test
         run: cargo test --release
-      - uses: taiki-e/install-action@just
+      - uses: taiki-e/install-action@1919c4a95903d2c33e4a221102edca87309fc14b # v2.89.0
+        with:
+          tool: just
       - name: Debian package (checks the .deb can be made)
         if: startsWith(matrix.os, 'ubuntu')
         run: |
@@ -53,10 +57,10 @@ jobs:
     name: freebsd
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           persist-credentials: false
-      - uses: cross-platform-actions/action@v1.7.0
+      - uses: cross-platform-actions/action@82668f1fbd89d9c99487604f822cbf6716f124d3 # v1.7.0
         with:
           operating_system: freebsd
           version: '14.5'
