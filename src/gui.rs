@@ -1644,7 +1644,7 @@ mod camera {
                         (f.frame_rate() >= 5, u64::from(f.width()) * u64::from(f.height()), f.frame_rate())
                     });
                     if let Some(best) = best {
-                        let _ = cam.set_camera_format(best);
+                        let _ = cam.set_camera_requset(RequestedFormat::with_formats(RequestedFormatType::Exact(best), &RAW));
                     }
                 }
                 return Ok(cam);
