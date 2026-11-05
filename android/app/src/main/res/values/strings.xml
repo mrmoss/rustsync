@@ -1,3 +1,4 @@
 <resources>
     <string name="app_name">RustSync</string>
+    <string name="nfc_service_description">Shows a RustSync pairing code to another phone held against this one</string>
 </resources>

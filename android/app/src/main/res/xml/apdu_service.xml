@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- RustSync shows a pairing code to another phone held against this one (see NfcPairing.kt). -->
+<host-apdu-service xmlns:android="http://schemas.android.com/apk/res/android"
+    android:description="@string/nfc_service_description"
+    android:requireDeviceUnlock="true">
+    <aid-group
+        android:category="other"
+        android:description="@string/nfc_service_description">
+        <!-- F0 + "RUSTSYNC" -->
+        <aid-filter android:name="F05255535453594E43" />
+    </aid-group>
+</host-apdu-service>

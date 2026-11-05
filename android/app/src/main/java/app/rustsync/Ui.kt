@@ -1,6 +1,8 @@
 package app.rustsync
 
+import android.content.Intent
 import android.graphics.Bitmap
+import android.provider.Settings
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.Image
@@ -33,6 +35,7 @@ import androidx.compose.material3.SnackbarHostState
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
@@ -440,12 +443,16 @@ private fun FolderDialog(
 private fun Devices(model: Model, status: Status) {
     var askHost by remember { mutableStateOf(false) }
     var enter by remember { mutableStateOf(false) }
+    var receiving by remember { mutableStateOf(false) }
+    val devicesContext = LocalContext.current
     var forgetting by remember { mutableStateOf<DeviceInfo?>(null) }
     var readdressing by remember { mutableStateOf<DeviceInfo?>(null) }
     val scan = rememberLauncherForActivityResult(ScanContract()) { result ->
         val text = result.contents
         if (text != null) model.enterCode(text)
     }
+
+    if (receiving) NfcReceiveDialog(model) { receiving = false }
 
     Page("Devices", "Pair your devices once; then share libraries between them.") {
         RsCard(Modifier.fillMaxWidth()) {
@@ -457,6 +464,11 @@ private fun Devices(model: Model, status: Status) {
                 }
                 OutlinedButton(modifier = Modifier.fillMaxWidth(), onClick = { askHost = true }) {
                     Text("Show a code on this phone")
+                }
+                if (NfcPairing.state(devicesContext) != NfcState.Missing) {
+                    OutlinedButton(modifier = Modifier.fillMaxWidth(), onClick = { receiving = true }) {
+                        Text("Receive a code from another phone (NFC)")
+                    }
                 }
                 TextButton(modifier = Modifier.align(Alignment.CenterHorizontally), onClick = { enter = true }) {
                     Text("Enter a code by hand", style = MaterialTheme.typography.bodySmall)
@@ -748,6 +760,7 @@ private fun PairingDialogs(model: Model) {
     val invite = model.invite
     val join = model.join
     val clipboard = LocalClipboardManager.current
+    val context = LocalContext.current
 
     if (check != null) {
         // Comparing the code comes first: both people must agree it is the same.
@@ -795,8 +808,19 @@ private fun PairingDialogs(model: Model) {
                         invite.error != null -> Text(invite.error)
                         invite.code == null -> CircularProgressIndicator()
                         else -> {
+                            // While the code is on screen, a phone held against this one can take it.
+                            DisposableEffect(invite.code) {
+                                NfcPairing.offer(invite.code)
+                                onDispose { NfcPairing.offer(null) }
+                            }
                             Text("On the other device tap “Scan a code” and point it at this:")
                             QrImage(invite.code)
+                            if (NfcPairing.canOffer(context)) {
+                                Text(
+                                    "Or, on another phone, choose “Receive a code from another phone (NFC)” and hold the backs of the two phones together.",
+                                    style = MaterialTheme.typography.bodySmall,
+                                )
+                            }
                             Text(invite.code, fontFamily = FontFamily.Monospace, fontSize = 10.sp)
                             TextButton(onClick = { clipboard.setText(AnnotatedString(invite.code)) }) { Text("Copy code") }
                             Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -826,4 +850,63 @@ private fun PairingDialogs(model: Model) {
             confirmButton = { TextButton(onClick = { model.cancelPairing() }) { Text(if (join.error != null) "Close" else "Cancel") } },
         )
     }
+}
+
+/** Waits for another phone (showing a pairing code) to be held against this one. */
+@Composable
+private fun NfcReceiveDialog(model: Model, onClose: () -> Unit) {
+    val context = LocalContext.current
+    val activity = remember(context) { context.findActivity() }
+    var state by remember { mutableStateOf(NfcPairing.state(context)) }
+    var problem by remember { mutableStateOf<String?>(null) }
+
+    DisposableEffect(state, activity) {
+        if (state == NfcState.Ready && activity != null) {
+            NfcPairing.startReading(
+                activity,
+                onCode = {
+                    model.enterCode(it)
+                    onClose()
+                },
+                onProblem = { problem = it },
+            )
+        }
+        onDispose { if (activity != null) NfcPairing.stopReading(activity) }
+    }
+
+    AlertDialog(
+        onDismissRequest = onClose,
+        title = { Text("Receive a code by NFC") },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                when (state) {
+                    NfcState.Missing -> Text("This phone has no NFC.")
+                    NfcState.Off -> Text("NFC is switched off. Turn it on in Android's settings, then come back and tap “Check again”.")
+                    NfcState.Ready -> {
+                        Text("On the other phone, choose “Show a code on this phone”. Then hold the backs of the two phones together and keep them still for a moment.")
+                        Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                            CircularProgressIndicator(Modifier.size(18.dp), strokeWidth = 2.dp)
+                            Text("Waiting for the other phone…", style = MaterialTheme.typography.bodySmall)
+                        }
+                    }
+                }
+                problem?.let { Text(it, color = MaterialTheme.colorScheme.error) }
+            }
+        },
+        confirmButton = {
+            if (state == NfcState.Off) {
+                TextButton(onClick = {
+                    problem = null
+                    state = NfcPairing.state(context)
+                }) { Text("Check again") }
+            } else {
+                TextButton(onClick = onClose) { Text("Cancel") }
+            }
+        },
+        dismissButton = {
+            if (state == NfcState.Off) {
+                TextButton(onClick = { context.startActivity(Intent(Settings.ACTION_NFC_SETTINGS)) }) { Text("Open NFC settings") }
+            }
+        },
+    )
 }

@@ -19,7 +19,12 @@
     <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" android:maxSdkVersion="29" />
     <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE" android:maxSdkVersion="29" />
 
+    <!-- to hand a pairing code to another phone held against this one -->
+    <uses-permission android:name="android.permission.NFC" />
+
     <uses-feature android:name="android.hardware.camera" android:required="false" />
+    <uses-feature android:name="android.hardware.nfc" android:required="false" />
+    <uses-feature android:name="android.hardware.nfc.hce" android:required="false" />
 
     <application
         android:allowBackup="false"
@@ -53,6 +58,20 @@
             <property
                 android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
                 android:value="Keeps the file sync running so other devices can reach this one" />
+        </service>
+
+        <!-- Answers a phone held against this one, only while a pairing code is on screen. Only the
+             system can bind to it (BIND_NFC_SERVICE). -->
+        <service
+            android:name=".PairingCardService"
+            android:exported="true"
+            android:permission="android.permission.BIND_NFC_SERVICE">
+            <intent-filter>
+                <action android:name="android.nfc.cardemulation.action.HOST_APDU_SERVICE" />
+            </intent-filter>
+            <meta-data
+                android:name="android.nfc.cardemulation.host_apdu_service"
+                android:resource="@xml/apdu_service" />
         </service>
 
         <receiver

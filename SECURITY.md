@@ -284,3 +284,4 @@ never applied silently.
   sensitive as the text (it works once, and needs a person's approval on both devices, but do not
   post it). The camera reader (window and Android app) only takes a picture while the scan screen is
   open, decodes it locally, and does nothing with the picture afterwards.
+- **NFC pairing (Android).** While a pairing code is on screen, a phone held against this one can read it over NFC (the range is a few centimetres): the same code as in the QR code, so it carries the same rules (it works once, and both people must approve). The card service answers nothing at any other time, only the system can talk to it, and it requires the phone to be unlocked.

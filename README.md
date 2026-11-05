@@ -503,6 +503,12 @@ straight from the big *Scan a code* button (upright, like any QR scanner); *Show
 phone* shows one for the other device to scan, and a small *Enter a code by hand* link is there
 for when a camera isn't handy.
 
+**Pairing two phones by NFC.** On one phone choose *Show a code on this phone*; on the other,
+*Receive a code from another phone (NFC)*, then hold the backs of the two phones together for a
+moment. The code travels the same way as in the QR code, and you still compare the verification
+number on both screens. Both phones need NFC switched on. (Laptops: use the QR code or the pasted
+code; few laptops have NFC and none can take part in this.)
+
 **Get the app.** You don't need to build anything: the `android` GitHub Actions workflow builds an
 APK on every push (open the run, download the `dist-android` artifact), and tagged releases have
 it attached (`rustsync-<version>-android.apk`). Copy it to the phone and open it; Android asks to
