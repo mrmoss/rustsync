@@ -16,7 +16,7 @@ crate-type = ["lib", "cdylib"]
 [dependencies]
 anyhow = "1"
 blake3 = "1"
-chacha20poly1305 = "0.10"
+chacha20poly1305 = "0.11"
 # the desktop window (rustsync-gui); servers can skip it with --no-default-features
 eframe = { version = "0.37", optional = true, default-features = false, features = [
     # the OpenGL renderer (the default is now wgpu, a much bigger dependency), the Linux windowing
