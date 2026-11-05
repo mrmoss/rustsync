@@ -46,7 +46,7 @@ object NfcPairing {
 
     internal fun offeredCode(): ByteArray? = offered
 
-    /** Can this phone act as the card (show a code to another phone)? */
+    /** Can this phone act as the card (share a code with another phone)? */
     fun canOffer(context: Context): Boolean =
         context.packageManager.hasSystemFeature(PackageManager.FEATURE_NFC_HOST_CARD_EMULATION)
 

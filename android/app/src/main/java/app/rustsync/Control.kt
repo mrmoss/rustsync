@@ -14,12 +14,17 @@ import java.io.OutputStream
 
 data class DeviceInfo(
     val key: String,
+    /** What to show: our nickname for it if we gave it one, else the name its owner set. */
     val name: String,
     val online: Boolean,
     val addr: String?,
     val lastSeen: Long,
     val upRate: Long = 0L,
     val downRate: Long = 0L,
+    /** The name its owner set. */
+    val announced: String = "",
+    /** Our own nickname for it; empty if none. */
+    val nickname: String = "",
 )
 
 /** How a library is syncing with one device: what is still to be fetched, each way. */
@@ -102,6 +107,8 @@ private fun parseStatus(o: JSONObject): Status {
                 lastSeen = d.optLong("last_seen", 0L),
                 upRate = d.optLong("up_rate", 0L),
                 downRate = d.optLong("down_rate", 0L),
+                announced = d.optString("announced"),
+                nickname = d.optString("nickname"),
             )
         },
         libraries = (0 until (libraries?.length() ?: 0)).map {
@@ -189,6 +196,9 @@ object Req {
     fun forget(device: String) = obj("Forget", JSONObject().put("device", device))
     fun setAddress(device: String, addr: String) =
         obj("SetAddress", JSONObject().put("device", device).put("addr", addr))
+    fun setName(name: String) = obj("SetName", JSONObject().put("name", name))
+    fun rename(device: String, nickname: String) =
+        obj("Rename", JSONObject().put("device", device).put("nickname", nickname))
     fun create(name: String, folder: String) = obj("Create", JSONObject().put("name", name).put("folder", folder))
     fun removeLibrary(library: String) = obj("RemoveLibrary", JSONObject().put("library", library))
     fun share(library: String, device: String, backup: Boolean) =

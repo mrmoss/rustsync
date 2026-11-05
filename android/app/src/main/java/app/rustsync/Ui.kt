@@ -100,7 +100,7 @@ fun App(model: Model, hasAllFilesAccess: () -> Boolean, askAllFilesAccess: () ->
                 Offline(model.offline ?: "")
             } else {
                 when (tab) {
-                    0 -> ThisDevice(status, hasAllFilesAccess, askAllFilesAccess)
+                    0 -> ThisDevice(model, status, hasAllFilesAccess, askAllFilesAccess)
                     1 -> Libraries(model, status)
                     2 -> Devices(model, status)
                     else -> SettingsPage(model, status)
@@ -137,8 +137,9 @@ private fun Offline(reason: String) {
 // ---------------------------------------------------------------- Home
 
 @Composable
-private fun ThisDevice(status: Status, hasAllFilesAccess: () -> Boolean, askAllFilesAccess: () -> Unit) {
+private fun ThisDevice(model: Model, status: Status, hasAllFilesAccess: () -> Boolean, askAllFilesAccess: () -> Unit) {
     var allFiles by remember { mutableStateOf(hasAllFilesAccess()) }
+    var renaming by remember { mutableStateOf(false) }
     LaunchedEffect(Unit) { allFiles = hasAllFilesAccess() }
     val clipboard = LocalClipboardManager.current
     Page("Home", "This phone: how other devices see it.") {
@@ -147,11 +148,36 @@ private fun ThisDevice(status: Status, hasAllFilesAccess: () -> Boolean, askAllF
                 Text(status.name, style = MaterialTheme.typography.titleLarge)
                 Text("● running", color = MaterialTheme.colorScheme.primary)
                 Text("Listening on ${status.listen}", style = MaterialTheme.typography.bodyMedium)
+                TextButton(onClick = { renaming = true }) { Text("Rename this phone") }
                 Text("Public key", style = MaterialTheme.typography.labelMedium)
                 Text(status.key, fontFamily = FontFamily.Monospace, fontSize = 12.sp)
                 TextButton(onClick = { clipboard.setText(AnnotatedString(status.key)) }) { Text("Copy key") }
                 Text("RustSync ${Core.version()}", style = MaterialTheme.typography.bodySmall)
             }
+        }
+        if (renaming) {
+            var text by remember { mutableStateOf(status.name) }
+            AlertDialog(
+                onDismissRequest = { renaming = false },
+                title = { Text("Rename this phone") },
+                text = {
+                    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                        Text("The name other devices see for this phone.")
+                        OutlinedTextField(value = text, onValueChange = { text = it }, singleLine = true)
+                        Text(
+                            "Paired devices pick it up right away (connections restart for a moment). Each of them can still show its own nickname for this phone. Empty: use the default name.",
+                            style = MaterialTheme.typography.bodySmall,
+                        )
+                    }
+                },
+                confirmButton = {
+                    TextButton(onClick = {
+                        renaming = false
+                        model.setName(text.trim())
+                    }) { Text("Save") }
+                },
+                dismissButton = { TextButton(onClick = { renaming = false }) { Text("Cancel") } },
+            )
         }
         if (!allFiles) {
             RsCard(Modifier.fillMaxWidth()) {
@@ -447,6 +473,7 @@ private fun Devices(model: Model, status: Status) {
     val devicesContext = LocalContext.current
     var forgetting by remember { mutableStateOf<DeviceInfo?>(null) }
     var readdressing by remember { mutableStateOf<DeviceInfo?>(null) }
+    var renaming by remember { mutableStateOf<DeviceInfo?>(null) }
     val scan = rememberLauncherForActivityResult(ScanContract()) { result ->
         val text = result.contents
         if (text != null) model.enterCode(text)
@@ -458,12 +485,12 @@ private fun Devices(model: Model, status: Status) {
         RsCard(Modifier.fillMaxWidth()) {
             Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
                 Text("Add a device", style = MaterialTheme.typography.titleMedium)
-                Text("Scan the QR code the other device is showing. Or show one on this phone and scan it from there.")
+                Text("Scan the QR code the other device is showing. Or share a code from this phone and scan it from the other device.")
                 Button(modifier = Modifier.fillMaxWidth().height(52.dp), onClick = { scan.launch(scanOptions()) }) {
                     Text("Scan a code")
                 }
                 OutlinedButton(modifier = Modifier.fillMaxWidth(), onClick = { askHost = true }) {
-                    Text("Show a code on this phone")
+                    Text("Share a code")
                 }
                 if (NfcPairing.state(devicesContext) != NfcState.Missing) {
                     OutlinedButton(modifier = Modifier.fillMaxWidth(), onClick = { receiving = true }) {
@@ -483,6 +510,9 @@ private fun Devices(model: Model, status: Status) {
                     Spacer(Modifier.size(12.dp))
                     Column(Modifier.weight(1f)) {
                         Text(d.name, style = MaterialTheme.typography.titleMedium)
+                        if (d.nickname.isNotEmpty() && d.announced.isNotEmpty()) {
+                            Text("calls itself “${d.announced}”", style = MaterialTheme.typography.bodySmall)
+                        }
                         Text(
                             (if (d.online) "● online" else "○ offline") +
                                 (d.addr?.let { "  $it" } ?: "") +
@@ -498,6 +528,7 @@ private fun Devices(model: Model, status: Status) {
                     }
                     Column(horizontalAlignment = Alignment.End) {
                         TextButton(onClick = { model.showLog("Log: ${d.name}", d.name, null) }) { Text("Log") }
+                        TextButton(onClick = { renaming = d }) { Text("Rename") }
                         TextButton(onClick = { readdressing = d }) { Text("Change address") }
                         TextButton(onClick = { forgetting = d }) { Text("Forget") }
                     }
@@ -514,7 +545,7 @@ private fun Devices(model: Model, status: Status) {
         var open by remember { mutableStateOf(false) }
         AlertDialog(
             onDismissRequest = { askHost = false },
-            title = { Text("Show a pairing code") },
+            title = { Text("Share a code") },
             text = {
                 Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                     Text("The address the other device will use to reach this phone:")
@@ -595,6 +626,37 @@ private fun Devices(model: Model, status: Status) {
                 ) { Text("Pair") }
             },
             dismissButton = { TextButton(onClick = { enter = false }) { Text("Cancel") } },
+        )
+    }
+
+    renaming?.let { d ->
+        var nick by remember(d.key) { mutableStateOf(d.nickname) }
+        val theirs = d.announced.ifEmpty { d.name }
+        AlertDialog(
+            onDismissRequest = { renaming = null },
+            title = { Text("Rename a device") },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Text("Its owner calls it “$theirs”. What should this phone call it?")
+                    OutlinedTextField(
+                        value = nick,
+                        onValueChange = { nick = it },
+                        singleLine = true,
+                        placeholder = { Text(theirs) },
+                    )
+                    Text(
+                        "Only this phone uses the nickname. Leave it empty to show the name its owner chose, including future changes to it.",
+                        style = MaterialTheme.typography.bodySmall,
+                    )
+                }
+            },
+            confirmButton = {
+                TextButton(onClick = {
+                    renaming = null
+                    model.rename(d.key, nick.trim())
+                }) { Text("Save") }
+            },
+            dismissButton = { TextButton(onClick = { renaming = null }) { Text("Cancel") } },
         )
     }
 
@@ -797,7 +859,7 @@ private fun PairingDialogs(model: Model) {
     } else if (invite != null) {
         AlertDialog(
             onDismissRequest = { model.cancelPairing() },
-            title = { Text("Show a pairing code") },
+            title = { Text("Share a code") },
             text = {
                 Column(
                     Modifier.verticalScroll(rememberScrollState()),
@@ -883,7 +945,7 @@ private fun NfcReceiveDialog(model: Model, onClose: () -> Unit) {
                     NfcState.Missing -> Text("This phone has no NFC.")
                     NfcState.Off -> Text("NFC is switched off. Turn it on in Android's settings, then come back and tap “Check again”.")
                     NfcState.Ready -> {
-                        Text("On the other phone, choose “Show a code on this phone”. Then hold the backs of the two phones together and keep them still for a moment.")
+                        Text("On the other phone, choose “Share a code”. Then hold the backs of the two phones together and keep them still for a moment.")
                         Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                             CircularProgressIndicator(Modifier.size(18.dp), strokeWidth = 2.dp)
                             Text("Waiting for the other phone…", style = MaterialTheme.typography.bodySmall)

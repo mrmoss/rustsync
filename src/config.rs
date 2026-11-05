@@ -439,6 +439,25 @@ pub fn set_port(path: &Path, port: u16) -> Result<()> {
     set_in_section(path, "server", "port", toml_edit::value(port as i64))
 }
 
+/// Write this device's name into the config file (`None` removes the line, so the host name is
+/// used again). The rest of the file stays as it is.
+pub fn set_name(path: &Path, name: Option<&str>) -> Result<()> {
+    let text = std::fs::read_to_string(path).with_context(|| format!("cannot read config {}", path.display()))?;
+    let mut doc: toml_edit::DocumentMut = text.parse().with_context(|| format!("invalid config {}", path.display()))?;
+    match name {
+        Some(n) => {
+            doc.as_table_mut().insert("name", toml_edit::value(n));
+        }
+        None => {
+            doc.as_table_mut().remove("name");
+        }
+    }
+    let tmp = path.with_extension("toml.tmp");
+    std::fs::write(&tmp, doc.to_string())?;
+    std::fs::rename(&tmp, path)?;
+    Ok(())
+}
+
 /// Write the window's X11 setting into the config file (the config file must already exist).
 pub fn set_gui_x11(path: &Path, on: bool) -> Result<()> {
     set_in_section(path, "gui", "x11", toml_edit::value(on))
@@ -654,6 +673,11 @@ mod tests {
         std::fs::write(&path, "# keep me\nname = \"a\"\n\n[server]\nport = 1 # old\n").unwrap();
         set_port(&path, 4000).unwrap();
         set_log_size(&path, 5_000_000).unwrap();
+        set_name(&path, Some("laptop \"main\"")).unwrap();
+        assert_eq!(load(&path).unwrap().name.as_deref(), Some("laptop \"main\""));
+        set_name(&path, None).unwrap();
+        assert_eq!(load(&path).unwrap().name, None);
+        set_name(&path, Some("a")).unwrap();
         let text = std::fs::read_to_string(&path).unwrap();
         assert!(text.contains("# keep me"));
         let cfg = load(&path).unwrap();

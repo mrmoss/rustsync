@@ -297,7 +297,7 @@ rustsync status
 Prefer clicking? Start the window with `rustsync-gui` (it has a *Start* button if the service isn't
 running yet). It has four pages, and opens on the first:
 
-- **Home**: this device: its name, public key and the address it's listening on.
+- **Home**: this device: its name, public key and the address it's listening on. *Rename…* changes the name other devices see (see *Device names* below).
 - **Libraries**: your libraries, who they're shared with, how much encrypted-backup space is used,
   and offers waiting for you to accept. Each library has an arrow that shows its **sync status** ("Up to date" or "Syncing…"): open it to see,
   for every device, whether it is up to date or how many files and bytes are still to send or
@@ -305,8 +305,8 @@ running yet). It has four pages, and opens on the first:
 - **Devices**: the machines you've paired and whether they're online, plus *Show a pairing code* and
   *Enter a pairing code* for adding another. When you show a code, the address comes from a
   drop-down of this machine's own IP addresses and host names, or *Set manually…* to type one.
-  *Change address…* updates where a device is reached when its IP address changes (the Android
-  app has the same button). A device that is offline shows when it was *last seen*, and each
+  *Change address…* updates where a device is reached when its IP address changes, and *Rename…*
+  gives a device a nickname on this machine (the Android app has the same buttons). A device that is offline shows when it was *last seen*, and each
   device and library has a *Log…* button showing just what concerns it. An online device shows
   the current **download and upload speed** while data is moving.
 - **Settings**: the **Service** (start, **restart** or stop RustSync) at the top, and on a Wayland desktop a switch for the window's title bar (below); the **port** this machine listens on; the **logs** (show them, and set how big
@@ -384,6 +384,9 @@ Pairing devices
                       Change the address used to reach a paired device (when its IP changed)
   set-port [PORT]     Change the port this machine listens on (other devices then need
                       `set-address` with the new port)
+  name [NAME]         Change this device's own name (what other devices show for it)
+  rename [DEVICE] [NICKNAME]
+                      Give a paired device a nickname that only this machine uses
 
 Libraries (folders to sync)
   create [NAME] [FOLDER]            Create a library from a folder
@@ -493,17 +496,33 @@ entries are repaired the next time you open the app and press *Start* (or run `r
 the icon's entry repairs itself when the icon runs. Starting rustsync by hand always works, even
 if the login entry is broken.
 
+## Device names
+
+Every device has two names. The **name its owner sets** is what it announces to the devices it is
+paired with: choose it in the config file (`name = "laptop"`), with `rustsync name`, or with *Rename…*
+on the Home page (the Android app has *Rename this phone*). Changing it restarts the open
+connections for a moment so every paired device hears the new name at once; nothing is lost.
+
+A **nickname** is a name only *your* machine uses for a paired device. Set it with *Rename…* on that
+device's card (or `rustsync rename`). While a nickname is set it is shown everywhere on your machine
+(lists, logs, the library pages) and the owner's name is shown small underneath ("calls itself …").
+Clear the nickname and you are back to the name its owner chose, including any changes they made in
+the meantime. A nickname never leaves your machine: the other device is not told.
+
+Use a nickname when two devices announce the same name, or when you simply prefer your own. Names are
+labels, not identities: what identifies a device is its public key, shown (shortened) on its card.
+
 ## The Android app
 
 An Android app (a phone or tablet, Android 8 or newer) lives in [`android/`](android/). It runs
 the same sync service inside the app, so the phone is a full device: pair it, share libraries
 with it, accept ones from the others. It has the same four pages as the window (*Home* first, *Settings* last),
 shows a QR code for pairing, and scans one with the camera. To pair, *Devices* opens the camera
-straight from the big *Scan a code* button (upright, like any QR scanner); *Show a code on this
-phone* shows one for the other device to scan, and a small *Enter a code by hand* link is there
+straight from the big *Scan a code* button (upright, like any QR scanner); *Share a code*
+shows one for the other device to scan, and a small *Enter a code by hand* link is there
 for when a camera isn't handy.
 
-**Pairing two phones by NFC.** On one phone choose *Show a code on this phone*; on the other,
+**Pairing two phones by NFC.** On one phone choose *Share a code*; on the other,
 *Receive a code from another phone (NFC)*, then hold the backs of the two phones together for a
 moment. The code travels the same way as in the QR code, and you still compare the verification
 number on both screens. Both phones need NFC switched on. (Laptops: use the QR code or the pasted

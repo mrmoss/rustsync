@@ -35,6 +35,8 @@ enum Request {
     Join { token: String },
     PairDecision { accept: bool },
     SetPort { port: u16 },
+    SetName { name: String },
+    Rename { device: String, nickname: String },
     Log { device: Option<String>, library: Option<String>, lines: usize },
     SetLogSize { bytes: u64 },
     Forget { device: String },
@@ -94,7 +96,14 @@ struct StatusInfo {
 #[derive(Deserialize, Debug, Clone)]
 struct DeviceInfo {
     key: String,
+    /// What to show: our nickname for it, else the name its owner set.
     name: String,
+    /// The name its owner set.
+    #[serde(default)]
+    announced: String,
+    /// Our own nickname for it (empty if none).
+    #[serde(default)]
+    nickname: String,
     online: bool,
     addr: Option<String>,
     #[serde(default)]
@@ -537,6 +546,10 @@ enum Dialog {
     Join { code: String, running: bool, error: Option<String>, scanning: bool },
     ConfirmForget { key: String, name: String },
     Address { key: String, name: String, text: String },
+    /// Rename this device (the name other devices see).
+    OwnName { text: String },
+    /// A nickname for a paired device, used on this machine only.
+    Nickname { key: String, announced: String, text: String },
     ConfirmRemove { id: String, name: String },
 }
 
@@ -558,6 +571,8 @@ enum Action {
     PairDecide { accept: bool },
     Forget { key: String },
     SetAddress { key: String, addr: String },
+    SetOwnName { name: String },
+    SetNickname { key: String, nickname: String },
     SetPort { port: u16 },
     Remove { id: String },
     StartInvite { host: String },
@@ -1062,6 +1077,8 @@ impl App {
                 self.run(Request::SetPort { port })
             }
             Action::SetAddress { key, addr } => self.run(Request::SetAddress { device: key, addr }),
+            Action::SetOwnName { name } => self.run(Request::SetName { name }),
+            Action::SetNickname { key, nickname } => self.run(Request::Rename { device: key, nickname }),
             Action::Remove { id } => self.run(Request::RemoveLibrary { library: id }),
             Action::StartInvite { host } => {
                 if let Dialog::Invite { running, code, error, note, .. } = &mut self.dialog {
@@ -2279,6 +2296,9 @@ impl App {
                     }
                     ui.vertical(|ui| {
                         ui.label(RichText::new(&d.name).strong());
+                        if !d.nickname.is_empty() && !d.announced.is_empty() {
+                            ui.label(RichText::new(format!("calls itself “{}”", d.announced)).small().weak());
+                        }
                         let mut line = format!("{}…", short(&d.key));
                         if let Some(a) = &d.addr {
                             line.push_str(&format!("  ·  {}", a));
@@ -2305,6 +2325,17 @@ impl App {
                                     key: d.key.clone(),
                                     name: d.name.clone(),
                                     text: d.addr.clone().unwrap_or_default(),
+                                };
+                            }
+                            if ui
+                                .button("Rename…")
+                                .on_hover_text("Give it a name that only this machine uses. The name its owner chose stays as it is.")
+                                .clicked()
+                            {
+                                self.dialog = Dialog::Nickname {
+                                    key: d.key.clone(),
+                                    announced: if d.announced.is_empty() { d.name.clone() } else { d.announced.clone() },
+                                    text: d.nickname.clone(),
                                 };
                             }
                             if ui.button("Log…").clicked() {
@@ -2336,7 +2367,16 @@ impl App {
 
         card(ui, |ui| {
             ui.label(RichText::new("Name").small().weak());
-            ui.label(RichText::new(&status.name).strong().size(16.0));
+            ui.horizontal(|ui| {
+                ui.label(RichText::new(&status.name).strong().size(16.0));
+                if ui
+                    .small_button("Rename…")
+                    .on_hover_text("Other devices show this name, unless they gave this device a nickname of their own")
+                    .clicked()
+                {
+                    self.dialog = Dialog::OwnName { text: status.name.clone() };
+                }
+            });
             ui.add_space(4.0);
             ui.label(RichText::new("Public key").small().weak());
             ui.horizontal(|ui| {
@@ -2991,6 +3031,52 @@ impl App {
                     ui.horizontal(|ui| {
                         if ui.add(primary("Save")).clicked() {
                             action = Some(Action::SetAddress { key: key.clone(), addr: text.trim().to_string() });
+                            close = true;
+                        }
+                        if ui.button("Cancel").clicked() {
+                            close = true;
+                        }
+                    });
+                });
+            }
+
+            Dialog::OwnName { text } => {
+                window("Rename this device").show(ctx, |ui| {
+                    ui.label("The name other devices see for this one:");
+                    ui.add(egui::TextEdit::singleline(text).desired_width(f32::INFINITY));
+                    ui.label(
+                        RichText::new("Paired devices pick it up right away (connections restart for a moment). Each of them can still show its own nickname for this device. Empty: use the host name.")
+                            .small()
+                            .weak(),
+                    );
+                    ui.horizontal(|ui| {
+                        if ui.add(primary("Save")).clicked() {
+                            action = Some(Action::SetOwnName { name: text.trim().to_string() });
+                            close = true;
+                        }
+                        if ui.button("Cancel").clicked() {
+                            close = true;
+                        }
+                    });
+                });
+            }
+
+            Dialog::Nickname { key, announced, text } => {
+                window("Rename a device").show(ctx, |ui| {
+                    ui.label(format!("Its owner calls it “{}”. What should this machine call it?", announced));
+                    ui.add(
+                        egui::TextEdit::singleline(text)
+                            .hint_text(announced.as_str())
+                            .desired_width(f32::INFINITY),
+                    );
+                    ui.label(
+                        RichText::new("Only this machine uses the nickname. Leave it empty to show the name its owner chose, including future changes to it.")
+                            .small()
+                            .weak(),
+                    );
+                    ui.horizontal(|ui| {
+                        if ui.add(primary("Save")).clicked() {
+                            action = Some(Action::SetNickname { key: key.clone(), nickname: text.trim().to_string() });
                             close = true;
                         }
                         if ui.button("Cancel").clicked() {

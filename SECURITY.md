@@ -39,6 +39,11 @@
   password manager (a secure note is fine; it is encrypted there). They never appear in logs or the
   status output. The kit holds no device identity or pairing secrets, so losing it to someone does
   not let them impersonate your machines, and restoring needs a fresh pairing.
+- **Device names are labels, not identities.** A paired device announces its own name each time it
+  connects, and the receiving machine updates it (control characters and text-direction tricks are
+  removed, 64 characters at most). A paired device can therefore rename itself to look like another
+  one. The public key is what identifies a device; give a device a nickname on your machine (it
+  overrides the announced name and is never sent anywhere) if you want a label nobody else can change.
 - Nothing from another device is trusted blindly. Everything below is checked first.
 
 ## How it works in detail

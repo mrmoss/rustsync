@@ -16,6 +16,11 @@ pub enum Request {
     /// Change where to reach a paired device (`host` or `host:port`; empty clears it, so that
     /// only the other side dials).
     SetAddress { device: String, addr: String },
+    /// Change this device's own name (also written to the config file). Paired devices see the
+    /// new name the next time they connect, which happens right away. Empty = use the host name.
+    SetName { name: String },
+    /// Give a paired device a name that only this machine uses (empty removes it again).
+    Rename { device: String, nickname: String },
     /// Listen on another port from now on (also written to the config file).
     SetPort { port: u16 },
     /// The newest lines of the activity log, about a device and/or a library (both empty: all).
@@ -94,7 +99,14 @@ pub struct StatusInfo {
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct DeviceInfo {
     pub key: String,
+    /// What to show: our nickname for it if we gave it one, else the name its owner set.
     pub name: String,
+    /// The name its owner set (what it announces).
+    #[serde(default)]
+    pub announced: String,
+    /// Our own nickname for it; empty if none.
+    #[serde(default)]
+    pub nickname: String,
     pub online: bool,
     pub addr: Option<String>,
     /// When it was last connected (seconds since 1970); 0 = never seen.

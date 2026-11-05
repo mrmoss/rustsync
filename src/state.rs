@@ -12,7 +12,11 @@ use std::path::Path;
 pub struct Device {
     /// Public key (hex). This is the device's identity.
     pub key: String,
+    /// The name the other device's owner gave it (it announces this when it connects).
     pub name: String,
+    /// A name only this machine uses for it. When set, it is shown instead of `name`.
+    #[serde(default)]
+    pub nickname: String,
     /// Secret shared by exactly this pair of devices (hex). Mixed into the handshake.
     pub psk: String,
     /// Where to reach it. Only the side that joined has this; the other side waits for it to call.
@@ -23,6 +27,17 @@ pub struct Device {
     /// When it was last connected (seconds since 1970); 0 = never.
     #[serde(default)]
     pub last_seen: u64,
+}
+
+impl Device {
+    /// What this machine calls it: our own nickname if there is one, else the name its owner set.
+    pub fn display_name(&self) -> &str {
+        if self.nickname.is_empty() {
+            &self.name
+        } else {
+            &self.nickname
+        }
+    }
 }
 
 /// What another device does with one of our libraries. This is decided per library, so one
@@ -176,7 +191,7 @@ impl State {
 
     pub fn device_name(&self, key: &str) -> String {
         self.device(key)
-            .map(|d| d.name.clone())
+            .map(|d| d.display_name().to_string())
             .unwrap_or_else(|| key.chars().take(8).collect())
     }
 }

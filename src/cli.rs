@@ -244,7 +244,7 @@ fn print_status(config: &Path, s: &StatusInfo) {
     for d in &s.devices {
         println!(
             "  {:<16} {}  {}{}{}{}",
-            d.name,
+            if d.nickname.is_empty() { d.name.clone() } else { format!("{} (\"{}\")", d.nickname, d.announced) },
             if d.online { "online " } else { "offline" },
             &d.key[..8.min(d.key.len())],
             d.addr.as_ref().map(|a| format!("  {}", a)).unwrap_or_default(),
@@ -1013,6 +1013,46 @@ pub async fn run(config_path: &Path, cmd: Cmd) -> Result<()> {
                     .map_err(|_| anyhow!("that is not a port number (1 to 65535)"))?,
             };
             call(&ctl, &Request::SetPort { port }).await?;
+            Ok(())
+        }
+        Cmd::Name { name } => {
+            let info = status(&ctl).await?;
+            let name = match name {
+                Some(n) => n,
+                None => ask("Name of this device", &info.name)?,
+            };
+            call(&ctl, &Request::SetName { name }).await?;
+            Ok(())
+        }
+        Cmd::Rename { device, nickname } => {
+            let info = status(&ctl).await?;
+            if info.devices.is_empty() {
+                bail!("no paired devices yet");
+            }
+            let labels: Vec<String> = info
+                .devices
+                .iter()
+                .map(|d| {
+                    if d.nickname.is_empty() {
+                        d.name.clone()
+                    } else {
+                        format!("{} (calls itself \"{}\")", d.nickname, d.announced)
+                    }
+                })
+                .collect();
+            let devices = &info.devices;
+            let i = pick("device", &labels, device, |i, t| {
+                name_or_prefix(&devices[i].name, &devices[i].key, t) || t.eq_ignore_ascii_case(&devices[i].announced)
+            })?;
+            let nick = match nickname {
+                Some(n) => n,
+                None => ask(
+                    &format!("Nickname for \"{}\" on this machine (- removes it)", devices[i].announced),
+                    &devices[i].nickname,
+                )?,
+            };
+            let nick = if nick.trim() == "-" { String::new() } else { nick };
+            call(&ctl, &Request::Rename { device: info.devices[i].key.clone(), nickname: nick }).await?;
             Ok(())
         }
         Cmd::SetAddress { device, address } => {

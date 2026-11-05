@@ -84,6 +84,19 @@ pub enum Cmd {
         /// New address, `host` or `host:port` (asked if omitted; the current one is the default)
         address: Option<String>,
     },
+    /// Change this device's own name (saved in the config file; paired devices see it)
+    Name {
+        /// The new name (asked if omitted; pass "" to go back to the host name)
+        name: Option<String>,
+    },
+    /// Give a paired device a nickname that only this machine uses
+    Rename {
+        /// Number or name of the device (listed if omitted)
+        device: Option<String>,
+        /// The nickname (asked if omitted; `-` or an empty one removes it, and the name its owner
+        /// set is shown again)
+        nickname: Option<String>,
+    },
     /// Change the port this machine listens on (saved in the config file)
     SetPort {
         /// The new port (asked if omitted)

@@ -414,7 +414,8 @@ enum Cand {
 pub struct Node {
     pub cfg: Config,
     keys: Keys,
-    name: String,
+    /// This device's own name (can be changed while running).
+    name: Mutex<String>,
     /// Encrypted backups kept here for other devices, by library id.
     depots: Mutex<HashMap<String, Arc<Depot>>>,
     /// (library, backup device) -> (bytes used, size limit) as that device last reported.
@@ -490,10 +491,20 @@ fn short(k: &str) -> &str {
     &k[..8.min(k.len())]
 }
 
+/// A name that may be empty: drop control characters (and anything that could hide text or make
+/// it read backwards), limit the length, trim.
+fn clean_text(s: &str) -> String {
+    let t: String = s
+        .chars()
+        .filter(|c| !c.is_control() && !matches!(*c, '\u{200b}'..='\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}' | '\u{feff}'))
+        .take(64)
+        .collect();
+    t.trim().to_string()
+}
+
 /// Names come from other machines: drop control characters, limit the length.
 fn clean_name(s: &str) -> String {
-    let t: String = s.chars().filter(|c| !c.is_control()).take(64).collect();
-    let t = t.trim().to_string();
+    let t = clean_text(s);
     if t.is_empty() {
         "unnamed".to_string()
     } else {
@@ -1210,14 +1221,14 @@ impl Node {
                 Some((r, _)) if r != role => bail!(
                     "\"{}\" is already shared with {} ({}); one device can't have both. Use the other library name, or `forget` the device first.",
                     lib.name,
-                    dev.name,
+                    dev.display_name(),
                     r.word()
                 ),
                 Some((_, accepted)) => confirmed = accepted,
                 None => lib.members.push(Member { device: dev_key.to_string(), role, accepted: false }),
             }
             lib.excluded.retain(|d| d != dev_key);
-            (lib.name.clone(), dev.name, confirmed)
+            (lib.name.clone(), dev.display_name().to_string(), confirmed)
         };
         if confirmed {
             return Ok(format!("\"{}\" is already shared with {}.", lname, dname));
@@ -1399,7 +1410,7 @@ impl Node {
         let dname = {
             let st = self.state.lock().unwrap();
             let Some(dev) = st.device(device_key) else { bail!("no such device") };
-            dev.name.clone()
+            dev.display_name().to_string()
         };
         let code = code.trim();
         let mut done: Vec<String> = Vec::new();
@@ -1482,7 +1493,7 @@ impl Node {
                 l.members.retain(|m| m.device != key);
             }
             st.offers.retain(|o| o.from != key);
-            dev.name
+            dev.display_name().to_string()
         };
         self.save_state();
         if let Some(s) = self.sessions.lock().unwrap().get(key) {
@@ -1510,7 +1521,7 @@ impl Node {
                     dev.port = None;
                 }
             }
-            dev.name.clone()
+            dev.display_name().to_string()
         };
         self.save_state();
         match target {
@@ -1532,7 +1543,9 @@ impl Node {
             .iter()
             .map(|d| DeviceInfo {
                 key: d.key.clone(),
-                name: d.name.clone(),
+                name: d.display_name().to_string(),
+                announced: d.name.clone(),
+                nickname: d.nickname.clone(),
                 online: online.contains(&d.key),
                 addr: match (&d.host, d.port) {
                     (Some(h), Some(p)) => Some(format!("{}:{}", h, p)),
@@ -1620,7 +1633,7 @@ impl Node {
             })
             .collect();
         StatusInfo {
-            name: self.name.clone(),
+            name: self.my_name(),
             key: net::hex(&self.keys.public),
             listen: format!("{}:{}", self.cfg.server.host, self.port()),
             port: self.port(),
@@ -1636,6 +1649,81 @@ impl Node {
     }
 
     // ------------------------------------------------------------ pairing
+
+    /// This device's own name, as announced to the devices it is paired with.
+    pub fn my_name(&self) -> String {
+        self.name.lock().unwrap().clone()
+    }
+
+    /// Change this device's own name. It is written to the config file, and the open
+    /// connections are restarted so every paired device hears the new name right away (they
+    /// reconnect by themselves within seconds; nothing is lost).
+    pub fn set_own_name(&self, wanted: &str) -> Result<String> {
+        let typed = clean_text(wanted);
+        let (new, stored): (String, Option<String>) = if typed.is_empty() {
+            (config::hostname(), None)
+        } else {
+            (typed.clone(), Some(typed))
+        };
+        if new == self.my_name() {
+            return Ok(format!("This device is already called \"{}\".", new));
+        }
+        config::set_name(&self.cfg.path, stored.as_deref()).context("cannot save the name in the config file")?;
+        *self.name.lock().unwrap() = new.clone();
+        info!("this device is now called \"{}\"", new);
+        // The name is sent when a connection starts, so restart the open ones.
+        let sessions: Vec<CancellationToken> = self.sessions.lock().unwrap().values().map(|s| s.cancel.clone()).collect();
+        for c in sessions {
+            c.cancel();
+        }
+        Ok(format!("This device is now called \"{}\". Paired devices will show it (unless they gave it a nickname of their own).", new))
+    }
+
+    /// Give a paired device a name that only this machine uses (empty removes it).
+    pub fn set_nickname(&self, key: &str, nickname: &str) -> Result<String> {
+        let nick = clean_text(nickname);
+        let msg = {
+            let mut st = self.state.lock().unwrap();
+            let Some(dev) = st.devices.iter_mut().find(|d| d.key == key) else {
+                bail!("no such device");
+            };
+            // A nickname equal to the announced name is the same as none.
+            dev.nickname = if nick == dev.name { String::new() } else { nick };
+            if dev.nickname.is_empty() {
+                format!("\"{}\" is shown by the name its owner set.", dev.name)
+            } else {
+                format!("\"{}\" will be shown as \"{}\" on this machine.", dev.name, dev.nickname)
+            }
+        };
+        self.save_state();
+        Ok(msg)
+    }
+
+    /// A paired device told us its name (it does at every connection). Keep it up to date.
+    fn note_announced_name(&self, key: &str, announced: &str) {
+        let new = clean_text(announced);
+        if new.is_empty() {
+            return;
+        }
+        let changed = {
+            let mut st = self.state.lock().unwrap();
+            match st.devices.iter_mut().find(|d| d.key == key) {
+                Some(d) if d.name != new => {
+                    let old = std::mem::replace(&mut d.name, new.clone());
+                    Some((old, d.nickname.is_empty()))
+                }
+                _ => None,
+            }
+        };
+        if let Some((old, shown)) = changed {
+            if shown {
+                info!(device = %new, "this device renamed itself (it was called \"{}\")", old);
+            } else {
+                info!(device = %self.dev_label(key), "this device renamed itself from \"{}\" to \"{}\"", old, new);
+            }
+            self.save_state();
+        }
+    }
 
     /// A device's name, for the log.
     fn dev_label(&self, key: &str) -> String {
@@ -1762,7 +1850,7 @@ impl Node {
         if remote != key {
             bail!("the machine at {} has a different key than the code says (wrong machine?)", addr);
         }
-        let hello = PairHello { name: self.name.clone() };
+        let hello = PairHello { name: self.my_name() };
         net::send_message(&mut stream, &mut transport, &postcard::to_allocvec(&hello)?).await?;
         let bytes = recv_bytes(&mut stream, &mut transport).await?;
         let info: PairInfo = postcard::from_bytes(&bytes)?;
@@ -1799,10 +1887,12 @@ impl Node {
         let key_hex = net::hex(&key);
         {
             let mut st = self.state.lock().unwrap();
+            let nickname = st.device(&key_hex).map(|d| d.nickname.clone()).unwrap_or_default();
             st.devices.retain(|d| d.key != key_hex);
             st.devices.push(Device {
                 key: key_hex.clone(),
                 name: name.clone(),
+                nickname,
                 psk: net::hex(&reply.psk),
                 host: Some(host),
                 port: Some(port),
@@ -1859,6 +1949,8 @@ impl Node {
             Request::Forget { device } => out(self.forget_device(&device)?),
             Request::SetAddress { device, addr } => out(self.set_device_address(&device, &addr)?),
             Request::SetPort { port } => out(self.set_port(port).await?),
+            Request::SetName { name } => out(self.set_own_name(&name)?),
+            Request::Rename { device, nickname } => out(self.set_nickname(&device, &nickname)?),
             Request::Log { device, library, lines } => {
                 let text = activity::read(&self.cfg.dir, device.as_deref(), library.as_deref(), lines.min(2000));
                 out(if text.is_empty() { "(nothing logged yet)".to_string() } else { text })
@@ -1954,7 +2046,7 @@ pub async fn run_daemon(cfg: Config, keys: Keys) -> Result<()> {
     let state = State::load(&cfg.state_file())?;
     let port = cfg.server.port;
     let node = Arc::new(Node {
-        name: cfg.device_name(),
+        name: Mutex::new(cfg.device_name()),
         cfg,
         keys,
         depots: Mutex::new(HashMap::new()),
@@ -2495,7 +2587,7 @@ async fn pair_inviter(
     let bytes = recv_bytes(stream, transport).await?;
     let hello: PairHello = postcard::from_bytes(&bytes)?;
     let name = clean_name(&hello.name);
-    net::send_message(stream, transport, &postcard::to_allocvec(&PairInfo { name: node.name.clone() })?).await?;
+    net::send_message(stream, transport, &postcard::to_allocvec(&PairInfo { name: node.my_name() })?).await?;
 
     // Ask the person at this device, while the other device asks its person.
     let (decide, answer) = oneshot::channel();
@@ -2538,7 +2630,7 @@ async fn pair_inviter(
         (local.unwrap_or(false), theirs.unwrap_or(false))
     };
     if !(local_ok && remote_ok) {
-        let no = PairAccept { ok: false, psk: Vec::new(), name: node.name.clone() };
+        let no = PairAccept { ok: false, psk: Vec::new(), name: node.my_name() };
         let _ = net::send_message(stream, transport, &postcard::to_allocvec(&no)?).await;
         if !local_ok {
             bail!("pairing cancelled");
@@ -2549,10 +2641,12 @@ async fn pair_inviter(
     let psk = random_bytes(32);
     {
         let mut st = node.state.lock().unwrap();
+        let nickname = st.device(remote_hex).map(|d| d.nickname.clone()).unwrap_or_default();
         st.devices.retain(|d| d.key != remote_hex);
         st.devices.push(Device {
             key: remote_hex.to_string(),
             name: name.clone(),
+            nickname,
             psk: net::hex(&psk),
             host: None,
             port: None,
@@ -2560,7 +2654,7 @@ async fn pair_inviter(
         });
     }
     node.save_state();
-    let reply = PairAccept { ok: true, psk, name: node.name.clone() };
+    let reply = PairAccept { ok: true, psk, name: node.my_name() };
     net::send_message(stream, transport, &postcard::to_allocvec(&reply)?).await?;
     info!(device = %name, "paired ({})", short(remote_hex));
     node.request_resync();
@@ -2586,7 +2680,7 @@ async fn dial_loop(node: Arc<Node>, key: String) {
         match TcpStream::connect(&addr).await {
             Ok(stream) => {
                 backoff = 1;
-                let dev_name = dev.name.clone();
+                let dev_name = dev.display_name().to_string();
                 if let Err(e) = run_outbound(node.clone(), stream, dev).await {
                     warn!(device = %dev_name, "connection to {} ended: {:#}", addr, e);
                 }
@@ -2655,25 +2749,29 @@ async fn establish(
     mut transport: snow::TransportState,
     dev: Device,
 ) -> Result<()> {
-    let hello = Msg::Hello { name: node.name.clone() };
+    let hello = Msg::Hello { name: node.my_name() };
     net::send_message(&mut stream, &mut transport, &postcard::to_allocvec(&hello)?).await?;
     let first: Msg = postcard::from_bytes(&recv_bytes(&mut stream, &mut transport).await?)?;
-    if !matches!(first, Msg::Hello { .. }) {
+    let Msg::Hello { name: announced } = first else {
         bail!("unexpected first message");
-    }
+    };
+    // The other side is a paired device (its identity was proven by the handshake); take over
+    // the name its owner currently gives it.
+    node.note_announced_name(&dev.key, &announced);
+    let dev = node.state.lock().unwrap().device(&dev.key).cloned().unwrap_or(dev);
 
     let (rd, wr) = stream.into_split();
     let (tx, out_rx) = mpsc::channel::<Msg>(OUT_QUEUE);
     let (jobs_tx, jobs_rx) = mpsc::unbounded_channel::<DepotJob>();
     let cancel = CancellationToken::new();
     let id = node.register(&dev.key, tx.clone(), jobs_tx.clone(), cancel.clone());
-    info!(device = %dev.name, "connected");
+    info!(device = %dev.display_name(), "connected");
     node.touch_seen(&dev.key);
 
     let result = session_loop(&node, &dev, transport, rd, wr, tx, out_rx, jobs_tx, jobs_rx, cancel.clone()).await;
     node.unregister(&dev.key, id);
     cancel.cancel();
-    info!(device = %dev.name, "disconnected");
+    info!(device = %dev.display_name(), "disconnected");
     node.touch_seen(&dev.key);
     result
 }
@@ -2727,7 +2825,7 @@ async fn session_loop(
     {
         let node = node.clone();
         let origin = dev.key.clone();
-        let origin_name = dev.name.clone();
+        let origin_name = dev.display_name().to_string();
         let handle = handle.clone();
         let queued = queued.clone();
         let traffic = traffic.clone();
@@ -2862,7 +2960,7 @@ async fn session_loop(
                         if node.is_peer(&lib, &dev.key) {
                             let cost = bytes.len().max(256);
                             if queued.load(Ordering::Relaxed) + cost > MAX_QUEUED_APPLY {
-                                warn!(device = %dev.name, "sending faster than we can apply; skipped an update (it is re-sent at the next full scan)");
+                                warn!(device = %dev.display_name(), "sending faster than we can apply; skipped an update (it is re-sent at the next full scan)");
                             } else {
                                 // How much of this we do not have yet (for the progress shown).
                                 let (files, size) = match node.lib_rt(&lib) {
@@ -3257,6 +3355,31 @@ async fn depot_push(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn names_are_cleaned_and_nicknames_win() {
+        assert_eq!(clean_text("  lap\u{202e}top\u{0}\n "), "laptop");
+        assert_eq!(clean_text(&"x".repeat(200)).chars().count(), 64);
+        assert_eq!(clean_text("   "), "");
+        assert_eq!(clean_name("   "), "unnamed");
+        let mut d = Device {
+            key: "ab".repeat(32),
+            name: "laptop".to_string(),
+            nickname: String::new(),
+            psk: String::new(),
+            host: None,
+            port: None,
+            last_seen: 0,
+        };
+        assert_eq!(d.display_name(), "laptop");
+        d.nickname = "Mum's laptop".to_string();
+        assert_eq!(d.display_name(), "Mum's laptop");
+        let st = State { devices: vec![d.clone()], ..State::default() };
+        assert_eq!(st.device_name(&d.key), "Mum's laptop");
+        // old state files have no nickname
+        let old: Device = serde_json::from_str(r#"{"key":"k","name":"n","psk":"p"}"#).unwrap();
+        assert_eq!(old.display_name(), "n");
+    }
 
     /// How postcard writes a number: 7 bits at a time, low bits first.
     fn varint(mut n: u64) -> Vec<u8> {
