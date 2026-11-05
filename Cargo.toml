@@ -28,7 +28,7 @@ rqrr = { version = "0.8", optional = true }
 clap = { version = "4", features = ["derive"] }
 futures-util = "0.3"
 libc = "0.2"
-notify = "6"
+notify = "8"
 # draws pairing codes as QR codes (the terminal and the window)
 qrcode = { version = "0.14", default-features = false }
 rand = "0.8"
