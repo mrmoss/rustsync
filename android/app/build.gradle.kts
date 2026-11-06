@@ -17,9 +17,14 @@ android {
         applicationId = "app.rustsync"
         minSdk = 26
         targetSdk = 35
-        // CI passes the run number and the version from Cargo.toml; a local build uses these.
-        versionCode = System.getenv("GITHUB_RUN_NUMBER")?.toIntOrNull() ?: 1
-        versionName = (project.findProperty("appVersion") as String?) ?: "0.1.0"
+        // CI passes the version from Cargo.toml; a local build uses 0.1.0. The version code (what
+        // Android compares to decide "newer") comes from that version, so it only ever goes up
+        // when the version does: 0.12.2 becomes 12002, 1.2.3 becomes 1002003. (A CI run counter
+        // would not do: the push builds and the release builds count separately.)
+        val appVersion = (project.findProperty("appVersion") as String?) ?: "0.1.0"
+        val parts = appVersion.split(".", "-", "+").mapNotNull { it.toIntOrNull() }
+        versionCode = (parts.getOrElse(0) { 0 } * 1_000_000 + parts.getOrElse(1) { 1 } * 1_000 + parts.getOrElse(2) { 0 }).coerceAtLeast(1)
+        versionName = appVersion
     }
 
     signingConfigs {

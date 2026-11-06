@@ -535,9 +535,16 @@ allow installing from that source.
 
 - **Signing key.** Without one, each build is signed with a throw-away key, so a new build can only
   be installed after uninstalling the old one, which **deletes the phone's rustsync identity and
-  pairings**. To avoid that, make a key once with `just android-keystore` and add the four
-  repository secrets it prints (`ANDROID_KEYSTORE_BASE64`, `ANDROID_KEYSTORE_PASSWORD`,
-  `ANDROID_KEY_ALIAS`, `ANDROID_KEY_PASSWORD`). Keep the `rustsync.jks` file safe; it is not in git.
+  pairings**. To avoid that, make a key once with `just android-keystore` (or run
+  `keytool -genkeypair -v -keystore rustsync.jks -alias rustsync -keyalg RSA -keysize 4096 -validity 10000`)
+  and add the four repository secrets (Settings > Secrets and variables > Actions):
+  `ANDROID_KEYSTORE_BASE64` (the output of `base64 < rustsync.jks | tr -d '\n'`),
+  `ANDROID_KEYSTORE_PASSWORD`, `ANDROID_KEY_ALIAS` (`rustsync`) and `ANDROID_KEY_PASSWORD`.
+  Keep the `rustsync.jks` file safe (and a copy somewhere else: lose it and the next update needs an
+  uninstall again); it is not in git. Builds that don't have the key show a warning on the run.
+  Phones that have a build signed with a throw-away key need one last uninstall before the first
+  properly signed build; after that, updates just install over the old version, keeping everything.
+  The app's version code follows the version in `Cargo.toml`, so each new version counts as newer.
 - **Folders.** To sync folders like Documents or Pictures the app needs Android's "all files
   access" (the app asks when you first open it, and the *Home* page has a button if you said
   no). It also asks for notifications and for the camera (to scan pairing codes). Libraries are then

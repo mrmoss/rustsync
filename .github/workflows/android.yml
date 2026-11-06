@@ -65,7 +65,7 @@ jobs:
             echo "$KEYSTORE_B64" | base64 -d > "$RUNNER_TEMP/rustsync.jks"
             echo "ANDROID_KEYSTORE_FILE=$RUNNER_TEMP/rustsync.jks" >> "$GITHUB_ENV"
           else
-            echo "No signing key set: the APK gets a throw-away key (see the README)."
+            echo "::warning title=Android signing key missing::This APK is signed with a throw-away key, so the phone will only accept it after uninstalling the old app (which deletes its pairings). Add the four ANDROID_* repository secrets once (README: Android > Signing key) and updates will install over the old version."
           fi
 
       - name: Build the APK
