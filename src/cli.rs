@@ -429,6 +429,7 @@ async fn spawn_daemon(config_path: &Path, cfg: &Config) -> Result<()> {
 }
 
 /// Stop a daemon that was started by hand, so a service can take over its socket.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 async fn stop_running(config_path: &Path, cfg: &Config) {
     if UnixStream::connect(cfg.socket_path()).await.is_ok() {
         let ctl = Ctl { sock: cfg.socket_path(), config: config_path.to_path_buf() };
@@ -439,6 +440,7 @@ async fn stop_running(config_path: &Path, cfg: &Config) {
 
 /// The program a service entry will run, as written in the entry itself: the first quoted or
 /// `<string>` word after the marker.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn entry_program(text: &str, after: &str, open: &str, close: &str) -> Option<String> {
     let rest = &text[text.find(after)? + after.len()..];
     let rest = &rest[rest.find(open)? + open.len()..];

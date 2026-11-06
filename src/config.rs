@@ -446,7 +446,20 @@ pub fn set_name(path: &Path, name: Option<&str>) -> Result<()> {
     let mut doc: toml_edit::DocumentMut = text.parse().with_context(|| format!("invalid config {}", path.display()))?;
     match name {
         Some(n) => {
-            doc.as_table_mut().insert("name", toml_edit::value(n));
+            // Replace the value in place so the comments around the line stay.
+            let table = doc.as_table_mut();
+            match table.get_mut("name") {
+                Some(item) => {
+                    let mut v = toml_edit::Value::from(n);
+                    if let Some(old) = item.as_value() {
+                        *v.decor_mut() = old.decor().clone();
+                    }
+                    *item = toml_edit::Item::Value(v);
+                }
+                None => {
+                    table.insert("name", toml_edit::value(n));
+                }
+            }
         }
         None => {
             doc.as_table_mut().remove("name");
@@ -674,16 +687,26 @@ mod tests {
         set_port(&path, 4000).unwrap();
         set_log_size(&path, 5_000_000).unwrap();
         set_name(&path, Some("laptop \"main\"")).unwrap();
-        assert_eq!(load(&path).unwrap().name.as_deref(), Some("laptop \"main\""));
-        set_name(&path, None).unwrap();
-        assert_eq!(load(&path).unwrap().name, None);
-        set_name(&path, Some("a")).unwrap();
         let text = std::fs::read_to_string(&path).unwrap();
         assert!(text.contains("# keep me"));
+        assert_eq!(load(&path).unwrap().name.as_deref(), Some("laptop \"main\""));
         let cfg = load(&path).unwrap();
         assert_eq!(cfg.server.port, 4000);
         assert_eq!(cfg.logging.max_size, "5MB");
-        assert_eq!(cfg.name.as_deref(), Some("a"));
+        // removing the name goes back to the host name; a name can be added again
+        set_name(&path, None).unwrap();
+        assert_eq!(load(&path).unwrap().name, None);
+        assert_eq!(load(&path).unwrap().server.port, 4000);
+        set_name(&path, Some("a")).unwrap();
+        assert_eq!(load(&path).unwrap().name.as_deref(), Some("a"));
+        // a name with a trailing comment keeps it
+        std::fs::write(&path, "name = \"x\" # shown to others\n").unwrap();
+        set_name(&path, Some("y")).unwrap();
+        assert!(std::fs::read_to_string(&path).unwrap().contains("# shown to others"));
+        std::fs::write(&path, "[server]\nport = 1\n").unwrap();
+        set_name(&path, Some("z")).unwrap();
+        assert_eq!(load(&path).unwrap().name.as_deref(), Some("z"));
+        std::fs::write(&path, "[server]\nport = 1\n").unwrap();
         // inline tables work too
         std::fs::write(&path, "server = { port = 1 }\n").unwrap();
         set_port(&path, 5000).unwrap();

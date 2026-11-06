@@ -1,6 +1,6 @@
 [package]
 name = "rustsync"
-version = "0.12.1"
+version = "0.12.0"
 edition = "2021"
 # The service and command line build with this (the Noise library, snow 0.10, needs 1.85); the window (eframe) needs a recent Rust, 1.95 or newer.
 rust-version = "1.85"
