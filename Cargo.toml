@@ -39,7 +39,7 @@ postcard = { version = "1", default-features = false, features = ["use-std"] }
 snow = "0.10"
 tokio = { version = "1", features = ["full"] }
 # the config file (toml_edit changes one setting and keeps the comments)
-toml = "0.8"
+toml = "1.2"
 toml_edit = "0.22"
 tokio-util = "0.7"
 tracing = "0.1"
