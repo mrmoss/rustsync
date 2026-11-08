@@ -52,7 +52,7 @@ nokhwa = { version = "0.10", default-features = false, features = ["input-native
 
 # The Android app calls into the library through JNI.
 [target.'cfg(target_os = "android")'.dependencies]
-jni = "0.21"
+jni = "0.22"
 
 # system tray icon for rustsync-gui: StatusNotifierItem over D-Bus (pure Rust, no GTK). Linux and
 # the BSDs (any desktop with a D-Bus session and a tray host).
