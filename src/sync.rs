@@ -16,19 +16,19 @@ use crate::config::{self, Config};
 use crate::depot::Depot;
 use crate::index::{self, Entry, Folder, CHUNK};
 use crate::net::{self, Keys, Reassembler};
-use crate::proto::{fmt_size, BackupUsage, DeviceInfo, LibraryInfo, OfferInfo, Reply, Request, StatusInfo, SyncInfo};
+use crate::proto::{fmt_size, BackupUsage, DeviceInfo, LibraryInfo, OfferInfo, Reply, Request, StatusInfo, SyncInfo, TailnetInfo};
+use crate::tailnet;
 use crate::state::{Device, LibMode, Library, Member, Offer, Role, State};
 use crate::traffic::Traffic;
 use crate::vault::{self, Vault};
 use anyhow::{anyhow, bail, Context, Result};
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
-use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::io::SeekFrom;
 use std::path::{Path, PathBuf};
 use std::net::IpAddr;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncSeekExt, AsyncWriteExt, BufReader};
@@ -44,6 +44,8 @@ const MAX_BATCH_BYTES: usize = 4 * 1024 * 1024; // ... or roughly this many byte
 const MAX_RECV_ENTRIES: usize = 5_000; // entries per index message we accept
 const MAX_INDEX_MSG: usize = 16 * 1024 * 1024; // bytes per index message we accept
 const MAX_MEMBERSHIP: usize = 1_000; // items in a library list
+/// Most records one backup list may hold when read in full (a safety stop, far above real use).
+const MAX_DEPOT_RECORDS: usize = 20_000_000;
 const MAX_OFFERS: usize = 256; // offers waiting for `accept`
 const MAX_BACKUP_LIBRARIES: usize = 10_000; // libraries we keep encrypted backups of
 const PRUNE_MIN_AGE_SECS: u64 = 7 * 24 * 3600; // only chunks this old are ever deleted
@@ -56,8 +58,15 @@ const MAX_SERVE: usize = 16; // requests from one device answered at the same ti
 const WRITE_TIMEOUT: Duration = Duration::from_secs(60); // a device that stops reading is dropped
 const MAX_HANDSHAKES: usize = 32; // connections that have not proven who they are yet
 const MAX_HANDSHAKES_PER_IP: u32 = 4;
+/// An IPv6 network (/64) hands out as many addresses as its owner likes, and the devices of one
+/// home share one, so it counts as a single source with a somewhat higher limit.
+const MAX_HANDSHAKES_PER_NET6: u32 = 8;
 /// Too many failed handshakes from one address in a short time: ignore it for a while.
 const HANDSHAKE_FAILS_MAX: u32 = 8;
+/// How long what Tailscale said is reused before it is asked again.
+const TAILNET_TTL: Duration = Duration::from_secs(15);
+/// The smallest time between two "check which machines answer" runs.
+const TAILNET_PROBE_GAP: Duration = Duration::from_secs(5);
 const HANDSHAKE_FAIL_WINDOW: Duration = Duration::from_secs(60);
 const HANDSHAKE_BAN: Duration = Duration::from_secs(120);
 /// Hard cap on how many addresses are tracked (memory stays bounded however many sources there are).
@@ -98,7 +107,8 @@ pub enum Msg {
     Ping,
     DepotPut { req: u64, kind: u8, lib: String, id: String, stamp: u64, data: Vec<u8> },
     DepotGet { req: u64, kind: u8, lib: String, id: String },
-    DepotList { req: u64, lib: String },
+    /// -> (slot, stamp) of the records after slot `after`, in order, one page (empty = the end).
+    DepotList { req: u64, lib: String, after: String },
     DepotHave { req: u64, lib: String, ids: Vec<String> },
     /// -> (bytes used, size limit)
     DepotStat { req: u64, lib: String },
@@ -117,7 +127,7 @@ impl Msg {
         match self {
             Msg::DepotPut { req, lib, .. }
             | Msg::DepotGet { req, lib, .. }
-            | Msg::DepotList { req, lib }
+            | Msg::DepotList { req, lib, .. }
             | Msg::DepotHave { req, lib, .. }
             | Msg::DepotStat { req, lib }
             | Msg::DepotBlobs { req, lib, .. }
@@ -128,9 +138,11 @@ impl Msg {
 }
 
 // Pairing, after the handshake that proves both sides know the one-time code:
-//   joiner  -> inviter   PairHello    its device name
-//   inviter -> joiner    PairInfo     its device name
-//   both screens show the same verification code; each person compares and decides
+//   joiner  -> inviter   PairHello    its device name, and a commitment to a random value
+//   inviter -> joiner    PairInfo     its device name, and a random value of its own
+//   joiner  -> inviter   PairReveal   the value it committed to (the inviter checks it)
+//   both screens show the same verification code, made from the secret, both public keys and
+//   both random values; each person compares and decides
 //   joiner  -> inviter   PairConfirm  what the person at the joiner decided
 //   inviter -> joiner    PairAccept   only if both said yes: the secret for this pair
 
@@ -138,11 +150,20 @@ impl Msg {
 #[derive(Serialize, Deserialize)]
 struct PairHello {
     name: String,
+    /// `nonce_commitment` of the joiner's random value. The joiner has to fix its value before it
+    /// sees the inviter's, so it cannot try keys until the two 8-digit codes happen to match.
+    commit: [u8; 32],
 }
 
 #[derive(Serialize, Deserialize)]
 struct PairInfo {
     name: String,
+    nonce: [u8; 32],
+}
+
+#[derive(Serialize, Deserialize)]
+struct PairReveal {
+    nonce: [u8; 32],
 }
 
 #[derive(Serialize, Deserialize)]
@@ -162,6 +183,9 @@ struct PairAccept {
 /// What a person is asked to compare and approve while pairing.
 pub struct PairPrompt {
     pub name: String,
+    /// What Tailscale says about the connection (empty if the integration is off or it knows
+    /// nothing): only a hint for the person.
+    pub source: String,
     pub fingerprint: String,
     pub code: String,
     pub decide: oneshot::Sender<bool>,
@@ -176,18 +200,33 @@ enum InviteEvent {
 
 /// A short code derived from the one-time secret and both public keys. Both devices compute it
 /// on their own; it matches only when they agree on who is pairing.
-fn pairing_code(secret: &[u8], joiner: &[u8], inviter: &[u8]) -> String {
-    let mut h = blake3::Hasher::new_derive_key("rustsync pairing code v1");
+fn pairing_code(secret: &[u8], joiner: &[u8], inviter: &[u8], joiner_nonce: &[u8; 32], inviter_nonce: &[u8; 32]) -> String {
+    let mut h = blake3::Hasher::new_derive_key("rustsync pairing code v2");
     h.update(&(secret.len() as u64).to_le_bytes());
     h.update(secret);
     h.update(&(joiner.len() as u64).to_le_bytes());
     h.update(joiner);
     h.update(&(inviter.len() as u64).to_le_bytes());
     h.update(inviter);
+    h.update(joiner_nonce);
+    h.update(inviter_nonce);
     let mut out = [0u8; 8];
     h.finalize_xof().fill(&mut out);
     let n = u64::from_le_bytes(out) % 100_000_000;
     format!("{:04} {:04}", n / 10_000, n % 10_000)
+}
+
+/// What the joiner sends first: a commitment to its random value, revealed later.
+fn nonce_commitment(nonce: &[u8; 32]) -> [u8; 32] {
+    let mut h = blake3::Hasher::new_derive_key("rustsync pairing commitment v1");
+    h.update(nonce);
+    *h.finalize().as_bytes()
+}
+
+fn random_nonce() -> [u8; 32] {
+    let mut n = [0u8; 32];
+    n.copy_from_slice(&random_bytes(32));
+    n
 }
 
 /// A readable fingerprint of a public key, e.g. "ab12 cd34 ef56 7890 1234".
@@ -323,6 +362,31 @@ impl SessionHandle {
 
 impl Node {
     /// Is this address being ignored after repeated failed handshakes?
+    /// All handshake slots are taken. If one source holds more of them than the newcomer's source
+    /// does, drop its oldest unfinished handshake and say true, so a few addresses cannot keep
+    /// everyone else out just by connecting and waiting.
+    fn make_room(&self, newcomer: IpAddr) -> bool {
+        let pending = self.pending.lock().unwrap();
+        let mut counts: HashMap<IpAddr, usize> = HashMap::new();
+        for p in pending.iter() {
+            *counts.entry(p.slot).or_insert(0) += 1;
+        }
+        let mine = counts.get(&newcomer).copied().unwrap_or(0);
+        let Some((&busiest, &n)) = counts.iter().max_by_key(|(_, n)| **n) else {
+            return false;
+        };
+        if n < 2 || n <= mine {
+            return false;
+        }
+        match pending.iter().filter(|p| p.slot == busiest).min_by_key(|p| p.since) {
+            Some(victim) => {
+                victim.cancel.cancel();
+                true
+            }
+            None => false,
+        }
+    }
+
     fn handshake_banned(&self, ip: IpAddr) -> bool {
         if ip.is_loopback() {
             return false;
@@ -370,17 +434,47 @@ impl Node {
     }
 }
 
+/// Which source a connection counts against: its address, or for IPv6 its /64 network.
+fn slot_key(ip: IpAddr) -> IpAddr {
+    match ip {
+        IpAddr::V4(_) => ip,
+        IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
+            Some(v4) => IpAddr::V4(v4),
+            None => {
+                let mut o = v6.octets();
+                o[8..].fill(0);
+                IpAddr::V6(o.into())
+            }
+        },
+    }
+}
+
+fn slot_limit(slot: IpAddr) -> u32 {
+    if slot.is_ipv6() {
+        MAX_HANDSHAKES_PER_NET6
+    } else {
+        MAX_HANDSHAKES_PER_IP
+    }
+}
+
 /// A connection that has not proven who it is yet. Counts against the limits until dropped.
 struct PreAuth {
     node: Arc<Node>,
+    /// The caller's address (failed handshakes are counted per address).
     ip: IpAddr,
+    /// The source it counts against (see `slot_key`).
+    slot: IpAddr,
+    id: u64,
+    /// Cancelled to make room for another caller while the handshake is still running.
+    cancel: CancellationToken,
     _permit: OwnedSemaphorePermit,
 }
 
 impl Drop for PreAuth {
     fn drop(&mut self) {
+        self.node.pending.lock().unwrap().retain(|p| p.id != self.id);
         let mut m = self.node.ip_conns.lock().unwrap();
-        let remove = match m.get_mut(&self.ip) {
+        let remove = match m.get_mut(&self.slot) {
             Some(c) => {
                 *c = c.saturating_sub(1);
                 *c == 0
@@ -388,9 +482,17 @@ impl Drop for PreAuth {
             None => false,
         };
         if remove {
-            m.remove(&self.ip);
+            m.remove(&self.slot);
         }
     }
+}
+
+/// An entry in `Node.pending`: a connection still in its handshake.
+struct PendingConn {
+    id: u64,
+    slot: IpAddr,
+    since: Instant,
+    cancel: CancellationToken,
 }
 
 /// A running library: its folder, vault and background tasks.
@@ -429,6 +531,9 @@ pub struct Node {
     dialers: Mutex<HashSet<String>>,
     handshakes: Arc<Semaphore>,
     ip_conns: Mutex<HashMap<IpAddr, u32>>,
+    /// Connections still in their handshake, oldest first.
+    pending: Mutex<Vec<PendingConn>>,
+    next_pending: AtomicU64,
     /// Failed handshakes per address: (count in the current window, window start, ignored until).
     ip_fails: Mutex<HashMap<IpAddr, (u32, Instant, Option<Instant>)>>,
     /// (backup device, library) pairs that already have an upload job waiting.
@@ -438,7 +543,19 @@ pub struct Node {
     port: std::sync::atomic::AtomicU16,
     /// Stops the accept loop of the current listener when it is replaced.
     listener_stop: Mutex<CancellationToken>,
+    /// Is the optional Tailscale integration on? (The only thing kept about it: the setting.)
+    tailscale_on: AtomicBool,
+    /// What Tailscale last said; only in memory, and only while the integration is on.
+    tailnet: Mutex<TailnetCache>,
     pub shutdown: CancellationToken,
+}
+
+#[derive(Default)]
+struct TailnetCache {
+    info: Option<TailnetInfo>,
+    at: Option<Instant>,
+    probed: Option<Instant>,
+    refreshing: bool,
 }
 
 fn entry_cost(e: &Entry) -> usize {
@@ -514,7 +631,9 @@ fn clean_name(s: &str) -> String {
 
 fn random_bytes(n: usize) -> Vec<u8> {
     let mut v = vec![0u8; n];
-    rand::rngs::OsRng.fill_bytes(&mut v);
+    for b in v.iter_mut() {
+        *b = rand::random();
+    }
     v
 }
 
@@ -841,6 +960,9 @@ impl Node {
                         }
                         let name = format!("backup-{}", &o.id[..8]);
                         announce.push((from_name.clone(), name.clone()));
+                        if st.offers.iter().any(|x| x.id == o.id && x.from != from) {
+                            warn!(device = %from_name, "offers a backup with the same library id as another waiting offer; check which one you accept");
+                        }
                         st.offers.push(Offer {
                             from: from.to_string(),
                             id: o.id,
@@ -866,6 +988,9 @@ impl Node {
                         }
                         let name = clean_name(&o.name);
                         announce.push((from_name.clone(), name.clone()));
+                        if st.offers.iter().any(|x| x.id == o.id && x.from != from) {
+                            warn!(device = %from_name, library = %name, "offers a library with the same id as another waiting offer; check which one you accept");
+                        }
                         st.offers.push(Offer {
                             from: from.to_string(),
                             id: o.id,
@@ -1256,14 +1381,43 @@ impl Node {
         })
     }
 
-    pub async fn accept_offer(self: &Arc<Self>, offer_id: &str, folder: &str, quota: u64) -> Result<String> {
-        let offer = {
-            let st = self.state.lock().unwrap();
-            st.offers.iter().find(|o| o.id == offer_id).cloned()
+    /// A library was accepted: the offers for the same id are done with. Offers from *other*
+    /// devices are removed too (there can only be one library with an id here), and the person is
+    /// told, so a second offer is never dropped silently.
+    fn drop_other_offers(&self, id: &str, accepted_from: &str) {
+        let others: Vec<String> = {
+            let mut st = self.state.lock().unwrap();
+            let names: Vec<String> = st
+                .offers
+                .iter()
+                .filter(|o| o.id == id && o.from != accepted_from)
+                .map(|o| st.device_name(&o.from))
+                .collect();
+            st.offers.retain(|o| o.id != id);
+            names
         };
-        let Some(offer) = offer else {
+        for who in others {
+            warn!(device = %who, "also offered a library with the same id as the one you accepted; that offer was dropped (if you did not expect it, check which device you meant)");
+        }
+    }
+
+    /// The waiting offer with this library id from this device. A library id is not a secret
+    /// (every device that syncs or backs the library up knows it), so the sender is part of the
+    /// identity of an offer; without a sender only an unambiguous id is accepted.
+    fn find_offer(&self, offer_id: &str, from: &str) -> Result<Offer> {
+        let st = self.state.lock().unwrap();
+        let mut hits = st.offers.iter().filter(|o| o.id == offer_id && (from.is_empty() || o.from == from));
+        let Some(first) = hits.next() else {
             bail!("no such offer (it may have been withdrawn)");
         };
+        if hits.next().is_some() {
+            bail!("several devices offer a library with that id; say which device's offer you mean");
+        }
+        Ok(first.clone())
+    }
+
+    pub async fn accept_offer(self: &Arc<Self>, offer_id: &str, from: &str, folder: &str, quota: u64) -> Result<String> {
+        let offer = self.find_offer(offer_id, from)?;
         let have_backup = self
             .state
             .lock()
@@ -1310,11 +1464,8 @@ impl Node {
                 excluded: Vec::new(),
             };
             self.start_backup(&lib, true)?;
-            {
-                let mut st = self.state.lock().unwrap();
-                st.offers.retain(|o| o.id != lib.id);
-                st.libraries.push(lib.clone());
-            }
+            self.drop_other_offers(&lib.id, &offer.from);
+            self.state.lock().unwrap().libraries.push(lib.clone());
             self.save_state();
             self.notify_libraries(Some(&offer.from));
             return Ok(format!(
@@ -1337,11 +1488,8 @@ impl Node {
             excluded: Vec::new(),
         };
         self.start_library(&lib).await?;
-        {
-            let mut st = self.state.lock().unwrap();
-            st.offers.retain(|o| o.id != lib.id);
-            st.libraries.push(lib.clone());
-        }
+        self.drop_other_offers(&lib.id, &offer.from);
+        self.state.lock().unwrap().libraries.push(lib.clone());
         self.save_state();
         self.notify_libraries(Some(&offer.from));
         self.push_index(&offer.from, &lib.id);
@@ -1470,10 +1618,11 @@ impl Node {
         ))
     }
 
-    pub fn decline_offer(&self, offer_id: &str) -> Result<String> {
+    pub fn decline_offer(&self, offer_id: &str, from: &str) -> Result<String> {
+        let wanted = self.find_offer(offer_id, from)?;
         let name = {
             let mut st = self.state.lock().unwrap();
-            let Some(pos) = st.offers.iter().position(|o| o.id == offer_id) else {
+            let Some(pos) = st.offers.iter().position(|o| o.id == wanted.id && o.from == wanted.from) else {
                 bail!("no such offer");
             };
             st.offers.remove(pos).name
@@ -1534,7 +1683,8 @@ impl Node {
         }
     }
 
-    pub fn status(&self) -> StatusInfo {
+    pub fn status(self: &Arc<Self>) -> StatusInfo {
+        let tailnet = self.tailnet_view();
         let online: HashSet<String> = self.sessions.lock().unwrap().keys().cloned().collect();
         let traffic: HashMap<String, Arc<Traffic>> = self.traffic.lock().unwrap().clone();
         let st = self.state.lock().unwrap();
@@ -1632,19 +1782,136 @@ impl Node {
                 again: o.backup && st.libraries.iter().any(|l| l.id == o.id),
             })
             .collect();
+        let mut addresses = config::local_addresses();
+        let mut dns_names = config::dns_names();
+        if let Some(t) = tailnet.as_ref().filter(|t| t.problem.is_empty()) {
+            // Offered as choices when inviting. Nothing of this is stored.
+            if let Some(ip) = t.self_ips.iter().find(|i| i.parse::<std::net::Ipv4Addr>().is_ok()) {
+                if !addresses.iter().any(|(a, _)| a == ip) {
+                    addresses.push((ip.clone(), "Tailscale".to_string()));
+                }
+            }
+            if !t.self_dns.is_empty() && !dns_names.contains(&t.self_dns) {
+                dns_names.push(t.self_dns.clone());
+            }
+        }
         StatusInfo {
             name: self.my_name(),
             key: net::hex(&self.keys.public),
             listen: format!("{}:{}", self.cfg.server.host, self.port()),
             port: self.port(),
-            addresses: config::local_addresses(),
-            dns_names: config::dns_names(),
+            addresses,
+            dns_names,
+            tailnet,
             log_max: activity::max(),
             log_file: self.cfg.dir.join(activity::FILE).to_string_lossy().to_string(),
             backup_dir: self.cfg.backup_dir_path().to_string_lossy().to_string(),
             devices,
             libraries,
             offers,
+        }
+    }
+
+    // ------------------------------------------------------------ tailscale (optional)
+
+    /// Switch the integration on or off. Off means: `tailscale` is never run, nothing of it is
+    /// shown, and nothing is kept (devices paired by a tailnet host name or address simply keep
+    /// that host name or address).
+    pub fn set_tailscale(&self, enabled: bool) -> Result<String> {
+        config::set_tailscale(&self.cfg.path, enabled).context("cannot save the setting in the config file")?;
+        self.tailscale_on.store(enabled, Ordering::Relaxed);
+        *self.tailnet.lock().unwrap() = TailnetCache::default();
+        Ok(if enabled {
+            "The Tailscale integration is on. The machines of your tailnet are listed, and the tailnet address of this machine is offered when you invite. Devices are paired as before: with a code you approve on both sides.".to_string()
+        } else {
+            "The Tailscale integration is off: rustsync no longer runs tailscale and shows nothing from it. Devices you paired through a tailnet host name or address keep working like any other host name or address.".to_string()
+        })
+    }
+
+    /// What to show of the tailnet: None while the integration is off. The answer is the last
+    /// one Tailscale gave (asked again in the background when it is old).
+    fn tailnet_view(self: &Arc<Self>) -> Option<TailnetInfo> {
+        if !self.tailscale_on.load(Ordering::Relaxed) {
+            return None;
+        }
+        let (snap, stale) = {
+            let mut c = self.tailnet.lock().unwrap();
+            let stale = !c.refreshing && c.at.map_or(true, |t| t.elapsed() > TAILNET_TTL);
+            if stale {
+                c.refreshing = true;
+            }
+            (c.info.clone(), stale)
+        };
+        if stale {
+            let node = self.clone();
+            tokio::spawn(async move {
+                node.refresh_tailnet(false).await;
+            });
+        }
+        let mut info = snap.unwrap_or_else(|| TailnetInfo {
+            enabled: true,
+            problem: "asking Tailscale...".to_string(),
+            ..TailnetInfo::default()
+        });
+        let devices: Vec<(String, String)> = {
+            let st = self.state.lock().unwrap();
+            st.devices
+                .iter()
+                .filter_map(|d| d.host.clone().map(|h| (d.display_name().to_string(), h)))
+                .collect()
+        };
+        tailnet::mark_paired(&mut info, &devices);
+        Some(info)
+    }
+
+    /// Ask Tailscale and keep the answer in memory. With `probe`, also check which online
+    /// machines accept a connection on our port.
+    async fn refresh_tailnet(self: &Arc<Self>, probe: bool) {
+        let mut info = tailnet::fetch(&self.cfg.tailscale.command).await;
+        let previous = self.tailnet.lock().unwrap().info.clone();
+        if probe && info.problem.is_empty() {
+            tailnet::probe(&mut info, self.port()).await;
+        } else if let Some(old) = previous {
+            // keep what the last check found for machines that are still there
+            for p in info.peers.iter_mut() {
+                if let Some(o) = old.peers.iter().find(|o| o.name == p.name && o.ips == p.ips) {
+                    p.reachable = if p.online { o.reachable } else { None };
+                }
+            }
+        }
+        let mut c = self.tailnet.lock().unwrap();
+        c.refreshing = false;
+        if self.tailscale_on.load(Ordering::Relaxed) {
+            c.info = Some(info);
+            c.at = Some(Instant::now());
+            if probe {
+                c.probed = Some(Instant::now());
+            }
+        }
+    }
+
+    /// `Tailnet` request: ask now and check which machines answer (not more often than every few
+    /// seconds).
+    async fn tailnet_now(self: &Arc<Self>) -> Result<TailnetInfo> {
+        if !self.tailscale_on.load(Ordering::Relaxed) {
+            bail!("the Tailscale integration is off (switch it on with `rustsync tailscale on`)");
+        }
+        let recent = self.tailnet.lock().unwrap().probed.map_or(false, |t| t.elapsed() < TAILNET_PROBE_GAP);
+        if !recent {
+            self.refresh_tailnet(true).await;
+        }
+        self.tailnet_view().ok_or_else(|| anyhow!("the Tailscale integration was switched off"))
+    }
+
+    /// While someone pairs over the tailnet: who does Tailscale say they are? Empty if the
+    /// integration is off or it does not know. A hint for the person, never a reason to trust.
+    async fn tailnet_source(&self, ip: IpAddr) -> String {
+        if !self.tailscale_on.load(Ordering::Relaxed) {
+            return String::new();
+        }
+        match tailnet::whois(&self.cfg.tailscale.command, ip).await {
+            Some(who) if self.tailscale_on.load(Ordering::Relaxed) => format!("Tailscale says: {}", who),
+            _ => String::new(),
         }
     }
 
@@ -1843,25 +2110,29 @@ impl Node {
             .with_context(|| format!("cannot connect to {}", addr))?;
         stream.set_nodelay(true).ok();
         let (mut transport, remote) =
-            tokio::time::timeout(Duration::from_secs(10), net::handshake(&mut stream, &self.keys, true, &secret))
+            tokio::time::timeout(Duration::from_secs(10), net::handshake(&mut stream, &self.keys, true, &secret, Some(&key[..])))
                 .await
                 .context("handshake timed out")?
                 .context("handshake failed: is the other machine still waiting, and is the code complete and unused?")?;
         if remote != key {
             bail!("the machine at {} has a different key than the code says (wrong machine?)", addr);
         }
-        let hello = PairHello { name: self.my_name() };
+        let my_nonce = random_nonce();
+        let hello = PairHello { name: self.my_name(), commit: nonce_commitment(&my_nonce) };
         net::send_message(&mut stream, &mut transport, &postcard::to_allocvec(&hello)?).await?;
         let bytes = recv_bytes(&mut stream, &mut transport).await?;
         let info: PairInfo = postcard::from_bytes(&bytes)?;
         let inviter_name = clean_name(&info.name);
+        // Only now that the inviter's value is known do we reveal ours.
+        net::send_message(&mut stream, &mut transport, &postcard::to_allocvec(&PairReveal { nonce: my_nonce })?).await?;
 
         // Show the same code the other screen shows, and wait for the person to decide.
         let (decide, answer) = oneshot::channel();
         let ask = PairPrompt {
             name: inviter_name.clone(),
+            source: String::new(),
             fingerprint: fingerprint(&key),
-            code: pairing_code(&secret, &self.keys.public, &key),
+            code: pairing_code(&secret, &self.keys.public, &key, &my_nonce, &info.nonce),
             decide,
         };
         if prompt.send(ask).is_err() {
@@ -1950,6 +2221,8 @@ impl Node {
             Request::SetAddress { device, addr } => out(self.set_device_address(&device, &addr)?),
             Request::SetPort { port } => out(self.set_port(port).await?),
             Request::SetName { name } => out(self.set_own_name(&name)?),
+            Request::SetTailscale { enabled } => out(self.set_tailscale(enabled)?),
+            Request::Tailnet => Ok(vec![Reply::Tailnet(self.tailnet_now().await?), Reply::Done]),
             Request::Rename { device, nickname } => out(self.set_nickname(&device, &nickname)?),
             Request::Log { device, library, lines } => {
                 let text = activity::read(&self.cfg.dir, device.as_deref(), library.as_deref(), lines.min(2000));
@@ -1966,12 +2239,12 @@ impl Node {
             Request::Create { name, folder } => out(self.create_library(&name, &folder).await?),
             Request::RemoveLibrary { library } => out(self.remove_library(&library)?),
             Request::Share { library, device, backup } => out(self.share_library(&library, &device, backup)?),
-            Request::Accept { offer, folder, quota } => out(self.accept_offer(&offer, &folder, quota).await?),
+            Request::Accept { offer, from, folder, quota } => out(self.accept_offer(&offer, &from, &folder, quota).await?),
             Request::SetQuota { library, bytes } => out(self.set_quota(&library, bytes)?),
             Request::Unshare { library, device } => out(self.unshare_library(&library, &device)?),
             Request::Refresh => out(self.refresh()?),
             Request::Prune { library } => out(self.prune_library(&library)?),
-            Request::Decline { offer } => out(self.decline_offer(&offer)?),
+            Request::Decline { offer, from } => out(self.decline_offer(&offer, &from)?),
             Request::Recovery { library } => out(self.recovery_codes(library.as_deref())?),
             Request::Restore { code, folder, device } => out(self.restore_library(&code, &folder, &device).await?),
             Request::Stop => {
@@ -2045,6 +2318,7 @@ pub async fn run_daemon(cfg: Config, keys: Keys) -> Result<()> {
 
     let state = State::load(&cfg.state_file())?;
     let port = cfg.server.port;
+    let tailscale_on = cfg.tailscale.enabled;
     let node = Arc::new(Node {
         name: Mutex::new(cfg.device_name()),
         cfg,
@@ -2059,11 +2333,15 @@ pub async fn run_daemon(cfg: Config, keys: Keys) -> Result<()> {
         dialers: Mutex::new(HashSet::new()),
         handshakes: Arc::new(Semaphore::new(MAX_HANDSHAKES)),
         ip_conns: Mutex::new(HashMap::new()),
+        pending: Mutex::new(Vec::new()),
+        next_pending: AtomicU64::new(1),
         ip_fails: Mutex::new(HashMap::new()),
         depot_pending: Mutex::new(HashSet::new()),
         next_session: AtomicU64::new(1),
         port: std::sync::atomic::AtomicU16::new(port),
         listener_stop: Mutex::new(CancellationToken::new()),
+        tailscale_on: AtomicBool::new(tailscale_on),
+        tailnet: Mutex::new(TailnetCache::default()),
         shutdown: CancellationToken::new(),
     });
 
@@ -2230,6 +2508,7 @@ fn verify_reply(p: &PairPrompt, joining: bool) -> Reply {
         fingerprint: p.fingerprint.clone(),
         code: p.code.clone(),
         joining,
+        source: p.source.clone(),
     }
 }
 
@@ -2480,25 +2759,35 @@ async fn accept_loop(node: Arc<Node>, listener: TcpListener, stop: CancellationT
         };
         match accepted {
             Ok((stream, peer)) => {
-                // Limit connections that have not authenticated yet (overall and per address).
+                // Limit connections that have not authenticated yet (overall and per source).
                 let ip = peer.ip();
                 if node.handshake_banned(ip) {
                     continue; // dropped without any work
                 }
-                let Ok(permit) = node.handshakes.clone().try_acquire_owned() else {
-                    debug!("too many connections; dropping {}", peer);
+                let slot = slot_key(ip);
+                if node.ip_conns.lock().unwrap().get(&slot).copied().unwrap_or(0) >= slot_limit(slot) {
+                    debug!("too many connections from {}; dropping one", ip);
                     continue;
-                };
-                {
-                    let mut m = node.ip_conns.lock().unwrap();
-                    let c = m.entry(ip).or_insert(0);
-                    if *c >= MAX_HANDSHAKES_PER_IP {
-                        debug!("too many connections from {}; dropping one", ip);
-                        continue;
-                    }
-                    *c += 1;
                 }
-                let pre = PreAuth { node: node.clone(), ip, _permit: permit };
+                let permit = match node.handshakes.clone().try_acquire_owned() {
+                    Ok(p) => p,
+                    Err(_) => {
+                        // Full: make room if one source is hogging the slots, else turn this one away.
+                        if !node.make_room(slot) {
+                            debug!("too many connections; dropping {}", peer);
+                            continue;
+                        }
+                        match tokio::time::timeout(Duration::from_millis(200), node.handshakes.clone().acquire_owned()).await {
+                            Ok(Ok(p)) => p,
+                            _ => continue,
+                        }
+                    }
+                };
+                *node.ip_conns.lock().unwrap().entry(slot).or_insert(0) += 1;
+                let id = node.next_pending.fetch_add(1, Ordering::Relaxed);
+                let cancel = CancellationToken::new();
+                node.pending.lock().unwrap().push(PendingConn { id, slot, since: Instant::now(), cancel: cancel.clone() });
+                let pre = PreAuth { node: node.clone(), ip, slot, id, cancel, _permit: permit };
                 let node = node.clone();
                 tokio::spawn(async move {
                     if let Err(e) = handle_inbound(node, stream, pre).await {
@@ -2519,14 +2808,23 @@ async fn handle_inbound(node: Arc<Node>, mut stream: TcpStream, pre: PreAuth) ->
     let cands = node.candidates();
     let psks: Vec<Vec<u8>> = cands.iter().map(|(_, p)| p.clone()).collect();
     let ip = pre.ip;
-    let shaken = tokio::time::timeout(Duration::from_secs(10), net::handshake_responder(&mut stream, &node.keys, &psks))
-        .await
-        .context("handshake timed out")
-        .and_then(|r| r);
+    let shaken = tokio::select! {
+        _ = pre.cancel.cancelled() => bail!("dropped to make room for other callers"),
+        r = tokio::time::timeout(Duration::from_secs(10), net::handshake_responder(&mut stream, &node.keys, &psks)) => {
+            r.context("handshake timed out").and_then(|r| r)
+        }
+    };
     let (transport, remote, idx) = match shaken {
         Ok(v) => v,
         Err(e) => {
-            node.note_failed_handshake(ip);
+            // Someone who connects and hangs up (a check whether we answer, for example) tried no
+            // key: that is not counted as a failed attempt.
+            let hung_up = e.chain().any(|c| {
+                c.downcast_ref::<std::io::Error>().map_or(false, |io| io.kind() == std::io::ErrorKind::UnexpectedEof)
+            });
+            if !hung_up {
+                node.note_failed_handshake(ip);
+            }
             return Err(e);
         }
     };
@@ -2541,7 +2839,7 @@ async fn handle_inbound(node: Arc<Node>, mut stream: TcpStream, pre: PreAuth) ->
             let Some(dev) = dev else { bail!("that device was removed") };
             establish(node, stream, transport, dev).await
         }
-        Cand::Invite(secret) => serve_pairing(node, stream, transport, remote_hex, secret.clone()).await,
+        Cand::Invite(secret) => serve_pairing(node, stream, transport, remote_hex, secret.clone(), ip).await,
     }
 }
 
@@ -2554,6 +2852,7 @@ async fn serve_pairing(
     mut transport: snow::TransportState,
     remote_hex: String,
     secret: Vec<u8>,
+    peer: IpAddr,
 ) -> Result<()> {
     // One use only.
     let taken: Option<Invite> = {
@@ -2563,7 +2862,7 @@ async fn serve_pairing(
         found
     };
     let Some(invite) = taken else { bail!("this invite was already used") };
-    let res = pair_inviter(&node, &mut stream, &mut transport, &remote_hex, &secret, &invite.events).await;
+    let res = pair_inviter(&node, &mut stream, &mut transport, &remote_hex, &secret, &invite.events, peer).await;
     match &res {
         Ok(name) => {
             let _ = invite.events.send(InviteEvent::Paired(name.clone()));
@@ -2582,19 +2881,28 @@ async fn pair_inviter(
     remote_hex: &str,
     secret: &[u8],
     events: &mpsc::UnboundedSender<InviteEvent>,
+    peer: IpAddr,
 ) -> Result<String> {
     let remote = net::parse_hex32(remote_hex, "a device key")?;
     let bytes = recv_bytes(stream, transport).await?;
     let hello: PairHello = postcard::from_bytes(&bytes)?;
     let name = clean_name(&hello.name);
-    net::send_message(stream, transport, &postcard::to_allocvec(&PairInfo { name: node.my_name() })?).await?;
+    let my_nonce = random_nonce();
+    net::send_message(stream, transport, &postcard::to_allocvec(&PairInfo { name: node.my_name(), nonce: my_nonce })?).await?;
+    let bytes = recv_bytes_for(stream, transport, 30).await?;
+    let reveal: PairReveal = postcard::from_bytes(&bytes)?;
+    if nonce_commitment(&reveal.nonce) != hello.commit {
+        bail!("the joining device did not keep to the pairing protocol");
+    }
 
     // Ask the person at this device, while the other device asks its person.
     let (decide, answer) = oneshot::channel();
+    let source = node.tailnet_source(peer).await;
     let prompt = PairPrompt {
         name: name.clone(),
+        source,
         fingerprint: fingerprint(&remote),
-        code: pairing_code(secret, &remote, &node.keys.public),
+        code: pairing_code(secret, &remote, &node.keys.public, &reveal.nonce, &my_nonce),
         decide,
     };
     if events.send(InviteEvent::Verify(prompt)).is_err() {
@@ -2698,7 +3006,7 @@ async fn run_outbound(node: Arc<Node>, mut stream: TcpStream, dev: Device) -> Re
     let key = net::parse_hex32(&dev.key, "a device key")?;
     let psk = net::parse_hex32(&dev.psk, "a device secret")?;
     let (transport, remote) =
-        tokio::time::timeout(Duration::from_secs(10), net::handshake(&mut stream, &node.keys, true, &psk))
+        tokio::time::timeout(Duration::from_secs(10), net::handshake(&mut stream, &node.keys, true, &psk, Some(&key[..])))
             .await
             .context("handshake timed out")?
             .context("handshake failed (was this machine removed on the other side?)")?;
@@ -3178,13 +3486,34 @@ async fn run_prune(node: &Arc<Node>, remote: &Remote, depot_key: &str, lib: &str
     depot_stat(node, remote, depot_key, lib).await;
 }
 
+/// Every (slot, stamp) the backup holds, fetched one page at a time.
+async fn depot_list_all(remote: &Remote, lib: &str) -> Result<Vec<(String, u64)>> {
+    let mut all: Vec<(String, u64)> = Vec::new();
+    let mut after = String::new();
+    loop {
+        let (lib_s, after_s) = (lib.to_string(), after.clone());
+        let raw = remote.call(move |req| Msg::DepotList { req, lib: lib_s, after: after_s }).await?;
+        let page: Vec<(String, u64)> = postcard::from_bytes(&raw)?;
+        let Some(last) = page.last() else { break };
+        // Each page must move forward and stay within the size we asked for; a backup that
+        // loops or sends too much is faulty (or hostile).
+        if page.len() > crate::depot::MAX_LIST_PAGE || last.0.as_str() <= after.as_str() || !page.windows(2).all(|w| w[0].0 < w[1].0) {
+            bail!("the backup sent a faulty list");
+        }
+        after = last.0.clone();
+        all.extend(page);
+        if all.len() > MAX_DEPOT_RECORDS {
+            bail!("the backup holds more records than this app handles");
+        }
+    }
+    Ok(all)
+}
+
 /// Delete chunks in the backup that no record refers to. Every record is read and decrypted
 /// first; if any cannot be, nothing is deleted. Only chunks older than a week are considered,
 /// so chunks uploaded just before their record by another device are never touched.
 async fn depot_prune(remote: &Remote, lib: &str, rt: &Arc<LibRuntime>) -> Result<(u64, u64)> {
-    let lib_s = lib.to_string();
-    let raw = remote.call(move |req| Msg::DepotList { req, lib: lib_s }).await?;
-    let slots: Vec<(String, u64)> = postcard::from_bytes(&raw)?;
+    let slots = depot_list_all(remote, lib).await?;
     let mut live: HashSet<String> = HashSet::new();
     for (slot, _) in slots {
         let (lib_s, id) = (lib.to_string(), slot.clone());
@@ -3230,9 +3559,7 @@ async fn depot_pull(
     rt: &Arc<LibRuntime>,
     known: &mut HashMap<(String, String), u64>,
 ) -> Result<()> {
-    let lib_s = lib.to_string();
-    let raw = remote.call(move |req| Msg::DepotList { req, lib: lib_s }).await?;
-    let list: Vec<(String, u64)> = postcard::from_bytes(&raw)?;
+    let list = depot_list_all(remote, lib).await?;
     let local: HashMap<String, u64> = rt
         .folder
         .snapshot()
@@ -3355,6 +3682,37 @@ async fn depot_push(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn handshake_sources_are_grouped() {
+        let a: IpAddr = "2001:db8:1:2:aaaa:bbbb:cccc:dddd".parse().unwrap();
+        let b: IpAddr = "2001:db8:1:2:1:2:3:4".parse().unwrap();
+        let c: IpAddr = "2001:db8:1:3::1".parse().unwrap();
+        assert_eq!(slot_key(a), slot_key(b));
+        assert_ne!(slot_key(a), slot_key(c));
+        let v4: IpAddr = "192.0.2.7".parse().unwrap();
+        assert_eq!(slot_key(v4), v4);
+        let mapped: IpAddr = "::ffff:192.0.2.7".parse().unwrap();
+        assert_eq!(slot_key(mapped), v4);
+        assert_eq!(slot_limit(slot_key(a)), MAX_HANDSHAKES_PER_NET6);
+        assert_eq!(slot_limit(v4), MAX_HANDSHAKES_PER_IP);
+    }
+
+    #[test]
+    fn the_pairing_code_needs_both_random_values() {
+        let (s, j, i) = (b"secret".to_vec(), vec![1u8; 32], vec![2u8; 32]);
+        let (n1, n2, n3) = ([1u8; 32], [2u8; 32], [3u8; 32]);
+        let code = pairing_code(&s, &j, &i, &n1, &n2);
+        assert_eq!(code.len(), 9);
+        assert_eq!(code, pairing_code(&s, &j, &i, &n1, &n2));
+        assert_ne!(code, pairing_code(&s, &j, &i, &n3, &n2));
+        assert_ne!(code, pairing_code(&s, &j, &i, &n1, &n3));
+        assert_ne!(code, pairing_code(&s, &i, &j, &n1, &n2));
+        // a commitment fits one value only
+        assert_eq!(nonce_commitment(&n1), nonce_commitment(&n1));
+        assert_ne!(nonce_commitment(&n1), nonce_commitment(&n2));
+        assert_ne!(nonce_commitment(&n1), n1);
+    }
 
     #[test]
     fn names_are_cleaned_and_nicknames_win() {

@@ -21,7 +21,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 const PARAMS: &str = "Noise_XXpsk0_25519_ChaChaPoly_BLAKE2s";
 // Part of the key exchange: devices that speak a different message format (this changes with the
 // protocol version) cannot complete the handshake, so they refuse each other cleanly.
-const PROLOGUE: &[u8] = b"rustsync/5";
+const PROLOGUE: &[u8] = b"rustsync/6";
 const MAX_RECORD: usize = 65535;
 const PLAIN_CHUNK: usize = 60000;
 const MAX_MESSAGE: usize = 24 * 1024 * 1024;
@@ -220,11 +220,16 @@ fn psk_array(psk: &[u8]) -> Result<&[u8; 32]> {
 /// `psk` is the 32-byte secret code of the machine being called. It is mixed into every key
 /// from the first message on, so recorded traffic stays safe even if X25519 is broken later,
 /// and a machine without the code cannot even complete the handshake.
+///
+/// An initiator that knows whose key it is calling passes it as `expect`: it then stops as soon
+/// as the other side's key is known, before sending its own (which travels in the third
+/// message). A machine that cannot prove the expected key never learns who is calling.
 pub async fn handshake<S: AsyncRead + AsyncWrite + Unpin>(
     stream: &mut S,
     keys: &Keys,
     initiator: bool,
     psk: &[u8],
+    expect: Option<&[u8]>,
 ) -> Result<(snow::TransportState, Vec<u8>)> {
     let params: snow::params::NoiseParams = PARAMS.parse()?;
     let builder = snow::Builder::new(params)
@@ -241,6 +246,13 @@ pub async fn handshake<S: AsyncRead + AsyncWrite + Unpin>(
         } else {
             let frame = read_frame(stream).await?;
             hs.read_message(&frame, &mut buf)?;
+            if initiator {
+                if let (Some(want), Some(got)) = (expect, hs.get_remote_static()) {
+                    if got != want {
+                        bail!("the machine answering has a different key than expected (wrong machine or impersonation)");
+                    }
+                }
+            }
         }
         my_turn = !my_turn;
     }
@@ -325,5 +337,49 @@ impl Reassembler {
         } else {
             Ok(None)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn keys() -> Keys {
+        let kp = snow::Builder::new(PARAMS.parse().unwrap()).generate_keypair().unwrap();
+        Keys { private: kp.private, public: kp.public }
+    }
+
+    fn run<F: std::future::Future>(f: F) -> F::Output {
+        tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(f)
+    }
+
+    #[test]
+    fn a_caller_stops_before_revealing_its_key_to_the_wrong_machine() {
+        run(async {
+            let (a, b) = (keys(), keys());
+            let psk = [7u8; 32];
+            // the right machine: both sides finish and know each other
+            let (mut x, mut y) = tokio::io::duplex(65536);
+            let (r1, r2) = tokio::join!(
+                handshake(&mut x, &a, true, &psk, Some(&b.public[..])),
+                handshake(&mut y, &b, false, &psk, None)
+            );
+            assert_eq!(r1.unwrap().1, b.public);
+            assert_eq!(r2.unwrap().1, a.public);
+            // another machine answers: the caller refuses, and the answerer never gets the
+            // third message (the one that carries the caller's key)
+            let wrong = keys();
+            let (mut x, mut y) = tokio::io::duplex(65536);
+            let (r1, r2) = tokio::join!(
+                async move {
+                    let r = handshake(&mut x, &a, true, &psk, Some(&wrong.public[..])).await;
+                    drop(x); // the caller hangs up
+                    r
+                },
+                handshake(&mut y, &b, false, &psk, None)
+            );
+            assert!(r1.is_err());
+            assert!(r2.is_err());
+        });
     }
 }

@@ -87,7 +87,7 @@ pub struct Vault {
 fn seal(c: &XChaCha20Poly1305, aad: &[u8], plain: &[u8]) -> Vec<u8> {
     let nonce: [u8; 24] = rand::random();
     let ct = c
-        .encrypt(XNonce::from_slice(&nonce), Payload { msg: plain, aad })
+        .encrypt(&XNonce::from(nonce), Payload { msg: plain, aad })
         .expect("encryption cannot fail");
     let mut out = nonce.to_vec();
     out.extend_from_slice(&ct);
@@ -99,7 +99,8 @@ fn open(c: &XChaCha20Poly1305, aad: &[u8], data: &[u8]) -> Result<Vec<u8>> {
         bail!("truncated data from the depot");
     }
     let (nonce, ct) = data.split_at(24);
-    c.decrypt(XNonce::from_slice(nonce), Payload { msg: ct, aad })
+    let nonce: [u8; 24] = nonce.try_into().expect("split at 24 bytes");
+    c.decrypt(&XNonce::from(nonce), Payload { msg: ct, aad })
         .map_err(|_| anyhow!("decryption failed: wrong vault key, or the depot's data was tampered with"))
 }
 

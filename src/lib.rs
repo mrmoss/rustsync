@@ -97,6 +97,12 @@ pub enum Cmd {
         /// set is shown again)
         nickname: Option<String>,
     },
+    /// The optional Tailscale (or Headscale) integration: `on`, `off`, or `status` (the default)
+    /// to list the machines of your tailnet
+    Tailscale {
+        /// on, off or status
+        action: Option<String>,
+    },
     /// Change the port this machine listens on (saved in the config file)
     SetPort {
         /// The new port (asked if omitted)
@@ -218,6 +224,7 @@ pub mod vault;
 pub mod depot;
 pub mod proto;
 pub mod sync;
+pub mod tailnet;
 pub mod traffic;
 pub mod cli;
 #[cfg(target_os = "android")]

@@ -32,12 +32,21 @@ pub enum Request {
     Share { library: String, device: String, backup: bool },
     Accept {
         offer: String,
+        /// Key of the device that made the offer. Library ids are not secret, so an offer is
+        /// told apart by id *and* sender; empty only works while a single device offers that id.
+        #[serde(default)]
+        from: String,
         folder: String,
         /// (Backup offers) size limit in bytes; 0 = none.
         #[serde(default)]
         quota: u64,
     },
-    Decline { offer: String },
+    Decline {
+        offer: String,
+        /// Key of the device that made the offer (see `Accept`).
+        #[serde(default)]
+        from: String,
+    },
     /// Stop sharing a library with a device (works for syncing, backups, and offers not yet
     /// accepted). The files stay where they are.
     Unshare { library: String, device: String },
@@ -48,6 +57,11 @@ pub enum Request {
     /// Delete chunks in the encrypted backups of a library that nothing refers to any more.
     Prune { library: String },
     /// Recovery code(s) for one library, or the recovery kit plus all codes.
+    /// Switch the optional Tailscale integration on or off (also written to the config file).
+    SetTailscale { enabled: bool },
+    /// Ask the local Tailscale client about the tailnet now, and check which of its machines
+    /// answer on this machine's port. Needs the integration to be on.
+    Tailnet,
     Recovery { library: Option<String> },
     /// Bring a library (recovery code) or all libraries (recovery kit) back from an encrypted
     /// backup kept on `device`.
@@ -64,7 +78,17 @@ pub enum Reply {
     Note(String),
     /// Pairing: compare `code` with the other device's screen and answer with `PairDecision`.
     /// `joining` is true on the device that entered the code.
-    Verify { name: String, fingerprint: String, code: String, joining: bool },
+    /// `source` is what Tailscale says about where the request comes from (empty if unknown or
+    /// the integration is off): a hint for the person, never a reason to trust.
+    Verify {
+        name: String,
+        fingerprint: String,
+        code: String,
+        joining: bool,
+        #[serde(default)]
+        source: String,
+    },
+    Tailnet(TailnetInfo),
     Done,
     Error(String),
 }
@@ -90,10 +114,58 @@ pub struct StatusInfo {
     pub log_max: u64,
     #[serde(default)]
     pub log_file: String,
+    /// The Tailscale integration: None while it is off.
+    #[serde(default)]
+    pub tailnet: Option<TailnetInfo>,
     pub devices: Vec<DeviceInfo>,
     /// Libraries with a folder on this machine (including encrypted backups kept for others).
     pub libraries: Vec<LibraryInfo>,
     pub offers: Vec<OfferInfo>,
+}
+
+/// One machine on the tailnet, as the local Tailscale client reports it.
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq)]
+pub struct TailPeer {
+    pub name: String,
+    /// Its MagicDNS name (no trailing dot); empty if there is none.
+    #[serde(default)]
+    pub dns: String,
+    #[serde(default)]
+    pub ips: Vec<String>,
+    #[serde(default)]
+    pub online: bool,
+    /// When it was last seen (seconds since 1970); 0 = unknown.
+    #[serde(default)]
+    pub last_seen: u64,
+    #[serde(default)]
+    pub os: String,
+    /// What this machine calls the paired device that is stored at one of its addresses.
+    #[serde(default)]
+    pub paired: String,
+    /// Whether rustsync answers on this machine's port there. Only filled by `Tailnet`, and only
+    /// for machines that are online.
+    #[serde(default)]
+    pub reachable: Option<bool>,
+}
+
+/// What the local Tailscale client says about the tailnet (nothing here is stored).
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq)]
+pub struct TailnetInfo {
+    pub enabled: bool,
+    /// Why there is nothing to show (not installed, not connected, ...); empty when it works.
+    #[serde(default)]
+    pub problem: String,
+    #[serde(default)]
+    pub tailnet: String,
+    /// This machine's name on the tailnet, its MagicDNS name and its tailnet addresses.
+    #[serde(default)]
+    pub self_name: String,
+    #[serde(default)]
+    pub self_dns: String,
+    #[serde(default)]
+    pub self_ips: Vec<String>,
+    #[serde(default)]
+    pub peers: Vec<TailPeer>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]

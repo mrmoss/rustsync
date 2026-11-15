@@ -53,7 +53,7 @@ data class LibraryInfo(
     val sync: List<SyncInfo> = emptyList(),
 )
 
-data class OfferInfo(val id: String, val name: String, val fromName: String, val backup: Boolean, val again: Boolean)
+data class OfferInfo(val id: String, val name: String, val fromKey: String, val fromName: String, val backup: Boolean, val again: Boolean)
 
 data class Status(
     val name: String,
@@ -142,6 +142,7 @@ private fun parseStatus(o: JSONObject): Status {
             OfferInfo(
                 id = f.optString("id"),
                 name = f.optString("name"),
+                fromKey = f.optString("from_key"),
                 fromName = f.optString("from_name"),
                 backup = f.optBoolean("backup"),
                 again = f.optBoolean("again"),
@@ -203,9 +204,9 @@ object Req {
     fun removeLibrary(library: String) = obj("RemoveLibrary", JSONObject().put("library", library))
     fun share(library: String, device: String, backup: Boolean) =
         obj("Share", JSONObject().put("library", library).put("device", device).put("backup", backup))
-    fun accept(offer: String, folder: String, quota: Long) =
-        obj("Accept", JSONObject().put("offer", offer).put("folder", folder).put("quota", quota))
-    fun decline(offer: String) = obj("Decline", JSONObject().put("offer", offer))
+    fun accept(offer: String, from: String, folder: String, quota: Long) =
+        obj("Accept", JSONObject().put("offer", offer).put("from", from).put("folder", folder).put("quota", quota))
+    fun decline(offer: String, from: String) = obj("Decline", JSONObject().put("offer", offer).put("from", from))
 }
 
 /** One conversation with the daemon: a request, then answers until Done or Error. */

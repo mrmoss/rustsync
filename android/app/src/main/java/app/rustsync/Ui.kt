@@ -300,7 +300,7 @@ private fun Libraries(model: Model, status: Status) {
                     Text("${offer.fromName} wants to $what", style = MaterialTheme.typography.titleMedium)
                     Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                         Button(onClick = { accepting = offer }) { Text("Accept") }
-                        OutlinedButton(onClick = { model.decline(offer.id) }) { Text("Decline") }
+                        OutlinedButton(onClick = { model.decline(offer) }) { Text("Decline") }
                     }
                 }
             }
@@ -383,7 +383,7 @@ private fun Libraries(model: Model, status: Status) {
             onDismiss = { accepting = null },
             onDone = { _, folder ->
                 accepting = null
-                model.accept(offer.id, folder)
+                model.accept(offer, folder)
             },
         )
     }

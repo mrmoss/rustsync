@@ -4,21 +4,13 @@
 
 use crate::{activity, config, net, sync};
 use jni::objects::{JClass, JString};
-use jni::sys::{jint, jstring};
-use jni::JNIEnv;
+use jni::sys::jint;
+use jni::EnvUnowned;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 static DAEMON: Mutex<Option<std::thread::JoinHandle<()>>> = Mutex::new(None);
-
-fn read_string(env: &mut JNIEnv, s: &JString) -> String {
-    env.get_string(s).map(String::from).unwrap_or_default()
-}
-
-fn to_java(env: &JNIEnv, s: &str) -> jstring {
-    env.new_string(s).map(|j| j.into_raw()).unwrap_or(std::ptr::null_mut())
-}
 
 fn state_dir(dir: &Path) -> PathBuf {
     dir.join("state")
@@ -64,47 +56,66 @@ fn start_daemon(dir: &Path, name: &str, port: u16) -> anyhow::Result<()> {
 /// `Core.start(dataDir, deviceName, port)`: start the daemon (if it is not running). Returns an
 /// empty string, or what went wrong.
 #[no_mangle]
-pub extern "system" fn Java_app_rustsync_Core_start(
-    mut env: JNIEnv,
-    _class: JClass,
-    data_dir: JString,
-    name: JString,
+pub extern "system" fn Java_app_rustsync_Core_start<'caller>(
+    mut unowned_env: EnvUnowned<'caller>,
+    _class: JClass<'caller>,
+    data_dir: JString<'caller>,
+    name: JString<'caller>,
     port: jint,
-) -> jstring {
-    let dir = PathBuf::from(read_string(&mut env, &data_dir));
-    let name = read_string(&mut env, &name);
-    let port = u16::try_from(port).unwrap_or(3032);
-    let msg = match start_daemon(&dir, &name, port) {
-        Ok(()) => String::new(),
-        Err(e) => format!("{:#}", e),
-    };
-    to_java(&env, &msg)
+) -> JString<'caller> {
+    let outcome = unowned_env.with_env(|env| -> Result<_, jni::errors::Error> {
+        let dir = PathBuf::from(data_dir.to_string());
+        let name = name.to_string();
+        let port = u16::try_from(port).unwrap_or(3032);
+        let msg = match start_daemon(&dir, &name, port) {
+            Ok(()) => String::new(),
+            Err(e) => format!("{:#}", e),
+        };
+        JString::from_str(env, msg)
+    });
+    outcome.resolve::<jni::errors::ThrowRuntimeExAndDefault>()
 }
 
 /// `Core.socketPath(dataDir)`: where the daemon's control socket is.
 #[no_mangle]
-pub extern "system" fn Java_app_rustsync_Core_socketPath(
-    mut env: JNIEnv,
-    _class: JClass,
-    data_dir: JString,
-) -> jstring {
-    let dir = PathBuf::from(read_string(&mut env, &data_dir));
-    let sock = state_dir(&dir).join("control.sock");
-    to_java(&env, &sock.to_string_lossy())
+pub extern "system" fn Java_app_rustsync_Core_socketPath<'caller>(
+    mut unowned_env: EnvUnowned<'caller>,
+    _class: JClass<'caller>,
+    data_dir: JString<'caller>,
+) -> JString<'caller> {
+    let outcome = unowned_env.with_env(|env| -> Result<_, jni::errors::Error> {
+        let dir = PathBuf::from(data_dir.to_string());
+        let sock = state_dir(&dir).join("control.sock");
+        JString::from_str(env, sock.to_string_lossy())
+    });
+    outcome.resolve::<jni::errors::ThrowRuntimeExAndDefault>()
 }
 
 /// `Core.stop(dataDir)`: ask the daemon to stop.
 #[no_mangle]
-pub extern "system" fn Java_app_rustsync_Core_stop(mut env: JNIEnv, _class: JClass, data_dir: JString) {
-    let dir = PathBuf::from(read_string(&mut env, &data_dir));
-    let sock = state_dir(&dir).join("control.sock");
-    if let Ok(mut s) = std::os::unix::net::UnixStream::connect(sock) {
-        let _ = s.write_all(b"\"Stop\"\n");
-    }
+pub extern "system" fn Java_app_rustsync_Core_stop<'caller>(
+    mut unowned_env: EnvUnowned<'caller>,
+    _class: JClass<'caller>,
+    data_dir: JString<'caller>,
+) {
+    let outcome = unowned_env.with_env(|_env| -> Result<_, jni::errors::Error> {
+        let dir = PathBuf::from(data_dir.to_string());
+        let sock = state_dir(&dir).join("control.sock");
+        if let Ok(mut s) = std::os::unix::net::UnixStream::connect(sock) {
+            let _ = s.write_all(b"\"Stop\"\n");
+        }
+        Ok(())
+    });
+    outcome.resolve::<jni::errors::ThrowRuntimeExAndDefault>()
 }
 
 /// `Core.version()`
 #[no_mangle]
-pub extern "system" fn Java_app_rustsync_Core_version(env: JNIEnv, _class: JClass) -> jstring {
-    to_java(&env, env!("CARGO_PKG_VERSION"))
+pub extern "system" fn Java_app_rustsync_Core_version<'caller>(
+    mut unowned_env: EnvUnowned<'caller>,
+    _class: JClass<'caller>,
+) -> JString<'caller> {
+    let outcome = unowned_env
+        .with_env(|env| -> Result<_, jni::errors::Error> { JString::from_str(env, env!("CARGO_PKG_VERSION")) });
+    outcome.resolve::<jni::errors::ThrowRuntimeExAndDefault>()
 }

@@ -1,0 +1,51 @@
+{
+  "Version": "1.76.1-t0123456789",
+  "TUN": true,
+  "BackendState": "Running",
+  "TailscaleIPs": ["100.101.102.103", "fd7a:115c:a1e0::1"],
+  "Self": {
+    "ID": "n1",
+    "PublicKey": "nodekey:0000000000000000000000000000000000000000000000000000000000000001",
+    "HostName": "desk",
+    "DNSName": "desk.tail-scales.ts.net.",
+    "OS": "linux",
+    "UserID": 1,
+    "TailscaleIPs": ["100.101.102.103", "fd7a:115c:a1e0::1"],
+    "Online": true,
+    "LastSeen": "0001-01-01T00:00:00Z"
+  },
+  "Health": [],
+  "MagicDNSSuffix": "tail-scales.ts.net",
+  "CurrentTailnet": {"Name": "me@example.com", "MagicDNSSuffix": "tail-scales.ts.net", "MagicDNSEnabled": true},
+  "Peer": {
+    "nodekey:0000000000000000000000000000000000000000000000000000000000000002": {
+      "ID": "n2",
+      "HostName": "laptop",
+      "DNSName": "laptop.tail-scales.ts.net.",
+      "OS": "macOS",
+      "UserID": 1,
+      "TailscaleIPs": ["100.101.102.104", "fd7a:115c:a1e0::2"],
+      "Online": true,
+      "LastSeen": "2026-11-14T10:00:00Z",
+      "ExitNode": false
+    },
+    "nodekey:0000000000000000000000000000000000000000000000000000000000000003": {
+      "ID": "n3",
+      "HostName": "phone",
+      "DNSName": "phone.tail-scales.ts.net.",
+      "OS": "android",
+      "TailscaleIPs": ["100.101.102.105"],
+      "Online": false,
+      "LastSeen": "2026-11-13T21:30:15.123456789+01:00"
+    },
+    "nodekey:0000000000000000000000000000000000000000000000000000000000000004": {
+      "ID": "n4",
+      "HostName": "nas\u0007‮",
+      "DNSName": "nas.tail-scales.ts.net.",
+      "OS": "freebsd",
+      "TailscaleIPs": ["100.101.102.106", "not-an-address"],
+      "Online": true,
+      "SomethingNew": {"added": "in a later version"}
+    }
+  }
+}

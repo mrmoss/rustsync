@@ -202,8 +202,8 @@ class Model(app: Application) : AndroidViewModel(app) {
     fun createLibrary(name: String, folder: String) = run(Req.create(name, folder))
     fun removeLibrary(id: String) = run(Req.removeLibrary(id))
     fun share(library: String, device: String, backup: Boolean) = run(Req.share(library, device, backup))
-    fun accept(offer: String, folder: String) = run(Req.accept(offer, folder, 0))
-    fun decline(offer: String) = run(Req.decline(offer))
+    fun accept(offer: OfferInfo, folder: String) = run(Req.accept(offer.id, offer.fromKey, folder, 0))
+    fun decline(offer: OfferInfo) = run(Req.decline(offer.id, offer.fromKey))
     fun resync() = run(Req.refresh())
 
     /** This phone's IPv4 addresses (address, interface), home-network ones first. */

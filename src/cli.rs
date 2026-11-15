@@ -2,7 +2,7 @@
 //! socket, and asks you for anything you left out.
 
 use crate::config::{self, Config};
-use crate::proto::{self, Reply, Request, StatusInfo};
+use crate::proto::{self, Reply, Request, StatusInfo, TailnetInfo};
 use crate::Cmd;
 use anyhow::{anyhow, bail, Context, Result};
 use std::io::{IsTerminal, Write};
@@ -109,7 +109,7 @@ fn offer_label(o: &proto::OfferInfo) -> String {
     } else if o.backup {
         format!("keep an encrypted backup ({}) for {}", o.name, o.from_name)
     } else {
-        format!("\"{}\" from {}", o.name, o.from_name)
+        format!("\"{}\" from {} ({})", o.name, o.from_name, &o.from_key[..o.from_key.len().min(8)])
     }
 }
 
@@ -169,11 +169,14 @@ fn print_qr(text: &str, light_terminal: bool) {
 
 /// Show the verification code of a pairing attempt and ask whether to go on. No answer (for
 /// example no terminal) counts as no.
-fn verify_prompt(name: &str, fingerprint: &str, code: &str, joining: bool) -> bool {
+fn verify_prompt(name: &str, fingerprint: &str, code: &str, joining: bool, source: &str) -> bool {
     eprintln!();
     eprintln!("  Verification code:  {}", code);
     eprintln!("  Device:             {}", name);
     eprintln!("  Its fingerprint:    {}", fingerprint);
+    if !source.is_empty() {
+        eprintln!("  Network:            {}  (only a hint: compare the codes)", source);
+    }
     eprintln!();
     if joining {
         eprintln!("The machine that showed you the pairing code must now show exactly this verification code.");
@@ -187,6 +190,11 @@ fn verify_prompt(name: &str, fingerprint: &str, code: &str, joining: bool) -> bo
 /// Send a request and print what comes back. `qr` (Some(light terminal)) draws the `Out` lines
 /// as QR codes: used by `invite`, whose only `Out` line is the pairing code.
 async fn converse(ctl: &Ctl, req: &Request, qr: Option<bool>) -> Result<Option<StatusInfo>> {
+    Ok(converse_all(ctl, req, qr).await?.0)
+}
+
+/// Like `converse`, and also returns the tailnet if the daemon sent it.
+async fn converse_all(ctl: &Ctl, req: &Request, qr: Option<bool>) -> Result<(Option<StatusInfo>, Option<TailnetInfo>)> {
     let stream = UnixStream::connect(&ctl.sock).await.map_err(|_| {
         anyhow!(
             "rustsync is not running for this config.\nStart it in the background with:  rustsync -c {} start\n(or in a terminal with:  rustsync -c {})",
@@ -200,6 +208,7 @@ async fn converse(ctl: &Ctl, req: &Request, qr: Option<bool>) -> Result<Option<S
     // `w` stays open until we return: closing it tells the daemon we cancelled (Ctrl-C).
     let mut lines = BufReader::new(r).lines();
     let mut info = None;
+    let mut tail = None;
     while let Some(line) = lines.next_line().await? {
         match serde_json::from_str::<Reply>(&line)? {
             Reply::Info(i) => info = Some(i),
@@ -210,19 +219,59 @@ async fn converse(ctl: &Ctl, req: &Request, qr: Option<bool>) -> Result<Option<S
                 }
             }
             Reply::Note(s) => eprintln!("{}", s),
-            Reply::Verify { name, fingerprint, code, joining } => {
+            Reply::Tailnet(t) => tail = Some(t),
+            Reply::Verify { name, fingerprint, code, joining, source } => {
                 let accept =
-                    tokio::task::spawn_blocking(move || verify_prompt(&name, &fingerprint, &code, joining))
+                    tokio::task::spawn_blocking(move || verify_prompt(&name, &fingerprint, &code, joining, &source))
                         .await
                         .unwrap_or(false);
                 w.write_all(serde_json::to_string(&Request::PairDecision { accept })?.as_bytes()).await?;
                 w.write_all(b"\n").await?;
             }
-            Reply::Done => return Ok(info),
+            Reply::Done => return Ok((info, tail)),
             Reply::Error(e) => bail!("{}", e),
         }
     }
-    Ok(info)
+    Ok((info, tail))
+}
+
+/// The machines of the tailnet, as `rustsync tailscale` shows them.
+fn print_tailnet(t: &TailnetInfo) {
+    if !t.problem.is_empty() {
+        println!("Tailscale: {}", t.problem);
+        return;
+    }
+    println!(
+        "Tailscale: this machine is {}{}{}",
+        if t.self_name.is_empty() { "(unnamed)" } else { t.self_name.as_str() },
+        if t.self_ips.is_empty() { String::new() } else { format!("  {}", t.self_ips.join("  ")) },
+        if t.tailnet.is_empty() { String::new() } else { format!("  on {}", t.tailnet) },
+    );
+    if t.peers.is_empty() {
+        println!("  (no other machines on the tailnet)");
+        return;
+    }
+    let now = crate::activity::unix_now();
+    for p in &t.peers {
+        let state = if p.online {
+            match p.reachable {
+                Some(true) => "online, rustsync answers".to_string(),
+                Some(false) => "online, rustsync does not answer".to_string(),
+                None => "online".to_string(),
+            }
+        } else if p.last_seen == 0 {
+            "offline".to_string()
+        } else {
+            format!("offline, last seen {}", crate::activity::ago(now, p.last_seen))
+        };
+        println!(
+            "  {:<18} {:<16} {}{}",
+            p.name,
+            p.ips.iter().find(|i| !i.contains(':')).or(p.ips.first()).cloned().unwrap_or_default(),
+            state,
+            if p.paired.is_empty() { String::new() } else { format!("  (paired: {})", p.paired) }
+        );
+    }
 }
 
 async fn status(ctl: &Ctl) -> Result<StatusInfo> {
@@ -236,6 +285,9 @@ fn print_status(config: &Path, s: &StatusInfo) {
     println!("This device:   {}", s.name);
     println!("Public key:    {}", s.key);
     println!("Listening on:  {}", s.listen);
+    if s.tailnet.is_some() {
+        println!("Tailscale:     on  (see the machines of your tailnet with:  rustsync -c {} tailscale)", c);
+    }
     println!();
     println!("Paired devices:");
     if s.devices.is_empty() {
@@ -1005,6 +1057,29 @@ pub async fn run(config_path: &Path, cmd: Cmd) -> Result<()> {
             call(&ctl, &Request::Forget { device: info.devices[i].key.clone() }).await?;
             Ok(())
         }
+        Cmd::Tailscale { action } => {
+            match action.as_deref().map(|a| a.trim().to_lowercase()).as_deref() {
+                Some("on") => {
+                    call(&ctl, &Request::SetTailscale { enabled: true }).await?;
+                }
+                Some("off") => {
+                    call(&ctl, &Request::SetTailscale { enabled: false }).await?;
+                }
+                None | Some("status") | Some("list") => {
+                    let info = status(&ctl).await?;
+                    if info.tailnet.is_none() {
+                        println!("The Tailscale integration is off. Switch it on with:  rustsync -c {} tailscale on", ctl.config.display());
+                        return Ok(());
+                    }
+                    match converse_all(&ctl, &Request::Tailnet, None).await?.1 {
+                        Some(t) => print_tailnet(&t),
+                        None => bail!("rustsync did not answer"),
+                    }
+                }
+                Some(other) => bail!("unknown action {:?}: use on, off or status", other),
+            }
+            Ok(())
+        }
         Cmd::SetPort { port } => {
             let info = status(&ctl).await?;
             let port = match port {
@@ -1163,7 +1238,7 @@ pub async fn run(config_path: &Path, cmd: Cmd) -> Result<()> {
             let o = info.offers[i].clone();
             if o.again {
                 // A device this machine stopped serving asks to use a backup it already keeps.
-                call(&ctl, &Request::Accept { offer: o.id, folder: String::new(), quota: 0 }).await?;
+                call(&ctl, &Request::Accept { offer: o.id, from: o.from_key, folder: String::new(), quota: 0 }).await?;
                 return Ok(());
             }
             let folder = match folder {
@@ -1186,7 +1261,7 @@ pub async fn run(config_path: &Path, cmd: Cmd) -> Result<()> {
             } else {
                 0
             };
-            call(&ctl, &Request::Accept { offer: o.id, folder, quota }).await?;
+            call(&ctl, &Request::Accept { offer: o.id, from: o.from_key, folder, quota }).await?;
             Ok(())
         }
         Cmd::Decline { offer } => {
@@ -1198,7 +1273,7 @@ pub async fn run(config_path: &Path, cmd: Cmd) -> Result<()> {
             let labels: Vec<String> = info.offers.iter().map(offer_label).collect();
             let offers = &info.offers;
             let i = pick("offer", &labels, offer, |i, t| name_or_prefix(&offers[i].name, &offers[i].id, t))?;
-            call(&ctl, &Request::Decline { offer: info.offers[i].id.clone() }).await?;
+            call(&ctl, &Request::Decline { offer: info.offers[i].id.clone(), from: info.offers[i].from_key.clone() }).await?;
             Ok(())
         }
         Cmd::Refresh => {

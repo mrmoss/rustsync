@@ -387,6 +387,8 @@ Pairing devices
   name [NAME]         Change this device's own name (what other devices show for it)
   rename [DEVICE] [NICKNAME]
                       Give a paired device a nickname that only this machine uses
+  tailscale [on|off|status]
+                      Optional: list the machines of your Tailscale/Headscale network (see below)
 
 Libraries (folders to sync)
   create [NAME] [FOLDER]            Create a library from a folder
@@ -511,6 +513,43 @@ the meantime. A nickname never leaves your machine: the other device is not told
 
 Use a nickname when two devices announce the same name, or when you simply prefer your own. Names are
 labels, not identities: what identifies a device is its public key, shown (shortened) on its card.
+
+## Tailscale and Headscale (optional)
+
+If you already use Tailscale (or Headscale), rustsync can take a little help from it. It is **off
+unless you switch it on**: with `rustsync tailscale on` or the checkbox in Settings > Tailscale (or
+`enabled = true` under `[tailscale]` in the config file). When it is on:
+
+- the **Devices** page lists the machines of your tailnet: online or not (and when an offline one was
+  last seen), its address, and whether rustsync answers there. *Check* asks again; the same list is
+  printed by `rustsync tailscale`;
+- the **tailnet address and MagicDNS name of this machine** are offered when you show a pairing code;
+- while someone pairs with you over the tailnet, the check window adds a line such as
+  *Tailscale says: laptop (me@example.com)*. It is a hint about which machine is calling, nothing
+  more: you still compare the two codes on both screens, as always.
+
+Pairing itself does not change: you still show a code on one machine and enter it on the other. What
+is stored for a paired device is its address, like for any other device, so **nothing about
+Tailscale is kept**. Switch the integration off and the list, the extra address and the extra line
+are gone, and rustsync stops running `tailscale`; devices you paired through a tailnet host name or
+address keep working, because to rustsync that is just a host name or an address.
+
+How it works: rustsync runs the local `tailscale` program (`tailscale status --json` and
+`tailscale whois --json`). It needs no account, key or internet access, and it works the same with
+Headscale. It looks for the program in the usual places (`/usr/bin`, `/usr/local/bin`,
+`/opt/homebrew/bin`, `/snap/bin`, the macOS app) and **not** through the `PATH`; if yours is
+somewhere else, give the full path:
+
+```toml
+[tailscale]
+enabled = true
+# command = "/opt/tailscale/bin/tailscale"
+```
+
+If the service runs as another user than the one who is logged in to Tailscale, `tailscale` may
+refuse to talk to it ("access denied"); the window then says so. On Linux you can allow it once with
+`sudo tailscale set --operator=$USER`. The Android app does not list tailnet machines (the phone's
+Tailscale app does not offer that to other apps), but it pairs over a tailnet like any other network.
 
 ## The Android app
 
@@ -721,6 +760,10 @@ name = "laptop"           # what other devices call this one (default: the host 
 
 [server]
 port = 3032               # port to listen on (or use `rustsync set-port`, or Settings > Network)
+
+[tailscale]
+enabled = false           # optional help from Tailscale/Headscale (or `rustsync tailscale on`)
+# command = "/usr/bin/tailscale"   # only if it is not in a usual place
 
 [sync_options]
 full_scan_interval = 30   # seconds between full re-scans (changes are also noticed instantly)

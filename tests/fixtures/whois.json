@@ -1,0 +1,11 @@
+{
+  "Node": {
+    "ID": 123,
+    "Name": "laptop.tail-scales.ts.net.",
+    "ComputedName": "laptop",
+    "Addresses": ["100.101.102.104/32"],
+    "Hostinfo": {"OS": "macOS", "Hostname": "laptop"}
+  },
+  "UserProfile": {"ID": 1, "LoginName": "me@example.com", "DisplayName": "Me"},
+  "CapMap": {}
+}

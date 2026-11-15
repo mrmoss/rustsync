@@ -1,0 +1,30 @@
+{
+  "Version": "1.74.1",
+  "BackendState": "Running",
+  "Self": {
+    "HostName": "server",
+    "DNSName": "server.hs.example.net.",
+    "OS": "linux",
+    "TailscaleIPs": ["100.64.0.1", "fd7a:115c:a1e0::1"],
+    "Online": true
+  },
+  "MagicDNSSuffix": "hs.example.net",
+  "Peer": {
+    "mkey:aa": {
+      "HostName": "pi",
+      "DNSName": "pi.hs.example.net.",
+      "OS": "linux",
+      "TailscaleIPs": ["100.64.0.2"],
+      "Online": true,
+      "LastSeen": null
+    },
+    "mkey:bb": {
+      "HostName": "ghost",
+      "DNSName": "",
+      "TailscaleIPs": null,
+      "Online": null,
+      "LastSeen": null
+    },
+    "mkey:cc": null
+  }
+}

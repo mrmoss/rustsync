@@ -32,6 +32,9 @@ pub struct Config {
     /// The desktop window.
     #[serde(default)]
     pub gui: GuiConfig,
+    /// The optional Tailscale integration (off by default).
+    #[serde(default)]
+    pub tailscale: TailscaleConfig,
 
     // Old config format: still parsed so we can tell the user it is ignored.
     #[serde(default)]
@@ -67,6 +70,20 @@ impl Default for ServerConfig {
     fn default() -> Self {
         ServerConfig { host: default_host(), port: default_port() }
     }
+}
+
+/// The optional Tailscale (or Headscale) integration. Off unless switched on; when off, rustsync
+/// never runs the `tailscale` program and shows nothing about it.
+#[derive(Debug, Deserialize, Default)]
+pub struct TailscaleConfig {
+    /// Use the local Tailscale client to offer the tailnet address in invites, list the tailnet's
+    /// machines, and show which tailnet machine is asking to pair.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Full path of the `tailscale` program, for installs in unusual places. Empty: look in the
+    /// usual places (never the PATH).
+    #[serde(default)]
+    pub command: String,
 }
 
 /// Settings of the desktop window (`rustsync-gui`).
@@ -476,6 +493,11 @@ pub fn set_gui_x11(path: &Path, on: bool) -> Result<()> {
     set_in_section(path, "gui", "x11", toml_edit::value(on))
 }
 
+/// Switch the Tailscale integration on or off in the config file.
+pub fn set_tailscale(path: &Path, on: bool) -> Result<()> {
+    set_in_section(path, "tailscale", "enabled", toml_edit::value(on))
+}
+
 /// Write a new size limit for the logs (e.g. `5MB`) into the config file.
 pub fn set_log_size(path: &Path, bytes: u64) -> Result<()> {
     let text = if bytes % 1_000_000 == 0 { format!("{}MB", bytes / 1_000_000) } else { bytes.to_string() };
@@ -668,6 +690,23 @@ mod tests {
         assert!(yaml_to_toml("server:\n  nested:\n    deeper: 1\n").is_err());
         assert!(yaml_to_toml("name: [a, b]\n").is_err());
         assert!(yaml_to_toml("just words\n").is_err());
+    }
+
+    #[test]
+    fn tailscale_is_off_unless_switched_on() {
+        let cfg: Config = toml::from_str("name = \"a\"\n").unwrap();
+        assert!(!cfg.tailscale.enabled);
+        assert!(cfg.tailscale.command.is_empty());
+        let dir = std::env::temp_dir().join(format!("rustsync-tscfg-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("c.toml");
+        std::fs::write(&path, "# mine\nname = \"a\"\n").unwrap();
+        set_tailscale(&path, true).unwrap();
+        assert!(load(&path).unwrap().tailscale.enabled);
+        set_tailscale(&path, false).unwrap();
+        assert!(!load(&path).unwrap().tailscale.enabled);
+        assert!(std::fs::read_to_string(&path).unwrap().contains("# mine"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

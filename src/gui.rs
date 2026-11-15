@@ -37,6 +37,8 @@ enum Request {
     SetPort { port: u16 },
     SetName { name: String },
     Rename { device: String, nickname: String },
+    SetTailscale { enabled: bool },
+    Tailnet,
     Log { device: Option<String>, library: Option<String>, lines: usize },
     SetLogSize { bytes: u64 },
     Forget { device: String },
@@ -44,12 +46,12 @@ enum Request {
     Create { name: String, folder: String },
     RemoveLibrary { library: String },
     Share { library: String, device: String, backup: bool },
-    Accept { offer: String, folder: String, quota: u64 },
+    Accept { offer: String, from: String, folder: String, quota: u64 },
     SetQuota { library: String, bytes: u64 },
     Prune { library: String },
     Unshare { library: String, device: String },
     Refresh,
-    Decline { offer: String },
+    Decline { offer: String, from: String },
     Recovery { library: Option<String> },
     Restore { code: String, folder: String, device: String },
     Stop,
@@ -61,7 +63,17 @@ enum Reply {
     Out(String),
     Note(String),
     /// Pairing: compare `code` with the other device and answer with `PairDecision`.
-    Verify { name: String, fingerprint: String, code: String, joining: bool },
+    Verify {
+        name: String,
+        fingerprint: String,
+        code: String,
+        joining: bool,
+        #[serde(default)]
+        source: String,
+    },
+    /// Only sent for `Tailnet`; the window reads the same data from the status.
+    #[allow(dead_code)]
+    Tailnet(TailnetInfo),
     Done,
     Error(String),
 }
@@ -91,6 +103,42 @@ struct StatusInfo {
     log_max: u64,
     #[serde(default)]
     log_file: String,
+    /// The Tailscale integration: None while it is off.
+    #[serde(default)]
+    tailnet: Option<TailnetInfo>,
+}
+
+#[derive(Deserialize, Debug, Clone, Default)]
+struct TailPeer {
+    name: String,
+    #[serde(default)]
+    dns: String,
+    #[serde(default)]
+    ips: Vec<String>,
+    #[serde(default)]
+    online: bool,
+    #[serde(default)]
+    last_seen: u64,
+    #[serde(default)]
+    os: String,
+    #[serde(default)]
+    paired: String,
+    #[serde(default)]
+    reachable: Option<bool>,
+}
+
+#[derive(Deserialize, Debug, Clone, Default)]
+struct TailnetInfo {
+    #[serde(default)]
+    problem: String,
+    #[serde(default)]
+    tailnet: String,
+    #[serde(default)]
+    self_name: String,
+    #[serde(default)]
+    self_ips: Vec<String>,
+    #[serde(default)]
+    peers: Vec<TailPeer>,
 }
 
 #[derive(Deserialize, Debug, Clone)]
@@ -219,6 +267,8 @@ fn fmt_size(b: u64) -> String {
 struct OfferInfo {
     id: String,
     name: String,
+    #[serde(default)]
+    from_key: String,
     from_name: String,
     /// An offer to keep an encrypted backup here (rather than to sync).
     #[serde(default)]
@@ -519,6 +569,8 @@ struct Verify {
     code: String,
     /// True on the device that entered the pairing code.
     joining: bool,
+    /// What Tailscale says about the connection (empty if unknown or the integration is off).
+    source: String,
 }
 
 #[derive(Default, PartialEq, Clone, Copy)]
@@ -536,7 +588,7 @@ enum Dialog {
     None,
     NewLibrary { name: String, folder: String },
     Share { lib_id: String, lib_name: String, device: usize, backup: bool },
-    Accept { offer_id: String, name: String, folder: String, backup: bool, from: String, quota: String },
+    Accept { offer_id: String, from_key: String, name: String, folder: String, backup: bool, from: String, quota: String },
     Quota { id: String, name: String, text: String },
     Unshare { lib_id: String, lib_name: String, candidates: Vec<(String, String)>, sel: usize },
     Recovery { name: String, code: Option<String>, error: Option<String> },
@@ -556,7 +608,7 @@ enum Dialog {
 enum Action {
     Create { name: String, folder: String },
     Share { library: String, device: usize, backup: bool },
-    Accept { offer: String, folder: String, quota: u64 },
+    Accept { offer: String, from: String, folder: String, quota: u64 },
     SetQuota { id: String, bytes: u64 },
     Prune { id: String },
     Unshare { id: String, device: String },
@@ -574,6 +626,9 @@ enum Action {
     SetOwnName { name: String },
     SetNickname { key: String, nickname: String },
     SetPort { port: u16 },
+    SetTailscale { enabled: bool },
+    /// Ask Tailscale now and check which machines answer.
+    CheckTailnet,
     Remove { id: String },
     StartInvite { host: String },
     CancelInvite,
@@ -814,8 +869,8 @@ impl App {
                     let _ = tx.send(Ev::InviteNote(n));
                     ctx.request_repaint();
                 }
-                Reply::Verify { name, fingerprint, code, joining } => {
-                    let _ = tx.send(Ev::PairVerify(Verify { name, fingerprint, code, joining }));
+                Reply::Verify { name, fingerprint, code, joining, source } => {
+                    let _ = tx.send(Ev::PairVerify(Verify { name, fingerprint, code, joining, source }));
                     ctx.request_repaint();
                 }
                 _ => {}
@@ -832,8 +887,8 @@ impl App {
         std::thread::spawn(move || {
             let mut paired = String::new();
             let res = call(&sock, &Request::Join { token }, Some(&slot), |r| match r {
-                Reply::Verify { name, fingerprint, code, joining } => {
-                    let _ = tx.send(Ev::PairVerify(Verify { name, fingerprint, code, joining }));
+                Reply::Verify { name, fingerprint, code, joining, source } => {
+                    let _ = tx.send(Ev::PairVerify(Verify { name, fingerprint, code, joining, source }));
                     ctx.request_repaint();
                 }
                 Reply::Out(s) => paired = s,
@@ -1022,7 +1077,7 @@ impl App {
                     self.run(Request::Share { library, device, backup });
                 }
             }
-            Action::Accept { offer, folder, quota } => self.run(Request::Accept { offer, folder, quota }),
+            Action::Accept { offer, from, folder, quota } => self.run(Request::Accept { offer, from, folder, quota }),
             Action::SetQuota { id, bytes } => self.run(Request::SetQuota { library: id, bytes }),
             Action::Prune { id } => self.run(Request::Prune { library: id }),
             Action::Unshare { id, device } => self.run(Request::Unshare { library: id, device }),
@@ -1076,6 +1131,8 @@ impl App {
                 self.port_edit = None;
                 self.run(Request::SetPort { port })
             }
+            Action::SetTailscale { enabled } => self.run(Request::SetTailscale { enabled }),
+            Action::CheckTailnet => self.run(Request::Tailnet),
             Action::SetAddress { key, addr } => self.run(Request::SetAddress { device: key, addr }),
             Action::SetOwnName { name } => self.run(Request::SetName { name }),
             Action::SetNickname { key, nickname } => self.run(Request::Rename { device: key, nickname }),
@@ -1571,6 +1628,11 @@ fn verify_window(ctx: &egui::Context, v: &Verify) -> Option<bool> {
                 ui.label(RichText::new("Key fingerprint").weak());
                 ui.label(RichText::new(&v.fingerprint).monospace());
                 ui.end_row();
+                if !v.source.is_empty() {
+                    ui.label(RichText::new("Network").weak());
+                    ui.add(egui::Label::new(&v.source).wrap());
+                    ui.end_row();
+                }
             });
             ui.add_space(6.0);
             ui.label(
@@ -2055,11 +2117,11 @@ impl App {
                         });
                         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                             if ui.button("Decline").clicked() {
-                                self.run(Request::Decline { offer: o.id.clone() });
+                                self.run(Request::Decline { offer: o.id.clone(), from: o.from_key.clone() });
                             }
                             if o.again {
                                 if ui.button(RichText::new("Allow").strong()).clicked() {
-                                    self.run(Request::Accept { offer: o.id.clone(), folder: String::new(), quota: 0 });
+                                    self.run(Request::Accept { offer: o.id.clone(), from: o.from_key.clone(), folder: String::new(), quota: 0 });
                                 }
                             } else if ui.button(RichText::new("Accept…").strong()).clicked() {
                                 let base = if o.backup && !status.backup_dir.is_empty() {
@@ -2070,6 +2132,7 @@ impl App {
                                 let suggestion = base.join(&o.name).to_string_lossy().to_string();
                                 self.dialog = Dialog::Accept {
                                     offer_id: o.id.clone(),
+                                    from_key: o.from_key.clone(),
                                     name: o.name.clone(),
                                     folder: suggestion,
                                     backup: o.backup,
@@ -2353,6 +2416,81 @@ impl App {
                 });
             });
         }
+
+        if let Some(t) = &status.tailnet {
+            ui.add_space(8.0);
+            section(ui, "YOUR TAILNET");
+            card(ui, |ui| {
+                if !t.problem.is_empty() {
+                    ui.label(RichText::new(&t.problem).color(AMBER));
+                    return;
+                }
+                ui.horizontal(|ui| {
+                    ui.label(
+                        RichText::new(if t.tailnet.is_empty() { "Machines on your tailnet".to_string() } else { t.tailnet.clone() })
+                            .strong(),
+                    );
+                    if ui
+                        .small_button("Check")
+                        .on_hover_text("Ask Tailscale again, and see which of these machines answer to RustSync")
+                        .clicked()
+                    {
+                        self.perform(Action::CheckTailnet);
+                    }
+                });
+                if t.peers.is_empty() {
+                    ui.label(RichText::new("No other machines on the tailnet.").small().weak());
+                }
+                for p in &t.peers {
+                    ui.add_space(2.0);
+                    ui.horizontal(|ui| {
+                        status_dot(ui, if p.online { GREEN } else { MUTED });
+                        ui.vertical(|ui| {
+                            ui.label(RichText::new(&p.name).strong());
+                            let addr = p.ips.iter().find(|i| !i.contains(':')).or(p.ips.first()).cloned().unwrap_or_default();
+                            let mut line = addr.clone();
+                            if !p.os.is_empty() {
+                                line.push_str(&format!("  ·  {}", p.os));
+                            }
+                            if p.online {
+                                line.push_str(match p.reachable {
+                                    Some(true) => "  ·  RustSync answers",
+                                    Some(false) => "  ·  RustSync does not answer",
+                                    None => "  ·  online",
+                                });
+                            } else if p.last_seen > 0 {
+                                line.push_str(&format!("  ·  last seen {}", ago_text(p.last_seen)));
+                            } else {
+                                line.push_str("  ·  offline");
+                            }
+                            if !p.paired.is_empty() {
+                                line.push_str(&format!("  ·  paired as {}", p.paired));
+                            }
+                            ui.label(RichText::new(line).small().weak());
+                            if !addr.is_empty() {
+                                let host = if p.dns.is_empty() { addr.clone() } else { p.dns.clone() };
+                                ui.horizontal(|ui| {
+                                    if ui.small_button("Copy address").clicked() {
+                                        ui.ctx().copy_text(addr.clone());
+                                        self.say(true, "Address copied");
+                                    }
+                                    if !p.dns.is_empty() && ui.small_button("Copy name").clicked() {
+                                        ui.ctx().copy_text(host.clone());
+                                        self.say(true, "Name copied");
+                                    }
+                                });
+                            }
+                        });
+                    });
+                }
+                ui.add_space(4.0);
+                ui.label(
+                    RichText::new("To pair with one of these, show a pairing code on one machine and enter it on the other, as usual. Tailscale only tells you which machine is which.")
+                        .small()
+                        .weak(),
+                );
+            });
+        }
     }
 
     fn show_home(&mut self, ui: &mut egui::Ui) {
@@ -2496,6 +2634,42 @@ impl App {
             if save {
                 if let Ok(port) = text.trim().parse::<u16>() {
                     self.perform(Action::SetPort { port });
+                }
+            }
+        });
+
+        ui.add_space(8.0);
+        card(ui, |ui| {
+            ui.label(RichText::new("Tailscale").strong());
+            let mut on = status.tailnet.is_some();
+            if ui
+                .checkbox(&mut on, "Use Tailscale (or Headscale) to find my other machines")
+                .on_hover_text("Lists the machines of your tailnet on the Devices page and offers this machine's tailnet address when you show a pairing code. It runs the local tailscale program; nothing is stored, and you pair as usual, with a code.")
+                .changed()
+            {
+                self.perform(Action::SetTailscale { enabled: on });
+            }
+            match &status.tailnet {
+                None => {
+                    ui.label(
+                        RichText::new("Off. RustSync never runs tailscale and shows nothing from it. You can still pair over your tailnet by typing a tailnet host name or address.")
+                            .small()
+                            .weak(),
+                    );
+                }
+                Some(t) if !t.problem.is_empty() => {
+                    ui.label(RichText::new(&t.problem).small().color(AMBER));
+                }
+                Some(t) => {
+                    ui.label(
+                        RichText::new(format!(
+                            "{}{}",
+                            if t.self_name.is_empty() { "Connected".to_string() } else { format!("This machine is “{}”", t.self_name) },
+                            if t.tailnet.is_empty() { String::new() } else { format!(" on {}", t.tailnet) }
+                        ))
+                        .small()
+                        .weak(),
+                    );
                 }
             }
         });
@@ -2654,7 +2828,7 @@ impl App {
                 });
             }
 
-            Dialog::Accept { offer_id, name, folder, backup, from, quota } => {
+            Dialog::Accept { offer_id, from_key, name, folder, backup, from, quota } => {
                 window(if *backup { "Keep an encrypted backup" } else { "Accept a library" }).show(ctx, |ui| {
                     if *backup {
                         ui.label(format!("{} wants to keep an encrypted backup on this machine.", from));
@@ -2684,7 +2858,7 @@ impl App {
                     }
                     ui.horizontal(|ui| {
                         if ui.add_enabled(valid, primary("Accept")).clicked() {
-                            action = Some(Action::Accept { offer: offer_id.clone(), folder: folder_full.clone(), quota: quota_bytes });
+                            action = Some(Action::Accept { offer: offer_id.clone(), from: from_key.clone(), folder: folder_full.clone(), quota: quota_bytes });
                             close = true;
                         }
                         if ui.button("Cancel").clicked() {
