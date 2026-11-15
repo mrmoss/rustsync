@@ -21,7 +21,7 @@ use crate::proto::{TailPeer, TailnetInfo};
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::net::IpAddr;
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
@@ -55,7 +55,9 @@ fn check_program(path: &Path) -> Result<(), String> {
     if !path.is_absolute() {
         return Err(format!("the Tailscale program must be given with its full path ({})", path.display()));
     }
-    let md = std::fs::metadata(path).map_err(|_| format!("{} does not exist", path.display()))?;
+    // Look at the real file (a link, as Homebrew makes, is followed) and at the folder it is in.
+    let real = std::fs::canonicalize(path).map_err(|_| format!("{} does not exist", path.display()))?;
+    let md = std::fs::metadata(&real).map_err(|_| format!("{} does not exist", path.display()))?;
     if !md.is_file() {
         return Err(format!("{} is not a program", path.display()));
     }
@@ -65,6 +67,22 @@ fn check_program(path: &Path) -> Result<(), String> {
     }
     if mode & 0o022 != 0 {
         return Err(format!("{} can be changed by other users, so it is not run", path.display()));
+    }
+    // Only root or the user rustsync runs as may own it and the folder it is in: anyone else
+    // could put another program there, which would then run as us (as root, for a system service).
+    // SAFETY: geteuid has no preconditions and cannot fail.
+    let me = unsafe { libc::geteuid() };
+    let trusted = |uid: u32| uid == 0 || uid == me;
+    if !trusted(md.uid()) {
+        return Err(format!("{} belongs to another user, so it is not run", path.display()));
+    }
+    let folder = real.parent().ok_or_else(|| format!("{} is not a program", path.display()))?;
+    let fmd = std::fs::metadata(folder).map_err(|_| format!("{} does not exist", path.display()))?;
+    if !trusted(fmd.uid()) || fmd.permissions().mode() & 0o022 != 0 {
+        return Err(format!(
+            "the folder of {} belongs to or can be changed by other users, so it is not run (copy the program to a folder only root can write and give that path as `command` under [tailscale])",
+            path.display()
+        ));
     }
     Ok(())
 }
@@ -502,6 +520,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("rustsync-fakets-{}-{}", std::process::id(), name));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
         let path = dir.join("tailscale");
         std::fs::write(&path, format!("#!/bin/sh\n{}\n", body)).unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
@@ -604,6 +623,12 @@ mod tests {
         std::fs::set_permissions(&ok, std::fs::Permissions::from_mode(0o600)).unwrap();
         assert!(find_command(ok.to_str().unwrap()).unwrap_err().contains("cannot be run"));
         assert!(find_command(ok.parent().unwrap().to_str().unwrap()).unwrap_err().contains("not a program"));
+        // a folder others can write to is refused too, even if the program itself is fine
+        std::fs::set_permissions(&ok, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::set_permissions(ok.parent().unwrap(), std::fs::Permissions::from_mode(0o777)).unwrap();
+        assert!(find_command(ok.to_str().unwrap()).unwrap_err().contains("folder"));
+        std::fs::set_permissions(ok.parent().unwrap(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(find_command(ok.to_str().unwrap()).is_ok());
     }
 
     #[test]

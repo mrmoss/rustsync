@@ -45,8 +45,15 @@ fn stamp_too_far_ahead(stamp: u64) -> bool {
 const TOUCH_EVERY: u64 = 3600;
 static TMP: AtomicU64 = AtomicU64::new(0);
 
+/// Ids of records and chunks: 64 lowercase hex characters. One spelling only, so that the order
+/// of the stored names is the order every page of a list follows.
 fn ok_id(s: &str) -> bool {
-    valid_hex(s, 64)
+    valid_hex(s, 64) && !s.bytes().any(|c| c.is_ascii_uppercase())
+}
+
+/// Where a list goes on from: empty, or (the start of) an id in the one spelling ids have.
+fn ok_cursor(s: &str) -> bool {
+    s.len() <= 64 && s.bytes().all(|c| matches!(c, b'0'..=b'9' | b'a'..=b'f'))
 }
 
 pub const MARKER: &str = ".rustsync-backup";
@@ -461,10 +468,10 @@ impl Depot {
                 }
             }
             Msg::DepotList { after, .. } => {
-                if after.len() > 64 || !after.chars().all(|c| c.is_ascii_hexdigit()) {
+                if !ok_cursor(&after) {
                     return None;
                 }
-                postcard::to_allocvec(&self.list_page(&after.to_lowercase())).ok()
+                postcard::to_allocvec(&self.list_page(&after)).ok()
             }
             Msg::DepotHave { ids, .. } => {
                 let mut missing: Vec<String> = Vec::new();
@@ -478,10 +485,10 @@ impl Depot {
             }
             Msg::DepotStat { .. } => postcard::to_allocvec(&(self.used(), self.quota())).ok(),
             Msg::DepotBlobs { after, min_age, .. } => {
-                if after.len() > 64 || !after.chars().all(|c| c.is_ascii_hexdigit()) {
+                if !ok_cursor(&after) {
                     return None;
                 }
-                postcard::to_allocvec(&self.old_blobs(after.to_lowercase(), min_age).await).ok()
+                postcard::to_allocvec(&self.old_blobs(after, min_age).await).ok()
             }
             Msg::DepotDelete { ids, .. } => {
                 if ids.len() > MAX_DELETE {
@@ -505,6 +512,28 @@ mod tests {
     fn age_blob(depot: &Depot, id: &str, days: u64) {
         let f = std::fs::OpenOptions::new().write(true).open(depot.blob_path(id)).unwrap();
         f.set_modified(SystemTime::now() - std::time::Duration::from_secs(days * 24 * 3600)).unwrap();
+    }
+
+    #[test]
+    fn ids_have_one_spelling() {
+        assert!(ok_id(&"0a".repeat(32)));
+        assert!(!ok_id(&"0A".repeat(32)));
+        assert!(!ok_id(&"0a".repeat(31)));
+        assert!(!ok_id(&"zz".repeat(32)));
+        assert!(ok_cursor("") && ok_cursor("0af") && ok_cursor(&"f".repeat(64)));
+        assert!(!ok_cursor("0AF") && !ok_cursor(&"f".repeat(65)) && !ok_cursor("../x"));
+        let dir = std::env::temp_dir().join(format!("rustsync-depotcase-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let depot = Depot::open(&dir, "lib", true, 0).unwrap();
+        run(async {
+            let upper = Msg::DepotPut { req: 1, kind: KIND_RECORD, lib: "lib".into(), id: "AB".repeat(32), stamp: 1, data: vec![0; 4] };
+            assert!(depot.serve(upper).await.is_none());
+            let lower = Msg::DepotPut { req: 2, kind: KIND_RECORD, lib: "lib".into(), id: "ab".repeat(32), stamp: 1, data: vec![0; 4] };
+            assert!(depot.serve(lower).await.is_some());
+            assert!(depot.serve(Msg::DepotList { req: 3, lib: "lib".into(), after: "AB".into() }).await.is_none());
+            assert!(depot.serve(Msg::DepotList { req: 4, lib: "lib".into(), after: String::new() }).await.is_some());
+        });
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

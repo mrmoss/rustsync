@@ -278,6 +278,14 @@ impl Remote {
     }
 
     async fn call(&self, make: impl FnOnce(u64) -> Msg) -> Result<Vec<u8>> {
+        match self.try_call(make).await? {
+            Some(data) => Ok(data),
+            None => bail!("the other side could not or would not serve the request"),
+        }
+    }
+
+    /// Like `call`, but a refusal is `Ok(None)` (only a broken connection is an error).
+    async fn try_call(&self, make: impl FnOnce(u64) -> Msg) -> Result<Option<Vec<u8>>> {
         let req = self.next.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = oneshot::channel();
         self.pending.lock().unwrap().insert(req, tx);
@@ -286,8 +294,7 @@ impl Remote {
             bail!("session closed");
         }
         match tokio::time::timeout(Duration::from_secs(60), rx).await {
-            Ok(Ok(Some(data))) => Ok(data),
-            Ok(Ok(None)) => bail!("the other side could not or would not serve the request"),
+            Ok(Ok(answer)) => Ok(answer),
             Ok(Err(_)) => bail!("session closed"),
             Err(_) => {
                 self.pending.lock().unwrap().remove(&req);
@@ -3626,6 +3633,9 @@ async fn depot_push(
     entries: Vec<Entry>,
     known: &mut HashMap<(String, String), u64>,
 ) -> Result<()> {
+    // A record the backup machine refuses (its clock may be far behind, for example) does not
+    // stop the others; it is tried again with the next upload.
+    let mut refused = 0usize;
     for e in entries {
         let slot = rt.vault.slot(&e.path);
         if known
@@ -3670,11 +3680,22 @@ async fn depot_push(
 
         let record = rt.vault.seal_record(&slot, &e)?;
         let (lib_s, id, stamp) = (lib.to_string(), slot.clone(), e.stamp);
-        remote
-            .call(move |req| Msg::DepotPut { req, kind: KIND_RECORD, lib: lib_s, id, stamp, data: record })
+        let stored = remote
+            .try_call(move |req| Msg::DepotPut { req, kind: KIND_RECORD, lib: lib_s, id, stamp, data: record })
             .await?;
+        if stored.is_none() {
+            refused += 1;
+            debug!("the backup machine refused the record of {}", e.path);
+            continue;
+        }
         known.insert((lib.to_string(), slot), stamp);
         debug!("uploaded {}", e.path);
+    }
+    if refused > 0 {
+        bail!(
+            "the backup machine refused {} file record(s); the rest was uploaded. Its clock may be wrong (it refuses changes dated more than 3 days after its own time), or the backup is full. They are tried again with the next upload",
+            refused
+        );
     }
     Ok(())
 }
