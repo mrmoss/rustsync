@@ -11,15 +11,39 @@ use std::fs;
 use std::io::Read;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::{debug, warn};
 
-pub const CHUNK: usize = 128 * 1024;
+/// Files are cut into equal pieces ("chunks"); the size of the pieces depends only on the size of
+/// the file, so every device cuts a file the same way: small pieces for small files (little is
+/// sent again after a change), large pieces for large files (far fewer requests and hashes).
+pub const SMALL_CHUNK: usize = 128 * 1024;
+pub const MEDIUM_CHUNK: usize = 1024 * 1024;
+pub const MAX_CHUNK: usize = 4 * 1024 * 1024;
+const SMALL_FILE: u64 = 64 * 1024 * 1024;
+const MEDIUM_FILE: u64 = 16 * 1024 * 1024 * 1024;
 pub const TMP_PREFIX: &str = ".fsync-tmp-";
 /// Largest file we sync: its chunk list must fit comfortably in one index message.
 pub const MAX_CHUNKS: usize = 131_072;
-pub const MAX_FILE_SIZE: u64 = MAX_CHUNKS as u64 * CHUNK as u64;
+pub const MAX_FILE_SIZE: u64 = MAX_CHUNKS as u64 * MAX_CHUNK as u64;
+
+/// The size of the pieces a file of this size is cut into.
+pub fn chunk_size(file_size: u64) -> usize {
+    if file_size <= SMALL_FILE {
+        SMALL_CHUNK
+    } else if file_size <= MEDIUM_FILE {
+        MEDIUM_CHUNK
+    } else {
+        MAX_CHUNK
+    }
+}
+
+/// How many pieces a file of this size has.
+pub fn chunk_count(file_size: u64) -> u64 {
+    file_size.div_ceil(chunk_size(file_size) as u64)
+}
 const MAX_PATH_BYTES: usize = 4096;
 const MAX_NAME_BYTES: usize = 255;
 
@@ -43,7 +67,7 @@ pub struct Entry {
     pub stamp: u64,
     /// blake3 of the whole file (hex).
     pub hash: String,
-    /// blake3 of each CHUNK-sized block (hex).
+    /// blake3 of each piece (hex); see `chunk_size`.
     pub chunks: Vec<String>,
 }
 
@@ -134,7 +158,7 @@ pub fn sanitize_remote(mut e: Entry, now: u64, max_skew: u64) -> Result<Entry, &
                 if e.chunks.len() > MAX_CHUNKS || e.size > MAX_FILE_SIZE {
                     return Err("file too large");
                 }
-                if e.chunks.len() as u64 != e.size.div_ceil(CHUNK as u64) {
+                if e.chunks.len() as u64 != chunk_count(e.size) {
                     return Err("size does not match the number of chunks");
                 }
                 if !is_hex64(&e.hash) || !e.chunks.iter().all(|c| is_hex64(c)) {
@@ -235,6 +259,10 @@ pub struct Folder {
     pub max_skew_ns: u64,
     /// Held while scanning and while committing remote changes, so the two never interleave.
     pub fs_lock: tokio::sync::Mutex<()>,
+    /// How many files of this library are written at the same time (1 on a hard disk).
+    pub files_at_once: AtomicUsize,
+    /// How many files are read and hashed at the same time when scanning (1 on a hard disk).
+    pub hash_threads: AtomicUsize,
 }
 
 impl Folder {
@@ -248,7 +276,12 @@ impl Folder {
         if let Ok(bytes) = fs::read(&state_path) {
             match serde_json::from_slice::<Vec<Entry>>(&bytes) {
                 Ok(list) => {
-                    for e in list {
+                    for mut e in list {
+                        // Indexed by a version that cut files differently: forget what we saw
+                        // of the file, so the next scan reads it again.
+                        if e.is_live_file() && e.chunks.len() as u64 != chunk_count(e.size) {
+                            e.mtime_ns = 0;
+                        }
                         index.insert(e.path.clone(), e);
                     }
                 }
@@ -262,6 +295,8 @@ impl Folder {
             index: Mutex::new(index),
             max_skew_ns,
             fs_lock: tokio::sync::Mutex::new(()),
+            files_at_once: AtomicUsize::new(2),
+            hash_threads: AtomicUsize::new(1),
         })
     }
 
@@ -328,9 +363,11 @@ fn read_full<R: Read>(r: &mut R, buf: &mut [u8]) -> std::io::Result<usize> {
 /// Returns (whole-file hash, per-chunk hashes, size).
 pub fn hash_file(path: &Path, root: &Path) -> std::io::Result<(String, Vec<String>, u64)> {
     let mut f = open_nofollow(path, root)?;
+    // The size decides how the file is cut, so it has to be known before reading.
+    let chunk = chunk_size(f.metadata()?.len());
     let mut whole = blake3::Hasher::new();
     let mut chunks = Vec::new();
-    let mut buf = vec![0u8; CHUNK];
+    let mut buf = vec![0u8; chunk];
     let mut total = 0u64;
     loop {
         let n = read_full(&mut f, &mut buf)?;
@@ -340,9 +377,13 @@ pub fn hash_file(path: &Path, root: &Path) -> std::io::Result<(String, Vec<Strin
         whole.update(&buf[..n]);
         chunks.push(blake3::hash(&buf[..n]).to_hex().to_string());
         total += n as u64;
-        if n < CHUNK {
+        if n < chunk {
             break;
         }
+    }
+    if chunk_size(total) != chunk || chunks.len() as u64 != chunk_count(total) {
+        // It grew or shrank while we read it: the next scan reads it again.
+        return Err(std::io::Error::new(std::io::ErrorKind::Other, "the file changed while it was read"));
     }
     Ok((whole.finalize().to_hex().to_string(), chunks, total))
 }
@@ -371,8 +412,47 @@ pub fn scan(folder: &Folder, roots: &[String], deep: bool) -> Vec<Entry> {
     let mut seen: HashSet<String> = HashSet::new();
     let mut updates: Vec<Entry> = Vec::new();
     let mut changed: Vec<Entry> = Vec::new();
+    let mut to_hash: Vec<ToHash> = Vec::new();
     for r in &kept {
-        walk(folder, r, &old, deep, &mut seen, &mut updates, &mut changed);
+        walk(folder, r, &old, deep, &mut seen, &mut updates, &mut changed, &mut to_hash);
+    }
+
+    // Read and hash the files that look new or changed: several at once on an SSD, one after
+    // another on a hard disk (where reading several files at once only makes the heads jump).
+    let threads = folder.hash_threads.load(Ordering::Relaxed).clamp(1, 16);
+    let hashes = hash_all(folder, &to_hash, threads);
+    for (item, hashed) in to_hash.iter().zip(hashes) {
+        let prev = old.get(&item.rel);
+        match hashed {
+            Ok((hash, chunks, size)) => {
+                if let Some(o) = prev {
+                    if o.is_live_file() && o.hash == hash && o.mode == item.mode && o.chunks == chunks {
+                        // Same content (e.g. only mtime moved): refresh the cache silently.
+                        if o.mtime_ns != item.mtime || o.size != size {
+                            let mut e = o.clone();
+                            e.mtime_ns = item.mtime;
+                            e.size = size;
+                            updates.push(e);
+                        }
+                        continue;
+                    }
+                }
+                let e = Entry {
+                    path: item.rel.clone(),
+                    kind: Kind::File,
+                    deleted: false,
+                    mode: item.mode,
+                    size,
+                    mtime_ns: item.mtime,
+                    stamp: next_stamp(prev),
+                    hash,
+                    chunks,
+                };
+                updates.push(e.clone());
+                changed.push(e);
+            }
+            Err(e) => warn!("cannot read {}: {}", item.rel, e),
+        }
     }
 
     for (p, o) in &old {
@@ -405,6 +485,39 @@ pub fn scan(folder: &Folder, roots: &[String], deep: bool) -> Vec<Entry> {
     changed
 }
 
+/// A file the scan has to read: it is new, or its size or change time moved.
+struct ToHash {
+    rel: String,
+    abs: PathBuf,
+    mode: u32,
+    mtime: u64,
+}
+
+type Hashed = std::io::Result<(String, Vec<String>, u64)>;
+
+/// Hash the files, `threads` at a time; the results are in the order of `items`.
+fn hash_all(folder: &Folder, items: &[ToHash], threads: usize) -> Vec<Hashed> {
+    if threads <= 1 || items.len() <= 1 {
+        return items.iter().map(|i| hash_file(&i.abs, &folder.root)).collect();
+    }
+    let next = AtomicUsize::new(0);
+    let done: Mutex<Vec<(usize, Hashed)>> = Mutex::new(Vec::with_capacity(items.len()));
+    std::thread::scope(|s| {
+        for _ in 0..threads.min(items.len()) {
+            s.spawn(|| loop {
+                let i = next.fetch_add(1, Ordering::Relaxed);
+                let Some(item) = items.get(i) else { break };
+                let r = hash_file(&item.abs, &folder.root);
+                done.lock().unwrap().push((i, r));
+            });
+        }
+    });
+    let mut done = done.into_inner().unwrap();
+    done.sort_by_key(|(i, _)| *i);
+    done.into_iter().map(|(_, r)| r).collect()
+}
+
+#[allow(clippy::too_many_arguments)]
 fn walk(
     folder: &Folder,
     rel: &str,
@@ -413,6 +526,7 @@ fn walk(
     seen: &mut HashSet<String>,
     updates: &mut Vec<Entry>,
     changed: &mut Vec<Entry>,
+    to_hash: &mut Vec<ToHash>,
 ) {
     if rel.split('/').any(|c| c.starts_with(TMP_PREFIX)) {
         return;
@@ -467,7 +581,7 @@ fn walk(
         names.sort();
         for n in names {
             let child = if rel.is_empty() { n } else { format!("{}/{}", rel, n) };
-            walk(folder, &child, old, deep, seen, updates, changed);
+            walk(folder, &child, old, deep, seen, updates, changed, to_hash);
         }
     } else if md.is_file() {
         seen.insert(rel.to_string());
@@ -491,36 +605,7 @@ fn walk(
             }
         }
 
-        match hash_file(&abs, &folder.root) {
-            Ok((hash, chunks, size)) => {
-                if let Some(o) = prev {
-                    if o.is_live_file() && o.hash == hash && o.mode == mode {
-                        // Same content (e.g. only mtime moved): refresh the cache silently.
-                        if o.mtime_ns != mtime || o.size != size {
-                            let mut e = o.clone();
-                            e.mtime_ns = mtime;
-                            e.size = size;
-                            updates.push(e);
-                        }
-                        return;
-                    }
-                }
-                let e = Entry {
-                    path: rel.to_string(),
-                    kind: Kind::File,
-                    deleted: false,
-                    mode,
-                    size,
-                    mtime_ns: mtime,
-                    stamp: next_stamp(prev),
-                    hash,
-                    chunks,
-                };
-                updates.push(e.clone());
-                changed.push(e);
-            }
-            Err(e) => warn!("cannot read {}: {}", rel, e),
-        }
+        to_hash.push(ToHash { rel: rel.to_string(), abs, mode, mtime });
     }
 }
 
@@ -538,7 +623,7 @@ mod tests {
     }
 
     fn file_entry(size: u64) -> Entry {
-        let n = size.div_ceil(CHUNK as u64) as usize;
+        let n = chunk_count(size) as usize;
         Entry {
             path: "a/b.txt".into(),
             kind: Kind::File,
@@ -585,8 +670,13 @@ mod tests {
         let skew = 1_000_000_000u64;
         assert!(sanitize_remote(file_entry(0), now, skew).is_ok());
         assert!(sanitize_remote(file_entry(1), now, skew).is_ok());
-        assert!(sanitize_remote(file_entry(CHUNK as u64), now, skew).is_ok());
-        assert!(sanitize_remote(file_entry(CHUNK as u64 + 1), now, skew).is_ok());
+        assert!(sanitize_remote(file_entry(SMALL_CHUNK as u64), now, skew).is_ok());
+        assert!(sanitize_remote(file_entry(SMALL_CHUNK as u64 + 1), now, skew).is_ok());
+        // a large file has large pieces; a list cut the old way is refused
+        assert!(sanitize_remote(file_entry(SMALL_FILE + 1), now, skew).is_ok());
+        let mut e = file_entry(SMALL_FILE + 1);
+        e.chunks = vec!["1".repeat(64); (SMALL_FILE + 1).div_ceil(SMALL_CHUNK as u64) as usize];
+        assert!(sanitize_remote(e, now, skew).is_err());
 
         let mut e = file_entry(1);
         e.chunks.clear(); // size says one chunk
@@ -617,6 +707,49 @@ mod tests {
         let mut e = file_entry(1);
         e.mode = 0o7777;
         assert_eq!(sanitize_remote(e, now, skew).unwrap().mode, 0o755);
+    }
+
+    #[test]
+    fn files_are_cut_by_their_size() {
+        assert_eq!(chunk_size(0), SMALL_CHUNK);
+        assert_eq!(chunk_size(SMALL_FILE), SMALL_CHUNK);
+        assert_eq!(chunk_size(SMALL_FILE + 1), MEDIUM_CHUNK);
+        assert_eq!(chunk_size(MEDIUM_FILE), MEDIUM_CHUNK);
+        assert_eq!(chunk_size(MEDIUM_FILE + 1), MAX_CHUNK);
+        assert_eq!(chunk_count(0), 0);
+        assert_eq!(chunk_count(1), 1);
+        assert_eq!(chunk_count(SMALL_FILE), 512);
+        assert_eq!(chunk_count(SMALL_FILE + 1), 65);
+        // the largest file still fits the list of pieces
+        assert!(chunk_count(MAX_FILE_SIZE) <= MAX_CHUNKS as u64);
+    }
+
+    #[test]
+    fn scanning_with_several_threads_finds_the_same_files() {
+        let dir = std::env::temp_dir().join(format!("rustsync-scan-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let (data, state) = (dir.join("data"), dir.join("state"));
+        fs::create_dir_all(data.join("sub")).unwrap();
+        for i in 0..20u8 {
+            fs::write(data.join(format!("f{}", i)), vec![i; 1000 + i as usize]).unwrap();
+        }
+        fs::write(data.join("sub/big"), vec![7u8; SMALL_CHUNK * 2 + 5]).unwrap();
+        let hashes = |threads: usize, id: &str| {
+            let folder = Folder::open(id.to_string(), data.to_str().unwrap(), &state, 0).unwrap();
+            folder.hash_threads.store(threads, Ordering::Relaxed);
+            let mut found: Vec<(String, String, usize)> = scan(&folder, &[String::new()], false)
+                .into_iter()
+                .filter(|e| e.kind == Kind::File)
+                .map(|e| (e.path, e.hash, e.chunks.len()))
+                .collect();
+            found.sort();
+            found
+        };
+        let one = hashes(1, "one");
+        assert_eq!(one.len(), 21);
+        assert_eq!(one, hashes(4, "four"));
+        assert_eq!(one.iter().find(|e| e.0 == "sub/big").unwrap().2, 3);
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

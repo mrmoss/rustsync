@@ -23,6 +23,12 @@ pub enum Request {
     Rename { device: String, nickname: String },
     /// Listen on another port from now on (also written to the config file).
     SetPort { port: u16 },
+    /// Choose how hard this machine works: laptop, desktop, server, phone or custom.
+    SetProfile { profile: String },
+    /// Speed limits in bytes per second (0 = none).
+    SetLimits { upload: u64, download: u64 },
+    /// Say what a library's folder is stored on here: ssd or hdd.
+    SetStorage { library: String, storage: String },
     /// The newest lines of the activity log, about a device and/or a library (both empty: all).
     Log { device: Option<String>, library: Option<String>, lines: usize },
     /// How much the logs may grow (bytes; also written to the config file).
@@ -117,6 +123,14 @@ pub struct StatusInfo {
     /// The Tailscale integration: None while it is off.
     #[serde(default)]
     pub tailnet: Option<TailnetInfo>,
+    /// How hard this machine works: laptop, desktop, server, phone or custom.
+    #[serde(default)]
+    pub profile: String,
+    /// Speed limits in bytes per second (0 = none).
+    #[serde(default)]
+    pub upload_limit: u64,
+    #[serde(default)]
+    pub download_limit: u64,
     pub devices: Vec<DeviceInfo>,
     /// Libraries with a folder on this machine (including encrypted backups kept for others).
     pub libraries: Vec<LibraryInfo>,
@@ -267,6 +281,9 @@ pub struct LibraryInfo {
     pub quota: u64,
     /// Space used by our encrypted backups on other devices, as last reported by them.
     pub backups: Vec<BackupUsage>,
+    /// What the folder is stored on here: "ssd" or "hdd".
+    #[serde(default)]
+    pub storage: String,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]

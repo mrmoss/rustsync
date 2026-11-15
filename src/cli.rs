@@ -1350,6 +1350,63 @@ pub async fn run(config_path: &Path, cmd: Cmd) -> Result<()> {
             }
             Ok(())
         }
+        Cmd::Profile { name } => {
+            match name {
+                None => {
+                    let info = status(&ctl).await?;
+                    println!("Profile: {}", if info.profile.is_empty() { "desktop" } else { info.profile.as_str() });
+                    println!("Choose another with:  rustsync -c {} profile laptop|desktop|server|phone|custom", ctl.config.display());
+                }
+                Some(name) => {
+                    call(&ctl, &Request::SetProfile { profile: name }).await?;
+                }
+            }
+            Ok(())
+        }
+        Cmd::Limit { up, down } => {
+            let info = status(&ctl).await?;
+            let say = |v: u64| if v == 0 { "no limit".to_string() } else { format!("{} per second", proto::fmt_size(v)) };
+            if up.is_none() && down.is_none() {
+                println!("Sending:  {}", say(info.upload_limit));
+                println!("Fetching: {}", say(info.download_limit));
+                return Ok(());
+            }
+            let read = |text: Option<String>, now: u64| -> Result<u64> {
+                match text {
+                    None => Ok(now),
+                    Some(t) => proto::parse_size(&t).map_err(|e| anyhow!(e)),
+                }
+            };
+            let upload = read(up, info.upload_limit)?;
+            let download = read(down, info.download_limit)?;
+            call(&ctl, &Request::SetLimits { upload, download }).await?;
+            Ok(())
+        }
+        Cmd::Storage { library, kind } => {
+            let info = status(&ctl).await?;
+            let libs: Vec<proto::LibraryInfo> = info.libraries.iter().filter(|l| !l.backup_only).cloned().collect();
+            if libs.is_empty() {
+                println!("There are no libraries on this machine yet.");
+                return Ok(());
+            }
+            let word = |s: &str| if s == "hdd" { "hard disk" } else { "SSD" };
+            let labels: Vec<String> =
+                libs.iter().map(|l| format!("{}  ({})  on {}", l.name, l.folder, word(&l.storage))).collect();
+            if library.is_none() && kind.is_none() {
+                for l in &labels {
+                    println!("{}", l);
+                }
+                return Ok(());
+            }
+            let i = pick("library", &labels, library, |i, t| name_or_prefix(&libs[i].name, &libs[i].id, t))?;
+            match kind {
+                None => println!("{} is on {}.", libs[i].name, word(&libs[i].storage)),
+                Some(kind) => {
+                    call(&ctl, &Request::SetStorage { library: libs[i].id.clone(), storage: kind }).await?;
+                }
+            }
+            Ok(())
+        }
         Cmd::Quota { library, size } => {
             let info = status(&ctl).await?;
             let backups: Vec<proto::LibraryInfo> = info.libraries.iter().filter(|l| l.backup_only).cloned().collect();

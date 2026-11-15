@@ -14,10 +14,11 @@ use crate::activity;
 use crate::apply;
 use crate::config::{self, Config};
 use crate::depot::Depot;
-use crate::index::{self, Entry, Folder, CHUNK};
+use crate::index::{self, chunk_size, Entry, Folder, MAX_CHUNK};
 use crate::net::{self, Keys, Reassembler};
 use crate::proto::{fmt_size, BackupUsage, DeviceInfo, LibraryInfo, OfferInfo, Reply, Request, StatusInfo, SyncInfo, TailnetInfo};
 use crate::tailnet;
+use crate::tuning::{self, Limiter, Profile, Storage, Tuning};
 use crate::state::{Device, LibMode, Library, Member, Offer, Role, State};
 use crate::traffic::Traffic;
 use crate::vault::{self, Vault};
@@ -25,13 +26,12 @@ use anyhow::{anyhow, bail, Context, Result};
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
-use std::io::SeekFrom;
 use std::path::{Path, PathBuf};
 use std::net::IpAddr;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncSeekExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::{TcpListener, TcpStream, UnixListener, UnixStream};
 use tokio::sync::{mpsc, oneshot, OwnedSemaphorePermit, Semaphore};
@@ -54,7 +54,17 @@ const MAX_BACKUP_HINTS: usize = 64; // new backup locations learned from one dev
 const OUT_QUEUE: usize = 256; // messages waiting to be sent to one device
 const FRAME_QUEUE: usize = 64; // received frames waiting to be processed
 const MAX_QUEUED_APPLY: usize = 64 * 1024 * 1024; // bytes of index updates waiting to be applied
-const MAX_SERVE: usize = 16; // requests from one device answered at the same time
+// Data being read for one device, or waiting to be sent to it: requests beyond this wait.
+const SERVE_BUDGET: u64 = 64 * 1024 * 1024;
+const MAX_SERVE_WAITING: usize = 2048; // requests from one device that may wait for their turn
+const DATA_QUEUE: usize = 4; // answers with data waiting for the connection
+const OPEN_FILES: usize = 8; // files kept open while a device fetches them
+const OPEN_FILE_IDLE: Duration = Duration::from_secs(10);
+/// A request is given up after this long (a dead connection is noticed much sooner, see the
+/// reader). Long, because on a slow link a full window of data takes a while.
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(600);
+/// The connection is written in pieces of this size; each has to go out within WRITE_TIMEOUT.
+const WRITE_PIECE: usize = 256 * 1024;
 const WRITE_TIMEOUT: Duration = Duration::from_secs(60); // a device that stops reading is dropped
 const MAX_HANDSHAKES: usize = 32; // connections that have not proven who they are yet
 const MAX_HANDSHAKES_PER_IP: u32 = 4;
@@ -261,9 +271,26 @@ pub struct Remote {
     vault: Option<Arc<Vault>>,
     /// Counts what arrives, for the progress shown in the window.
     traffic: Option<Arc<Traffic>>,
+    /// How much data may be asked for and not yet written (in units, see `tuning`).
+    window: Arc<Semaphore>,
+    window_units: u32,
+    /// Files being written at the same time, over all libraries and devices.
+    files: Arc<Semaphore>,
+    /// The download speed limit.
+    down: Arc<Limiter>,
 }
 
 impl Remote {
+    /// Wait for a turn to write a file (the device writes only so many at once).
+    pub async fn file_slot(&self) -> Option<OwnedSemaphorePermit> {
+        self.files.clone().acquire_owned().await.ok()
+    }
+
+    /// How many pieces of this size may be on their way at the same time.
+    pub fn chunks_ahead(&self, chunk: usize) -> usize {
+        ((self.window_units as usize * tuning::UNIT) / chunk.max(1)).clamp(2, 64)
+    }
+
     /// One file of a batch from this device is finished.
     pub fn file_done(&self, lib: &str) {
         if let Some(t) = &self.traffic {
@@ -293,7 +320,7 @@ impl Remote {
             self.pending.lock().unwrap().remove(&req);
             bail!("session closed");
         }
-        match tokio::time::timeout(Duration::from_secs(60), rx).await {
+        match tokio::time::timeout(REQUEST_TIMEOUT, rx).await {
             Ok(Ok(answer)) => Ok(answer),
             Ok(Err(_)) => bail!("session closed"),
             Err(_) => {
@@ -303,8 +330,19 @@ impl Remote {
         }
     }
 
-    /// Fetch one plaintext chunk: from a peer directly, or from the depot (then decrypted here).
-    pub async fn get_chunk(&self, lib: String, path: String, index: u32, hash: String) -> Result<Vec<u8>> {
+    /// Fetch one plaintext chunk of `len` bytes: from a peer directly, or from the depot (then
+    /// decrypted here). It waits for room in the window first; the room is given back when the
+    /// returned permit is dropped (after the data was written).
+    pub async fn get_chunk(
+        &self,
+        lib: String,
+        path: String,
+        index: u32,
+        hash: String,
+        len: u64,
+    ) -> Result<(Vec<u8>, Option<OwnedSemaphorePermit>)> {
+        let room = self.window.clone().acquire_many_owned(tuning::units(len, self.window_units)).await.ok();
+        self.down.take(len.min(MAX_CHUNK as u64) as usize).await;
         let lib_id = lib.clone();
         let data = if let Some(vault) = &self.vault {
             let id = vault.blob_id(&hash);
@@ -319,8 +357,74 @@ impl Remote {
         if let Some(t) = &self.traffic {
             t.got(&lib_id, data.len());
         }
-        Ok(data)
+        Ok((data, room))
     }
+}
+
+/// Files kept open while another device fetches them piece by piece (opening a file, with the
+/// checks that go with it, for every piece is slow). Belongs to one connection.
+#[derive(Default)]
+struct OpenFiles {
+    files: Mutex<HashMap<(String, String), (Arc<std::fs::File>, Instant)>>,
+}
+
+impl OpenFiles {
+    /// The open file for a path of a library; `fresh` opens it again even if it is held open
+    /// (the file may have been replaced by a new one of the same name).
+    fn get(&self, folder: &Folder, path: &str, fresh: bool) -> Option<Arc<std::fs::File>> {
+        let key = (folder.id.clone(), path.to_string());
+        let now = Instant::now();
+        {
+            let mut files = self.files.lock().unwrap();
+            files.retain(|_, (_, used)| now.duration_since(*used) < OPEN_FILE_IDLE);
+            if fresh {
+                files.remove(&key);
+            } else if let Some((f, used)) = files.get_mut(&key) {
+                *used = now;
+                return Some(f.clone());
+            }
+        }
+        if !index::safe_rel(path) {
+            return None;
+        }
+        // Never follow a symlink, and make sure the file really is inside the library folder.
+        let f = Arc::new(index::open_nofollow(&folder.abs(path), &folder.root).ok()?);
+        let mut files = self.files.lock().unwrap();
+        if files.len() >= OPEN_FILES {
+            let oldest = files.iter().min_by_key(|(_, (_, used))| *used).map(|(k, _)| k.clone());
+            if let Some(k) = oldest {
+                files.remove(&k);
+            }
+        }
+        files.insert(key, (f.clone(), now));
+        Some(f)
+    }
+
+    fn forget(&self, folder: &Folder, path: &str) {
+        self.files.lock().unwrap().remove(&(folder.id.clone(), path.to_string()));
+    }
+
+    /// Close the files nothing was read from for a while.
+    fn close_idle(&self) {
+        let now = Instant::now();
+        self.files.lock().unwrap().retain(|_, (_, used)| now.duration_since(*used) < OPEN_FILE_IDLE);
+    }
+}
+
+/// Up to `len` bytes of the file starting at `offset` (fewer at the end of the file).
+fn read_piece(f: &std::fs::File, offset: u64, len: usize) -> std::io::Result<Vec<u8>> {
+    use std::os::unix::fs::FileExt;
+    let mut buf = vec![0u8; len];
+    let mut n = 0;
+    while n < len {
+        let k = f.read_at(&mut buf[n..], offset + n as u64)?;
+        if k == 0 {
+            break;
+        }
+        n += k;
+    }
+    buf.truncate(n);
+    Ok(buf)
 }
 
 // ---------------------------------------------------------------- node
@@ -550,6 +654,13 @@ pub struct Node {
     port: std::sync::atomic::AtomicU16,
     /// Stops the accept loop of the current listener when it is replaced.
     listener_stop: Mutex<CancellationToken>,
+    /// How hard this machine works (see `tuning`): the profile and the numbers that go with it.
+    profile: Mutex<(Profile, Tuning)>,
+    /// Files being written at the same time, over all libraries (replaced when the profile changes).
+    file_slots: Mutex<Arc<Semaphore>>,
+    /// Speed limits for what is sent and what is fetched.
+    up: Arc<Limiter>,
+    down: Arc<Limiter>,
     /// Is the optional Tailscale integration on? (The only thing kept about it: the setting.)
     tailscale_on: AtomicBool,
     /// What Tailscale last said; only in memory, and only while the integration is on.
@@ -1150,6 +1261,9 @@ impl Node {
         self.check_protected(&std::fs::canonicalize(&lib.folder)?)?;
         let skew = self.cfg.sync_options.max_clock_skew_secs.saturating_mul(1_000_000_000);
         let folder = Arc::new(Folder::open(lib.id.clone(), &lib.folder, &self.cfg.dir, skew)?);
+        let (files, threads) = self.profile.lock().unwrap().1.for_library(lib.storage);
+        folder.files_at_once.store(files, Ordering::Relaxed);
+        folder.hash_threads.store(threads, Ordering::Relaxed);
         index::clean_tmp(&folder.root);
         let vault = Arc::new(Vault::new(&net::parse_hex32(&lib.vault, "the library's vault key")?));
         let rt = Arc::new(LibRuntime { folder: folder.clone(), vault, cancel: CancellationToken::new() });
@@ -1237,6 +1351,7 @@ impl Node {
         let lib = Library {
             id: net::hex(&random_bytes(16)),
             name: wanted.clone(),
+            storage: tuning::guess_storage(Path::new(&canon)),
             folder: canon,
             vault: net::hex(&random_bytes(32)),
             members: Vec::new(),
@@ -1469,6 +1584,7 @@ impl Node {
                 access: offer.access.clone(),
                 quota,
                 excluded: Vec::new(),
+                storage: Storage::default(),
             };
             self.start_backup(&lib, true)?;
             self.drop_other_offers(&lib.id, &offer.from);
@@ -1486,6 +1602,7 @@ impl Node {
         let lib = Library {
             id: offer.id.clone(),
             name: self.unique_name(&offer.name),
+            storage: tuning::guess_storage(Path::new(&canon)),
             folder: canon,
             vault: offer.vault.clone(),
             members: vec![Member { device: offer.from.clone(), role: Role::Peer, accepted: true }],
@@ -1544,6 +1661,7 @@ impl Node {
         let lib = Library {
             id: id.to_string(),
             name: self.unique_name(&clean_name(name)),
+            storage: tuning::guess_storage(Path::new(&canon)),
             folder: canon,
             vault: vault_hex.to_string(),
             members: vec![Member { device: device_key.to_string(), role: Role::Store, accepted: false }],
@@ -1762,6 +1880,7 @@ impl Node {
                         }
                     })
                     .collect(),
+                storage: l.storage.word().to_string(),
                 pending: l
                     .members
                     .iter()
@@ -1810,6 +1929,9 @@ impl Node {
             addresses,
             dns_names,
             tailnet,
+            profile: self.profile.lock().unwrap().0.word().to_string(),
+            upload_limit: self.up.rate(),
+            download_limit: self.down.rate(),
             log_max: activity::max(),
             log_file: self.cfg.dir.join(activity::FILE).to_string_lossy().to_string(),
             backup_dir: self.cfg.backup_dir_path().to_string_lossy().to_string(),
@@ -1817,6 +1939,82 @@ impl Node {
             libraries,
             offers,
         }
+    }
+
+    // ------------------------------------------------------------ performance
+
+    /// The numbers of the current profile reach the running libraries.
+    fn apply_tuning(&self) {
+        let tuned = self.profile.lock().unwrap().1;
+        let storage: HashMap<String, Storage> =
+            self.state.lock().unwrap().libraries.iter().map(|l| (l.id.clone(), l.storage)).collect();
+        for (id, rt) in self.libs.lock().unwrap().iter() {
+            let (files, threads) = tuned.for_library(storage.get(id).copied().unwrap_or_default());
+            rt.folder.files_at_once.store(files, Ordering::Relaxed);
+            rt.folder.hash_threads.store(threads, Ordering::Relaxed);
+        }
+    }
+
+    /// Choose how hard this machine works. Connections are made again so that they use the new
+    /// numbers (transfers in progress carry on from where they were).
+    pub fn set_profile(&self, name: &str) -> Result<String> {
+        let Some(profile) = Profile::parse(name) else {
+            bail!("unknown profile {:?}: use laptop, desktop, server, phone or custom", name.trim());
+        };
+        config::set_profile(&self.cfg.path, profile).context("cannot save the profile in the config file")?;
+        let tuned = self.cfg.performance.tuning(profile);
+        *self.profile.lock().unwrap() = (profile, tuned);
+        *self.file_slots.lock().unwrap() = Arc::new(Semaphore::new(tuned.files));
+        self.apply_tuning();
+        let sessions: Vec<CancellationToken> = self.sessions.lock().unwrap().values().map(|s| s.cancel.clone()).collect();
+        for s in sessions {
+            s.cancel();
+        }
+        Ok(format!(
+            "Profile: {}. Up to {} is asked for from a device at a time and up to {} file(s) are written at once.{}",
+            profile.word(),
+            fmt_size(tuned.window),
+            tuned.files,
+            if profile == Profile::Custom {
+                " The numbers come from `window` and `files` under [performance] in the config file (changes there need a restart)."
+            } else {
+                ""
+            }
+        ))
+    }
+
+    /// Speed limits in bytes per second; 0 = none. They apply at once.
+    pub fn set_limits(&self, upload: u64, download: u64) -> Result<String> {
+        // Below this a connection could not even keep itself alive.
+        const SLOWEST: u64 = 16 * 1024;
+        let fix = |v: u64| if v == 0 { 0 } else { v.max(SLOWEST) };
+        let (upload, download) = (fix(upload), fix(download));
+        config::set_limits(&self.cfg.path, upload, download).context("cannot save the limits in the config file")?;
+        self.up.set(upload);
+        self.down.set(download);
+        let say = |v: u64| if v == 0 { "no limit".to_string() } else { format!("{} per second", fmt_size(v)) };
+        Ok(format!("Sending: {}. Fetching: {}.", say(upload), say(download)))
+    }
+
+    /// Say what a library's folder is stored on here.
+    pub fn set_storage(&self, lib_id: &str, storage: &str) -> Result<String> {
+        let Some(storage) = Storage::parse(storage) else {
+            bail!("unknown storage {:?}: use ssd or hdd", storage.trim());
+        };
+        let name = {
+            let mut st = self.state.lock().unwrap();
+            let Some(lib) = st.libraries.iter_mut().find(|l| l.id == lib_id && l.mode == LibMode::Sync) else {
+                bail!("no such library here");
+            };
+            lib.storage = storage;
+            lib.name.clone()
+        };
+        self.save_state();
+        self.apply_tuning();
+        Ok(match storage {
+            Storage::Hdd => format!("{} is on a hard disk: its files are written and read one after another.", name),
+            Storage::Ssd => format!("{} is on an SSD: several of its files are written and read at once.", name),
+        })
     }
 
     // ------------------------------------------------------------ tailscale (optional)
@@ -2227,6 +2425,9 @@ impl Node {
             Request::Forget { device } => out(self.forget_device(&device)?),
             Request::SetAddress { device, addr } => out(self.set_device_address(&device, &addr)?),
             Request::SetPort { port } => out(self.set_port(port).await?),
+            Request::SetProfile { profile } => out(self.set_profile(&profile)?),
+            Request::SetLimits { upload, download } => out(self.set_limits(upload, download)?),
+            Request::SetStorage { library, storage } => out(self.set_storage(&library, &storage)?),
             Request::SetName { name } => out(self.set_own_name(&name)?),
             Request::SetTailscale { enabled } => out(self.set_tailscale(enabled)?),
             Request::Tailnet => Ok(vec![Reply::Tailnet(self.tailnet_now().await?), Reply::Done]),
@@ -2326,6 +2527,9 @@ pub async fn run_daemon(cfg: Config, keys: Keys) -> Result<()> {
     let state = State::load(&cfg.state_file())?;
     let port = cfg.server.port;
     let tailscale_on = cfg.tailscale.enabled;
+    let profile = cfg.performance.profile();
+    let tuned = cfg.performance.tuning(profile);
+    let (up_limit, down_limit) = cfg.performance.limits();
     let node = Arc::new(Node {
         name: Mutex::new(cfg.device_name()),
         cfg,
@@ -2347,6 +2551,10 @@ pub async fn run_daemon(cfg: Config, keys: Keys) -> Result<()> {
         next_session: AtomicU64::new(1),
         port: std::sync::atomic::AtomicU16::new(port),
         listener_stop: Mutex::new(CancellationToken::new()),
+        profile: Mutex::new((profile, tuned)),
+        file_slots: Mutex::new(Arc::new(Semaphore::new(tuned.files))),
+        up: Arc::new(Limiter::new(up_limit)),
+        down: Arc::new(Limiter::new(down_limit)),
         tailscale_on: AtomicBool::new(tailscale_on),
         tailnet: Mutex::new(TailnetCache::default()),
         shutdown: CancellationToken::new(),
@@ -3047,12 +3255,20 @@ async fn recv_bytes_for(stream: &mut TcpStream, t: &mut snow::TransportState, se
     Ok(bytes)
 }
 
-/// Send one message; returns how many bytes it was.
-async fn send(wr: &mut OwnedWriteHalf, t: &mut snow::TransportState, msg: &Msg) -> Result<usize> {
+/// Send one message; returns how many bytes it was. Only the task that writes the connection
+/// calls this, so the records go out in the order they were encrypted.
+async fn send(wr: &mut OwnedWriteHalf, t: &Mutex<snow::TransportState>, msg: &Msg, limit: &Limiter) -> Result<usize> {
     let bytes = postcard::to_allocvec(msg)?;
-    tokio::time::timeout(WRITE_TIMEOUT, net::send_message(wr, t, &bytes))
-        .await
-        .map_err(|_| anyhow!("the other side stopped reading"))??;
+    let wire = {
+        let mut t = t.lock().unwrap();
+        net::seal_message(&mut t, &bytes)?
+    };
+    for piece in wire.chunks(WRITE_PIECE) {
+        limit.take(piece.len()).await;
+        tokio::time::timeout(WRITE_TIMEOUT, wr.write_all(piece))
+            .await
+            .map_err(|_| anyhow!("the other side stopped reading"))??;
+    }
     Ok(bytes.len())
 }
 
@@ -3095,9 +3311,9 @@ async fn establish(
 async fn session_loop(
     node: &Arc<Node>,
     dev: &Device,
-    mut transport: snow::TransportState,
+    transport: snow::TransportState,
     rd: OwnedReadHalf,
-    mut wr: OwnedWriteHalf,
+    wr: OwnedWriteHalf,
     tx: mpsc::Sender<Msg>,
     mut out_rx: mpsc::Receiver<Msg>,
     jobs_tx: mpsc::UnboundedSender<DepotJob>,
@@ -3108,7 +3324,7 @@ async fn session_loop(
     // is small: when we fall behind, we stop reading and TCP slows the sender down.
     let (frame_tx, mut frame_rx) = mpsc::channel::<std::io::Result<Vec<u8>>>(FRAME_QUEUE);
     let reader = tokio::spawn(async move {
-        let mut rd = rd;
+        let mut rd = BufReader::with_capacity(256 * 1024, rd);
         loop {
             let f = match tokio::time::timeout(Duration::from_secs(45), net::read_frame(&mut rd)).await {
                 Ok(r) => r,
@@ -3123,13 +3339,47 @@ async fn session_loop(
 
     let traffic = node.traffic_for(&dev.key);
     traffic.new_session();
+
+    // Writer task: everything that goes out, so a slow or blocked send never keeps us from
+    // reading. Short messages (index updates, requests, pings) go before answers with data.
+    // An answer with data keeps its share of the serve budget until it is on the wire.
+    let transport = Arc::new(Mutex::new(transport));
+    let (data_tx, mut data_rx) = mpsc::channel::<(Msg, OwnedSemaphorePermit)>(DATA_QUEUE);
+    let mut writer = {
+        let (transport, traffic, limit) = (transport.clone(), traffic.clone(), node.up.clone());
+        tokio::spawn(async move {
+            let mut wr = wr;
+            loop {
+                let (msg, _budget) = tokio::select! {
+                    biased;
+                    m = out_rx.recv() => match m {
+                        Some(m) => (m, None),
+                        None => break,
+                    },
+                    d = data_rx.recv() => match d {
+                        Some((m, held)) => (m, Some(held)),
+                        None => break,
+                    },
+                };
+                let n = send(&mut wr, &transport, &msg, &limit).await?;
+                traffic.add_sent(n);
+            }
+            Ok::<(), anyhow::Error>(())
+        })
+    };
+
     let pending: Pending = Arc::new(Mutex::new(HashMap::new()));
+    let tuned = node.profile.lock().unwrap().1;
     let handle = Remote {
         tx: tx.clone(),
         pending: pending.clone(),
         next: Arc::new(AtomicU64::new(1)),
         vault: None,
         traffic: Some(traffic.clone()),
+        window: Arc::new(Semaphore::new(tuned.window_units() as usize)),
+        window_units: tuned.window_units(),
+        files: node.file_slots.lock().unwrap().clone(),
+        down: node.down.clone(),
     };
 
     // Libraries we sync with this device: its index batches are applied one after another.
@@ -3174,40 +3424,35 @@ async fn session_loop(
     }
     let _ = jobs_tx.send(DepotJob::SyncAll);
 
-    // At most MAX_SERVE requests from this device are answered at the same time; any more are
-    // refused straight away (the asker retries later).
-    let serve_slots = Arc::new(Semaphore::new(MAX_SERVE));
+    // Requests for data from this device wait for their turn: only so much is read from disk
+    // (and waits to be sent) at a time. Far too many waiting requests are refused.
+    let serve_units = (SERVE_BUDGET / tuning::UNIT as u64) as u32;
+    let serve_budget = Arc::new(Semaphore::new(serve_units as usize));
+    let serving = Arc::new(AtomicUsize::new(0));
+    let open_files = Arc::new(OpenFiles::default());
     let mut asm = Reassembler::default();
     let mut ping = tokio::time::interval(Duration::from_secs(15));
     let mut progress = tokio::time::interval(Duration::from_secs(1));
     let res: Result<()> = loop {
         tokio::select! {
             _ = cancel.cancelled() => { break Ok(()); }
-            _ = ping.tick() => {
-                match send(&mut wr, &mut transport, &Msg::Ping).await {
-                    Ok(n) => traffic.add_sent(n),
-                    Err(e) => break Err(e),
-                }
+            done = &mut writer => {
+                break match done {
+                    Ok(Ok(())) => Ok(()),
+                    Ok(Err(e)) => Err(e),
+                    Err(e) => Err(anyhow!("the sending side of the connection stopped: {}", e)),
+                };
             }
-            Some(m) = out_rx.recv() => {
-                match send(&mut wr, &mut transport, &m).await {
-                    Ok(n) => traffic.add_sent(n),
-                    Err(e) => break Err(e),
-                }
+            _ = ping.tick() => {
+                // (If the queue is full, plenty is being sent already.)
+                let _ = tx.try_send(Msg::Ping);
+                open_files.close_idle();
             }
             _ = progress.tick() => {
                 // Tell the device how much we still have to fetch from it (it shows that).
-                let mut failed = None;
                 for (lib, files, bytes) in traffic.report() {
-                    match send(&mut wr, &mut transport, &Msg::Progress { lib, files, bytes }).await {
-                        Ok(n) => traffic.add_sent(n),
-                        Err(e) => {
-                            failed = Some(e);
-                            break;
-                        }
-                    }
+                    let _ = tx.try_send(Msg::Progress { lib, files, bytes });
                 }
-                if let Some(e) = failed { break Err(e); }
             }
             f = frame_rx.recv() => {
                 let frame = match f {
@@ -3215,7 +3460,11 @@ async fn session_loop(
                     Some(Err(e)) => break Err(anyhow::Error::from(e)),
                     Some(Ok(fr)) => fr,
                 };
-                let bytes = match asm.push(&mut transport, &frame) {
+                let pushed = {
+                    let mut t = transport.lock().unwrap();
+                    asm.push(&mut t, &frame)
+                };
+                let bytes = match pushed {
                     Err(e) => break Err(e),
                     Ok(None) => continue,
                     Ok(Some(b)) => b,
@@ -3299,20 +3548,25 @@ async fn session_loop(
                         }
                     }
                     Msg::GetChunk { req, lib, path, index, hash } => {
-                        match serve_slots.clone().try_acquire_owned() {
-                            Ok(permit) => {
-                                let node = node.clone();
-                                let tx = tx.clone();
-                                let from = dev.key.clone();
-                                tokio::spawn(async move {
-                                    let _permit = permit;
-                                    let data = serve_chunk(&node, &from, &lib, &path, index, &hash).await;
-                                    let _ = tx.send(Msg::Chunk { req, data }).await;
-                                });
-                            }
-                            Err(_) => {
-                                let _ = tx.try_send(Msg::Chunk { req, data: None });
-                            }
+                        if serving.load(Ordering::Relaxed) >= MAX_SERVE_WAITING {
+                            let _ = tx.try_send(Msg::Chunk { req, data: None });
+                        } else {
+                            serving.fetch_add(1, Ordering::Relaxed);
+                            let node = node.clone();
+                            let (tx, data_tx) = (tx.clone(), data_tx.clone());
+                            let from = dev.key.clone();
+                            let (budget, files, serving) = (serve_budget.clone(), open_files.clone(), serving.clone());
+                            tokio::spawn(async move {
+                                match serve_chunk(&node, &from, &lib, &path, index, hash, files, budget, serve_units).await {
+                                    Some((data, held)) => {
+                                        let _ = data_tx.send((Msg::Chunk { req, data: Some(data) }, held)).await;
+                                    }
+                                    None => {
+                                        let _ = tx.send(Msg::Chunk { req, data: None }).await;
+                                    }
+                                }
+                                serving.fetch_sub(1, Ordering::Relaxed);
+                            });
                         }
                     }
                     // Encrypted-backup requests: only answered for libraries this device was
@@ -3320,30 +3574,44 @@ async fn session_loop(
                     other => {
                         let info = other.depot_req();
                         if let Some((req, lib)) = info {
-                            match serve_slots.clone().try_acquire_owned() {
-                                Ok(permit) => {
-                                    let depot = node.depot_for(&dev.key, &lib);
-                                    let wrote_record =
-                                        matches!(&other, Msg::DepotPut { kind, .. } if *kind == KIND_RECORD);
-                                    let tx = tx.clone();
-                                    let node = node.clone();
-                                    let from = dev.key.clone();
-                                    tokio::spawn(async move {
-                                        let _permit = permit;
-                                        let data = match depot {
-                                            Some(d) => d.serve(other).await,
-                                            None => None,
-                                        };
-                                        if wrote_record && data.is_some() {
-                                            // Other devices that back up here can fetch it right away.
-                                            node.notify_depot_changed(&lib, &from);
+                            if serving.load(Ordering::Relaxed) >= MAX_SERVE_WAITING {
+                                let _ = tx.try_send(Msg::Chunk { req, data: None });
+                            } else {
+                                serving.fetch_add(1, Ordering::Relaxed);
+                                let depot = node.depot_for(&dev.key, &lib);
+                                let wrote_record =
+                                    matches!(&other, Msg::DepotPut { kind, .. } if *kind == KIND_RECORD);
+                                // A chunk that is fetched can be as large as the largest piece of
+                                // a file; every other answer is small.
+                                let need = if matches!(&other, Msg::DepotGet { kind, .. } if *kind == KIND_BLOB) {
+                                    tuning::units(MAX_CHUNK as u64, serve_units)
+                                } else {
+                                    1
+                                };
+                                let (tx, data_tx) = (tx.clone(), data_tx.clone());
+                                let node = node.clone();
+                                let from = dev.key.clone();
+                                let (budget, serving) = (serve_budget.clone(), serving.clone());
+                                tokio::spawn(async move {
+                                    let held = budget.acquire_many_owned(need).await.ok();
+                                    let data = match depot {
+                                        Some(d) => d.serve(other).await,
+                                        None => None,
+                                    };
+                                    if wrote_record && data.is_some() {
+                                        // Other devices that back up here can fetch it right away.
+                                        node.notify_depot_changed(&lib, &from);
+                                    }
+                                    match (data, held) {
+                                        (Some(data), Some(held)) => {
+                                            let _ = data_tx.send((Msg::Chunk { req, data: Some(data) }, held)).await;
                                         }
-                                        let _ = tx.send(Msg::Chunk { req, data }).await;
-                                    });
-                                }
-                                Err(_) => {
-                                    let _ = tx.try_send(Msg::Chunk { req, data: None });
-                                }
+                                        _ => {
+                                            let _ = tx.send(Msg::Chunk { req, data: None }).await;
+                                        }
+                                    }
+                                    serving.fetch_sub(1, Ordering::Relaxed);
+                                });
                             }
                         }
                     }
@@ -3353,52 +3621,80 @@ async fn session_loop(
     };
 
     reader.abort();
+    writer.abort();
     // Fail any fetches still waiting on this session (apply tasks clean up their temp files).
     pending.lock().unwrap().clear();
     drop(apply_tx);
     res
 }
 
-async fn read_local_chunk(f: &Folder, path: &str, index: u32) -> Option<Vec<u8>> {
+/// One piece of a local file (for uploading it to an encrypted backup). `size` is the size the
+/// index has for the file: it decides how the file is cut.
+async fn read_local_chunk(f: &Folder, path: &str, index: u32, size: u64) -> Option<Vec<u8>> {
     if !index::safe_rel(path) {
         return None;
     }
-    // Never follow a symlink, and make sure the file really is inside the library folder.
-    let std_file = index::open_nofollow(&f.abs(path), &f.root).ok()?;
-    let mut file = tokio::fs::File::from_std(std_file);
-    file.seek(SeekFrom::Start(index as u64 * CHUNK as u64)).await.ok()?;
-    let mut buf = vec![0u8; CHUNK];
-    let mut n = 0;
-    while n < CHUNK {
-        let k = file.read(&mut buf[n..]).await.ok()?;
-        if k == 0 {
-            break;
-        }
-        n += k;
-    }
-    buf.truncate(n);
-    Some(buf)
+    let (abs, root) = (f.abs(path), f.root.clone());
+    let chunk = chunk_size(size);
+    tokio::task::spawn_blocking(move || {
+        // Never follow a symlink, and make sure the file really is inside the library folder.
+        let file = index::open_nofollow(&abs, &root).ok()?;
+        read_piece(&file, index as u64 * chunk as u64, chunk).ok()
+    })
+    .await
+    .ok()?
 }
 
-async fn serve_chunk(node: &Node, from: &str, lib: &str, path: &str, index: u32, hash: &str) -> Option<Vec<u8>> {
+/// Answer a request for one piece of a file: the data, and its share of the serve budget (kept
+/// until the answer is on the wire).
+#[allow(clippy::too_many_arguments)]
+async fn serve_chunk(
+    node: &Node,
+    from: &str,
+    lib: &str,
+    path: &str,
+    index: u32,
+    hash: String,
+    files: Arc<OpenFiles>,
+    budget: Arc<Semaphore>,
+    budget_units: u32,
+) -> Option<(Vec<u8>, OwnedSemaphorePermit)> {
     if !node.is_peer(lib, from) {
         return None;
     }
     let rt = node.lib_rt(lib)?;
-    {
-        // Only serve files that are in our index.
+    let size = {
+        // Only serve files that are in our index, and only the piece the index has there (so a
+        // wrong request costs no reading).
         let idx = rt.folder.index.lock().unwrap();
         let e = idx.get(path)?;
-        if !e.is_live_file() {
+        if !e.is_live_file() || e.chunks.get(index as usize) != Some(&hash) {
             return None;
         }
-    }
-    let buf = read_local_chunk(&rt.folder, path, index).await?;
-    if blake3::hash(&buf).to_hex().as_str() == hash {
-        Some(buf)
-    } else {
+        e.size
+    };
+    let chunk = chunk_size(size);
+    let held = budget.acquire_many_owned(tuning::units(chunk as u64, budget_units)).await.ok()?;
+    let (folder, path) = (rt.folder.clone(), path.to_string());
+    // Reading and hashing happen off the threads that serve the network.
+    let data = tokio::task::spawn_blocking(move || {
+        let offset = index as u64 * chunk as u64;
+        for fresh in [false, true] {
+            let file = files.get(&folder, &path, fresh)?;
+            if let Ok(buf) = read_piece(&file, offset, chunk) {
+                if blake3::hash(&buf).to_hex().as_str() == hash {
+                    return Some(buf);
+                }
+            }
+            // Not what the index says: the file may have been replaced by a new one since it
+            // was opened. Look once more with a freshly opened file.
+        }
+        files.forget(&folder, &path);
         None
-    }
+    })
+    .await
+    .ok()??;
+    Some((data, held))
 }
 
 // ---------------------------------------------------------------- depot (client side)
@@ -3658,7 +3954,7 @@ async fn depot_push(
                 if !missing.contains(id) {
                     continue;
                 }
-                let plain = match read_local_chunk(&rt.folder, &e.path, i as u32).await {
+                let plain = match read_local_chunk(&rt.folder, &e.path, i as u32, e.size).await {
                     Some(p) if blake3::hash(&p).to_hex().as_str() == e.chunks[i] => p,
                     _ => {
                         // The file changed since it was indexed; the next scan will re-send it.

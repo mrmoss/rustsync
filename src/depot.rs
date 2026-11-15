@@ -9,7 +9,7 @@
 //! A size limit (`quota`, 0 = none) caps what the folder may hold; `used` counts the bytes of
 //! all blobs and records.
 
-use crate::index::CHUNK;
+use crate::index::MAX_CHUNK;
 use crate::net::valid_hex;
 use crate::sync::{Msg, KIND_BLOB, KIND_RECORD};
 use anyhow::Result;
@@ -443,7 +443,7 @@ impl Depot {
                 }
                 match kind {
                     KIND_BLOB => {
-                        if data.len() > CHUNK + 64 {
+                        if data.len() > MAX_CHUNK + 64 {
                             return None;
                         }
                         self.put_blob(&id, data).await.then(Vec::new)

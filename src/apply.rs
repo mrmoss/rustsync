@@ -6,20 +6,19 @@
 //! hash before an atomic rename.
 
 use crate::index::{
-    disk_matches, fd_inside, mtime_of, now_ns, open_nofollow, remote_wins, sanitize_remote, Entry, Folder, Kind,
-    CHUNK, TMP_PREFIX,
+    chunk_size, disk_matches, fd_inside, mtime_of, now_ns, open_nofollow, remote_wins, sanitize_remote, Entry, Folder,
+    Kind, TMP_PREFIX,
 };
 use crate::sync::Remote;
 use anyhow::{anyhow, bail, Context, Result};
 use futures_util::StreamExt;
 use std::fs;
-use std::io::SeekFrom;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, UNIX_EPOCH};
-use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
+use tokio::sync::OwnedSemaphorePermit;
 use tracing::{debug, warn};
 
 static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -86,9 +85,23 @@ pub async fn apply_entries(folder: &Arc<Folder>, remote: &Remote, entries: Vec<E
         }
     }
 
-    for e in files {
-        let res = apply_file(folder, remote, &e).await;
-        remote.file_done(&folder.id);
+    // Several files at once where that helps (an SSD), one after another where it hurts (a hard
+    // disk); never more than the device allows in total.
+    let at_once = folder.files_at_once.load(Ordering::Relaxed).clamp(1, 16);
+    let (folder2, remote2) = (folder.clone(), remote.clone());
+    let jobs = futures_util::stream::iter(files)
+        .map(move |e| {
+            let (folder, remote) = (folder2.clone(), remote2.clone());
+            async move {
+                let _slot = remote.file_slot().await;
+                let res = apply_file(&folder, &remote, &e).await;
+                remote.file_done(&folder.id);
+                (e, res)
+            }
+        })
+        .buffer_unordered(at_once);
+    futures_util::pin_mut!(jobs);
+    while let Some((e, res)) = jobs.next().await {
         match res {
             Ok(true) => {
                 debug!("synced {}", e.path);
@@ -234,7 +247,7 @@ async fn build_temp(
     tmp: PathBuf,
 ) -> Result<()> {
     // New file, never following a symlink, and checked to really be inside the folder.
-    let mut out = {
+    let out = {
         use std::os::fd::AsRawFd;
         let mut opts = tokio::fs::OpenOptions::new();
         opts.write(true).create_new(true).mode(0o600).custom_flags(libc::O_NOFOLLOW);
@@ -244,35 +257,41 @@ async fn build_temp(
             let _ = tokio::fs::remove_file(&tmp).await;
             bail!("{} would be written outside the library folder (or that could not be confirmed: on Linux this needs /proc mounted)", e.path);
         }
-        f
+        f.into_std().await
     };
-    let mut old = if local_chunks.is_empty() {
-        None
-    } else {
-        Some(tokio::fs::File::from_std(open_nofollow(&abs, &root)?))
-    };
-    let mut whole = blake3::Hasher::new();
+    // Pieces of the local copy can be reused if both versions are cut the same way.
+    let chunk = chunk_size(e.size);
+    let same_cut = chunk_size(local_size) == chunk;
+    let old = if local_chunks.is_empty() || !same_cut { None } else { Some(open_nofollow(&abs, &root)?) };
 
     // (index, wanted hash, can we reuse the local chunk?)
     let items: Vec<(usize, String, bool)> = e
         .chunks
         .iter()
         .enumerate()
-        .map(|(i, want)| (i, want.clone(), local_chunks.get(i) == Some(want)))
+        .map(|(i, want)| (i, want.clone(), same_cut && local_chunks.get(i) == Some(want)))
         .collect();
     let path = e.path.clone();
     // The sender chooses the chunks, so check their sizes against what the entry declares: every
-    // chunk is CHUNK bytes except the last, and together they are exactly `size`.
+    // chunk has the size that goes with the file's size, except the last, and together they are
+    // exactly `size`.
     let (declared_size, chunk_count) = (e.size, e.chunks.len());
     let expected_len = move |i: usize| -> u64 {
         if i + 1 < chunk_count {
-            CHUNK as u64
+            chunk as u64
         } else {
-            declared_size.saturating_sub((chunk_count.saturating_sub(1) as u64) * CHUNK as u64)
+            declared_size.saturating_sub((chunk_count.saturating_sub(1) as u64) * chunk as u64)
         }
     };
 
-    // Missing chunks are fetched concurrently (8 in flight); results are consumed in order.
+    // Writing and hashing the whole file happen on their own thread, in order; this side only
+    // fetches. The small queue between the two holds the fetching back when the disk is slower.
+    let (piece_tx, piece_rx) = tokio::sync::mpsc::channel::<Piece>(2);
+    let writer = tokio::task::spawn_blocking(move || write_pieces(out, old, piece_rx, chunk, local_size, declared_size));
+
+    // Missing chunks are fetched several at a time (as many as the device's window allows);
+    // results are consumed in order.
+    let ahead = remote.chunks_ahead(chunk);
     let fetches = futures_util::stream::iter(items)
         .map(move |(i, want, reuse)| {
             let remote = remote.clone();
@@ -280,52 +299,100 @@ async fn build_temp(
             let folder_id = folder_id.clone();
             async move {
                 if reuse {
-                    return Ok::<Option<Vec<u8>>, anyhow::Error>(None);
+                    return Ok::<Piece, anyhow::Error>(Piece::Local(i));
                 }
-                let data = remote.get_chunk(folder_id, path, i as u32, want.clone()).await?;
-                if data.len() as u64 != expected_len(i) {
+                let len = expected_len(i);
+                let (data, window) = remote.get_chunk(folder_id, path, i as u32, want.clone(), len).await?;
+                if data.len() as u64 != len {
                     bail!("chunk {} has the wrong size", i);
                 }
-                if blake3::hash(&data).to_hex().as_str() != want {
-                    bail!("chunk {} failed verification", i);
+                // Hashing is kept off the threads that serve the network.
+                let data = tokio::task::spawn_blocking(move || {
+                    (blake3::hash(&data).to_hex().as_str() == want).then_some(data)
+                })
+                .await?;
+                match data {
+                    Some(data) => Ok(Piece::Fetched(data, window)),
+                    None => bail!("chunk {} failed verification", i),
                 }
-                Ok(Some(data))
             }
         })
-        .buffered(8);
+        .buffered(ahead);
     futures_util::pin_mut!(fetches);
 
-    let mut i = 0usize;
-    let mut total = 0u64;
+    let mut failed = None;
     while let Some(res) = fetches.next().await {
-        let data = match res? {
-            Some(d) => d,
-            None => {
-                let off = i as u64 * CHUNK as u64;
-                let len = local_size.saturating_sub(off).min(CHUNK as u64) as usize;
-                let f = old.as_mut().ok_or_else(|| anyhow!("local file missing"))?;
-                f.seek(SeekFrom::Start(off)).await?;
-                let mut buf = vec![0u8; len];
-                f.read_exact(&mut buf).await?;
-                buf
+        match res {
+            Ok(piece) => {
+                if piece_tx.send(piece).await.is_err() {
+                    break; // the writer stopped: its error is reported below
+                }
             }
-        };
-        total += data.len() as u64;
-        if total > e.size {
-            bail!("the file is larger than it says");
+            Err(err) => {
+                failed = Some(err);
+                break;
+            }
         }
-        whole.update(&data);
-        out.write_all(&data).await?;
-        i += 1;
     }
-    out.flush().await?;
-    if total != e.size {
-        bail!("the file is smaller than it says");
+    drop(piece_tx);
+    let written = writer.await?;
+    if let Some(err) = failed {
+        return Err(err);
     }
-    if whole.finalize().to_hex().as_str() != e.hash {
+    if written? != e.hash {
         bail!("file hash mismatch after assembly");
     }
     Ok(())
+}
+
+/// One piece of a file being put together.
+enum Piece {
+    /// Fetched from the other device. The window permit is never looked at: it is held so that
+    /// the room is given back only when the piece is dropped, after it was written.
+    Fetched(Vec<u8>, #[allow(dead_code)] Option<OwnedSemaphorePermit>),
+    /// Unchanged: taken from the local copy.
+    Local(usize),
+}
+
+/// Write the pieces in the order they arrive and return the hash of the whole file. Runs on a
+/// thread of its own (it blocks on the disk).
+fn write_pieces(
+    mut out: fs::File,
+    old: Option<fs::File>,
+    mut pieces: tokio::sync::mpsc::Receiver<Piece>,
+    chunk: usize,
+    local_size: u64,
+    size: u64,
+) -> Result<String> {
+    use std::io::Write;
+    use std::os::unix::fs::FileExt;
+    let mut whole = blake3::Hasher::new();
+    let mut total = 0u64;
+    let mut buf: Vec<u8> = Vec::new();
+    while let Some(piece) = pieces.blocking_recv() {
+        let data: &[u8] = match &piece {
+            Piece::Fetched(data, _) => data,
+            Piece::Local(i) => {
+                let off = *i as u64 * chunk as u64;
+                let len = local_size.saturating_sub(off).min(chunk as u64) as usize;
+                let f = old.as_ref().ok_or_else(|| anyhow!("local file missing"))?;
+                buf.resize(len, 0);
+                f.read_exact_at(&mut buf, off)?;
+                &buf
+            }
+        };
+        total += data.len() as u64;
+        if total > size {
+            bail!("the file is larger than it says");
+        }
+        whole.update(data);
+        out.write_all(data)?;
+    }
+    out.flush()?;
+    if total != size {
+        bail!("the file is smaller than it says");
+    }
+    Ok(whole.finalize().to_hex().to_string())
 }
 
 /// Atomically move the finished temp file into place. Caller holds fs_lock.

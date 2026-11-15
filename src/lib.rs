@@ -103,6 +103,27 @@ pub enum Cmd {
         /// on, off or status
         action: Option<String>,
     },
+    /// Show or choose how hard this machine works: laptop, desktop, server, phone or custom
+    Profile {
+        /// The profile (shown if omitted)
+        name: Option<String>,
+    },
+    /// Show or set speed limits, e.g. `rustsync limit --up 2MB --down none` (per second)
+    Limit {
+        /// Most that is sent per second, e.g. 500K or 2MB; "none" for no limit
+        #[arg(long)]
+        up: Option<String>,
+        /// Most that is fetched per second; "none" for no limit
+        #[arg(long)]
+        down: Option<String>,
+    },
+    /// Say what a library's folder is stored on here: ssd or hdd (a hard disk gets one file at a time)
+    Storage {
+        /// Number, name or id of the library (listed if omitted)
+        library: Option<String>,
+        /// ssd or hdd. Omit to just show it
+        kind: Option<String>,
+    },
     /// Change the port this machine listens on (saved in the config file)
     SetPort {
         /// The new port (asked if omitted)
@@ -225,6 +246,7 @@ pub mod depot;
 pub mod proto;
 pub mod sync;
 pub mod tailnet;
+pub mod tuning;
 pub mod traffic;
 pub mod cli;
 #[cfg(target_os = "android")]

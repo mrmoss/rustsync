@@ -203,7 +203,7 @@ sequenceDiagram
     A->>B: Index (changed entries)
     B->>B: Check every entry (path, sizes, hashes, clock, permissions)
     B->>B: Conflict rule: higher (time stamp, hash) wins
-    loop each chunk that differs from B's copy (128 KiB pieces)
+    loop each piece that differs from B's copy (128 KiB to 4 MiB, by file size)
         B->>A: GetChunk (library, path, index, hash)
         A->>A: Re-read that piece of the file, check its hash
         A->>B: Chunk (data)
@@ -216,8 +216,18 @@ sequenceDiagram
 
 - A **full scan** and re-announcement of every index also runs on a timer
   (`sync_options.full_scan_interval`), which catches anything the file watcher missed.
-- Requests are limited: 16 chunk requests served at once per device, bounded queues, and an
-  oversized or too-fast index is refused or skipped until the next full scan.
+- Requests are limited: for one device at most 64 MiB of file data is read or waits to be sent at
+  a time (further requests wait their turn, and beyond 2048 waiting requests they are refused),
+  queues are bounded, and an oversized or too-fast index is refused or skipped until the next full
+  scan. A piece is only read from disk if the request names the hash our index has for it.
+- The size of a file's pieces follows from the file's size by a fixed rule, and a received entry
+  whose number of pieces does not fit that rule is refused, so another device cannot choose piece
+  sizes. What a device asks for at a time is bounded by its own profile (see the README), never by
+  what the other side would like to send.
+- Files that are being fetched are kept open on the sending side for a few seconds (at most 8 per
+  connection). They were opened with the same checks as always (no symlink, inside the library
+  folder), every piece read from them is still checked against the index's hash before it is sent,
+  and if that fails the file is opened again once.
 - A device that only keeps an encrypted backup of a library cannot send `Index` or `GetChunk` for
   it: those messages are ignored.
 
@@ -295,7 +305,7 @@ never applied silently.
 - Size limits are per backup and optional; with none set, a paired device that may back up there can fill the drive. The limit counts the bytes rustsync stores, not other files on the same drive.
 - A recovery code is per library and does not change; save it once. Losing every machine *and* every code means the encrypted backup cannot be opened (that is the point).
 - Library names are not sent to a machine that only keeps a backup (its offer shows `backup-<id>`); every library shows its id in `status` and the GUI. A restore from a single code takes the name from the folder; a kit carries the names.
-- Files larger than 16 GiB are skipped (with a warning).
+- Files larger than 512 GiB are skipped (with a warning).
 - Conflict resolution is last-writer-wins on wall-clock time; keep clocks in sync (NTP).
 - Dependencies: the `audit` workflow runs `cargo audit` on every dependency change and weekly; commit `Cargo.lock` so it checks what you actually ship.
 - **Build and release pipeline.** The workflows run with read-only repository access; only the final job that creates the draft release may write, and the Android build gets just its four signing secrets. Every third-party action is pinned to a full commit hash (the version is in a comment beside it); Dependabot, set up in `.github/dependabot.yml`, proposes the updates for review. Check downloads against `SHA256SUMS`.

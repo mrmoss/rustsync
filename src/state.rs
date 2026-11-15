@@ -106,6 +106,10 @@ pub struct Library {
     /// other devices' hints, and (backup mode) must be allowed again by hand.
     #[serde(default)]
     pub excluded: Vec<String>,
+    /// What the folder is stored on here (decides how many files are written and read at once).
+    /// Only about this machine; never sent to other devices.
+    #[serde(default)]
+    pub storage: crate::tuning::Storage,
 }
 
 impl Library {

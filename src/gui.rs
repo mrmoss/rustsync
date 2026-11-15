@@ -35,6 +35,9 @@ enum Request {
     Join { token: String },
     PairDecision { accept: bool },
     SetPort { port: u16 },
+    SetProfile { profile: String },
+    SetLimits { upload: u64, download: u64 },
+    SetStorage { library: String, storage: String },
     SetName { name: String },
     Rename { device: String, nickname: String },
     SetTailscale { enabled: bool },
@@ -106,6 +109,14 @@ struct StatusInfo {
     /// The Tailscale integration: None while it is off.
     #[serde(default)]
     tailnet: Option<TailnetInfo>,
+    /// How hard this machine works: laptop, desktop, server, phone or custom.
+    #[serde(default)]
+    profile: String,
+    /// Speed limits in bytes per second (0 = none).
+    #[serde(default)]
+    upload_limit: u64,
+    #[serde(default)]
+    download_limit: u64,
 }
 
 #[derive(Deserialize, Debug, Clone, Default)]
@@ -210,6 +221,9 @@ struct LibraryInfo {
     /// Our encrypted backups on other devices, as they last reported.
     #[serde(default)]
     backups: Vec<BackupUsage>,
+    /// What the folder is stored on here: "ssd" or "hdd".
+    #[serde(default)]
+    storage: String,
 }
 
 #[derive(Deserialize, Debug, Clone)]
@@ -224,6 +238,40 @@ struct BackupUsage {
 }
 
 /// "500G", "1.5 TB" -> bytes (decimal units, same as the command line). Empty/"none" = 0.
+fn profile_label(p: &str) -> &'static str {
+    match p {
+        "laptop" => "Laptop",
+        "server" => "Server",
+        "phone" => "Phone",
+        "custom" => "Custom",
+        _ => "Desktop",
+    }
+}
+
+fn profile_hint(p: &str) -> &'static str {
+    match p {
+        "laptop" => "Works gently: saves battery and leaves the machine free for you.",
+        "server" => "Works as hard as it can. Say for each library whether it is on an SSD or a hard disk (Libraries page).",
+        "phone" => "Works as little as possible at a time.",
+        "custom" => "Uses `window` and `files` from the [performance] section of the config file.",
+        _ => "A good balance for a computer that is also used for other things.",
+    }
+}
+
+fn storage_label(s: &str) -> &'static str {
+    if s == "hdd" {
+        "On a hard disk"
+    } else {
+        "On an SSD"
+    }
+}
+
+/// A number without needless zeros: 2, 2.5, 0.25.
+fn trim_number(v: f64) -> String {
+    let t = format!("{:.3}", v);
+    t.trim_end_matches('0').trim_end_matches('.').to_string()
+}
+
 fn parse_size(s: &str) -> Result<u64, String> {
     let t = s.trim().to_lowercase().replace(' ', "");
     if t.is_empty() || t == "none" || t == "unlimited" || t == "0" {
@@ -626,6 +674,10 @@ enum Action {
     SetOwnName { name: String },
     SetNickname { key: String, nickname: String },
     SetPort { port: u16 },
+    SetProfile { profile: String },
+    /// Bytes per second; 0 = no limit.
+    SetLimits { upload: u64, download: u64 },
+    SetStorage { id: String, storage: String },
     SetTailscale { enabled: bool },
     /// Ask Tailscale now and check which machines answer.
     CheckTailnet,
@@ -657,6 +709,9 @@ struct App {
     logo: egui::TextureHandle,
     /// The port being typed on the Home page (None: show the current one).
     port_edit: Option<String>,
+    /// The speed limits being typed on the Settings page, sending and fetching (None: show the
+    /// current ones).
+    limit_edit: Option<(String, String)>,
     /// The log size being typed on the Settings page (None: show the current one).
     log_edit: Option<String>,
 }
@@ -704,6 +759,7 @@ impl App {
             browse: None,
             logo,
             port_edit: None,
+            limit_edit: None,
             log_edit: None,
         }
     }
@@ -1131,6 +1187,12 @@ impl App {
                 self.port_edit = None;
                 self.run(Request::SetPort { port })
             }
+            Action::SetProfile { profile } => self.run(Request::SetProfile { profile }),
+            Action::SetLimits { upload, download } => {
+                self.limit_edit = None;
+                self.run(Request::SetLimits { upload, download })
+            }
+            Action::SetStorage { id, storage } => self.run(Request::SetStorage { library: id, storage }),
             Action::SetTailscale { enabled } => self.run(Request::SetTailscale { enabled }),
             Action::CheckTailnet => self.run(Request::Tailnet),
             Action::SetAddress { key, addr } => self.run(Request::SetAddress { device: key, addr }),
@@ -2201,6 +2263,19 @@ impl App {
                                 if ui.button("Recovery code…").clicked() {
                                     self.perform(Action::ShowRecovery { id: Some(l.id.clone()), name: l.name.clone() });
                                 }
+                                let current = if l.storage == "hdd" { "hdd" } else { "ssd" };
+                                let mut choice = current;
+                                egui::ComboBox::from_id_salt(("storage", &l.id))
+                                    .selected_text(storage_label(current))
+                                    .width(110.0)
+                                    .show_ui(ui, |ui| {
+                                        ui.selectable_value(&mut choice, "ssd", storage_label("ssd"));
+                                        ui.selectable_value(&mut choice, "hdd", storage_label("hdd"))
+                                            .on_hover_text("Files are written and read one after another, so the disk does not have to jump around.");
+                                    });
+                                if choice != current {
+                                    self.perform(Action::SetStorage { id: l.id.clone(), storage: choice.to_string() });
+                                }
                             }
                             let related = related_devices(l, &status.devices);
                             if !related.is_empty() && ui.button("Unshare…").clicked() {
@@ -2634,6 +2709,69 @@ impl App {
             if save {
                 if let Ok(port) = text.trim().parse::<u16>() {
                     self.perform(Action::SetPort { port });
+                }
+            }
+        });
+
+        ui.add_space(8.0);
+        card(ui, |ui| {
+            ui.label(RichText::new("Performance").strong());
+            let current = if status.profile.is_empty() { "desktop".to_string() } else { status.profile.clone() };
+            let mut choice = current.clone();
+            ui.horizontal(|ui| {
+                ui.label("This device is a");
+                egui::ComboBox::from_id_salt("profile").selected_text(profile_label(&current)).width(150.0).show_ui(ui, |ui| {
+                    for p in ["laptop", "desktop", "server", "phone"] {
+                        ui.selectable_value(&mut choice, p.to_string(), profile_label(p));
+                    }
+                    if current == "custom" {
+                        ui.selectable_value(&mut choice, "custom".to_string(), profile_label("custom"));
+                    }
+                });
+            });
+            if choice != current {
+                self.perform(Action::SetProfile { profile: choice });
+            }
+            ui.label(RichText::new(profile_hint(&current)).small().weak());
+
+            ui.add_space(6.0);
+            let shown = |v: u64| if v == 0 { String::new() } else { trim_number(v as f64 / 1e6) };
+            let now = (shown(status.upload_limit), shown(status.download_limit));
+            let (mut up, mut down) = self.limit_edit.clone().unwrap_or_else(|| now.clone());
+            // megabytes per second -> bytes per second; empty = no limit
+            let read = |t: &str| -> Option<u64> {
+                let t = t.trim().replace(',', ".");
+                if t.is_empty() {
+                    return Some(0);
+                }
+                t.parse::<f64>().ok().filter(|v| v.is_finite() && *v >= 0.0 && *v <= 100_000.0).map(|v| (v * 1e6).round() as u64)
+            };
+            let mut save = false;
+            ui.horizontal_wrapped(|ui| {
+                ui.label("Send at most");
+                let a = ui.add(egui::TextEdit::singleline(&mut up).desired_width(60.0).hint_text("no limit"));
+                ui.label("MB/s,  fetch at most");
+                let b = ui.add(egui::TextEdit::singleline(&mut down).desired_width(60.0).hint_text("no limit"));
+                ui.label("MB/s");
+                let changed = (up.trim(), down.trim()) != (now.0.as_str(), now.1.as_str());
+                if a.changed() || b.changed() {
+                    self.limit_edit = if changed { Some((up.clone(), down.clone())) } else { None };
+                }
+                let ok = read(&up).is_some() && read(&down).is_some();
+                let enter = (a.lost_focus() || b.lost_focus()) && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                if changed && ok && (ui.button("Save").clicked() || enter) {
+                    save = true;
+                }
+                if changed && ui.button("Reset").clicked() {
+                    self.limit_edit = None;
+                }
+            });
+            if read(&up).is_none() || read(&down).is_none() {
+                ui.label(RichText::new("A number of megabytes per second, or empty for no limit.").color(RED).small());
+            }
+            if save {
+                if let (Some(upload), Some(download)) = (read(&up), read(&down)) {
+                    self.perform(Action::SetLimits { upload, download });
                 }
             }
         });

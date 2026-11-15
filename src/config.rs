@@ -35,6 +35,9 @@ pub struct Config {
     /// The optional Tailscale integration (off by default).
     #[serde(default)]
     pub tailscale: TailscaleConfig,
+    /// How hard this machine works when it transfers and scans.
+    #[serde(default)]
+    pub performance: PerformanceConfig,
 
     // Old config format: still parsed so we can tell the user it is ignored.
     #[serde(default)]
@@ -84,6 +87,43 @@ pub struct TailscaleConfig {
     /// usual places (never the PATH).
     #[serde(default)]
     pub command: String,
+}
+
+/// How hard this machine works: a profile, and optional speed limits. See `tuning`.
+#[derive(Debug, Deserialize, Default)]
+pub struct PerformanceConfig {
+    /// `laptop`, `desktop`, `server`, `phone` or `custom`. Empty: `desktop` (`phone` on Android).
+    #[serde(default)]
+    pub profile: String,
+    /// (custom) how much data is asked for from one device at a time, e.g. `32MB`.
+    #[serde(default)]
+    pub window: Option<String>,
+    /// (custom) how many files are written at the same time, over all libraries.
+    #[serde(default)]
+    pub files: Option<usize>,
+    /// Most bytes per second sent to / fetched from other devices, e.g. `5MB`. Empty or 0: no limit.
+    #[serde(default)]
+    pub upload_limit: String,
+    #[serde(default)]
+    pub download_limit: String,
+}
+
+impl PerformanceConfig {
+    pub fn profile(&self) -> crate::tuning::Profile {
+        crate::tuning::Profile::parse(&self.profile).unwrap_or_else(crate::tuning::Profile::default_here)
+    }
+
+    /// The numbers that go with `profile` (the custom ones only count for `custom`).
+    pub fn tuning(&self, profile: crate::tuning::Profile) -> crate::tuning::Tuning {
+        let window = self.window.as_deref().and_then(|w| crate::proto::parse_size(w).ok()).filter(|w| *w > 0);
+        crate::tuning::Tuning::here(profile, window, self.files)
+    }
+
+    /// (upload, download) limits in bytes per second; 0 = none.
+    pub fn limits(&self) -> (u64, u64) {
+        let read = |s: &str| if s.trim().is_empty() { 0 } else { crate::proto::parse_size(s).unwrap_or(0) };
+        (read(&self.upload_limit), read(&self.download_limit))
+    }
 }
 
 /// Settings of the desktop window (`rustsync-gui`).
@@ -493,6 +533,17 @@ pub fn set_gui_x11(path: &Path, on: bool) -> Result<()> {
     set_in_section(path, "gui", "x11", toml_edit::value(on))
 }
 
+/// Write the performance profile into the config file.
+pub fn set_profile(path: &Path, profile: crate::tuning::Profile) -> Result<()> {
+    set_in_section(path, "performance", "profile", toml_edit::value(profile.word()))
+}
+
+/// Write the speed limits (bytes per second, 0 = none) into the config file.
+pub fn set_limits(path: &Path, upload: u64, download: u64) -> Result<()> {
+    set_in_section(path, "performance", "upload_limit", toml_edit::value(upload.to_string()))?;
+    set_in_section(path, "performance", "download_limit", toml_edit::value(download.to_string()))
+}
+
 /// Switch the Tailscale integration on or off in the config file.
 pub fn set_tailscale(path: &Path, on: bool) -> Result<()> {
     set_in_section(path, "tailscale", "enabled", toml_edit::value(on))
@@ -690,6 +741,36 @@ mod tests {
         assert!(yaml_to_toml("server:\n  nested:\n    deeper: 1\n").is_err());
         assert!(yaml_to_toml("name: [a, b]\n").is_err());
         assert!(yaml_to_toml("just words\n").is_err());
+    }
+
+    #[test]
+    fn the_performance_section_is_optional_and_can_be_written() {
+        use crate::tuning::Profile;
+        let dir = std::env::temp_dir().join(format!("rustsync-cfgperf-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        std::fs::write(&path, "# keep me\nname = \"x\"\n").unwrap();
+        let cfg = load(&path).unwrap();
+        assert_eq!(cfg.performance.profile(), Profile::default_here());
+        assert_eq!(cfg.performance.limits(), (0, 0));
+
+        set_profile(&path, Profile::Server).unwrap();
+        set_limits(&path, 5_000_000, 0).unwrap();
+        let cfg = load(&path).unwrap();
+        assert_eq!(cfg.performance.profile(), Profile::Server);
+        assert_eq!(cfg.performance.limits(), (5_000_000, 0));
+        assert!(std::fs::read_to_string(&path).unwrap().contains("# keep me"));
+
+        std::fs::write(&path, "[performance]\nprofile = \"custom\"\nwindow = \"32MB\"\nfiles = 6\nupload_limit = \"1MB\"\n").unwrap();
+        let cfg = load(&path).unwrap();
+        let t = cfg.performance.tuning(cfg.performance.profile());
+        assert_eq!((t.window, t.files), (32_000_000, 6));
+        assert_eq!(cfg.performance.limits(), (1_000_000, 0));
+        // an unknown profile name falls back to the default instead of failing to start
+        std::fs::write(&path, "[performance]\nprofile = \"turbo\"\n").unwrap();
+        assert_eq!(load(&path).unwrap().performance.profile(), Profile::default_here());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

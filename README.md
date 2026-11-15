@@ -389,6 +389,9 @@ Pairing devices
                       Give a paired device a nickname that only this machine uses
   tailscale [on|off|status]
                       Optional: list the machines of your Tailscale/Headscale network (see below)
+  profile [NAME]      How hard this machine works: laptop, desktop, server or phone (see below)
+  limit [--up SIZE] [--down SIZE]
+                      Speed limits per second, e.g. --up 2MB; "none" removes one
 
 Libraries (folders to sync)
   create [NAME] [FOLDER]            Create a library from a folder
@@ -401,6 +404,7 @@ Libraries (folders to sync)
                                     Accept a library another device shared with you
   decline [OFFER]                   Say no to an offer
   refresh                           Ask connected devices for their libraries again
+  storage [LIBRARY] [ssd|hdd]       Say what the library's folder is on here (see below)
 
 Encrypted backups (see below)
   quota [LIBRARY] [SIZE]            Show or change the size limit of a backup kept here
@@ -550,6 +554,51 @@ If the service runs as another user than the one who is logged in to Tailscale, 
 refuse to talk to it ("access denied"); the window then says so. On Linux you can allow it once with
 `sudo tailscale set --operator=$USER`. The Android app does not list tailnet machines (the phone's
 Tailscale app does not offer that to other apps), but it pairs over a tailnet like any other network.
+
+## Speed and how hard a machine works
+
+Two simple choices tell rustsync how to treat a machine; there is nothing else to tune.
+
+**What kind of device it is** (Settings > Performance, or `rustsync profile NAME`):
+
+| Profile | Meant for | Asks another device for | Files written at once |
+|---|---|---|---|
+| `laptop` | saving battery, staying out of your way | up to 8 MiB at a time | 2 |
+| `desktop` (the default) | a computer you also use for other things | up to 16 MiB | 3 |
+| `server` | a machine that is there to sync and store | up to 64 MiB | 8 |
+| `phone` (the default in the Android app) | as little work at a time as possible | up to 4 MiB | 1 |
+
+Each device decides this for itself: a laptop that syncs with a server is never worked harder than
+its own profile allows, whatever the server is set to.
+
+**What each library's folder is on** (the *On an SSD / On a hard disk* choice on a library, or
+`rustsync storage LIBRARY hdd`). On a hard disk the library's files are written and read strictly
+one after another, because working on several at once only makes the disk jump around and makes
+everything slower. On an SSD several files are written at once and scans read several files at once.
+So a storage server can be set to `server` and still treat the libraries on its hard disks gently.
+On Linux a new library on a spinning disk is marked as such by itself; check it if the folder is on
+a RAID, a USB enclosure or a network share, where that cannot be seen.
+
+**Speed limits** (Settings > Performance, or `rustsync limit --up 2MB --down none`) cap what this
+machine sends and fetches per second, on any profile. They apply at once.
+
+For special cases there is a `custom` profile that takes its numbers from the config file:
+
+```toml
+[performance]
+profile = "custom"
+window = "32MB"           # how much is asked for from one device at a time (4 MiB to 256 MiB)
+files = 6                 # files written at the same time, over all libraries (1 to 16)
+upload_limit = "2MB"      # per second; leave out or 0 for none (any profile)
+download_limit = "0"
+```
+
+What happens underneath, on every profile: a file is cut into pieces whose size depends on the size
+of the file (128 KiB up to 64 MiB, 1 MiB up to 16 GiB, 4 MiB above that), so a small file that
+changes sends little and a large file needs few requests; the largest file that can be synced is
+512 GiB. Sending and receiving on a connection do not wait for each other, files that are being
+fetched stay open on the sending side, and hashing and disk work are kept away from the network
+threads.
 
 ## The Android app
 
@@ -764,6 +813,11 @@ port = 3032               # port to listen on (or use `rustsync set-port`, or Se
 [tailscale]
 enabled = false           # optional help from Tailscale/Headscale (or `rustsync tailscale on`)
 # command = "/usr/bin/tailscale"   # only if it is not in a usual place
+
+[performance]
+profile = "desktop"       # laptop, desktop, server, phone or custom (or `rustsync profile NAME`)
+# upload_limit = "2MB"    # per second (or `rustsync limit --up 2MB`)
+# download_limit = "0"
 
 [sync_options]
 full_scan_interval = 30   # seconds between full re-scans (changes are also noticed instantly)

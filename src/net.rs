@@ -21,7 +21,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 const PARAMS: &str = "Noise_XXpsk0_25519_ChaChaPoly_BLAKE2s";
 // Part of the key exchange: devices that speak a different message format (this changes with the
 // protocol version) cannot complete the handshake, so they refuse each other cleanly.
-const PROLOGUE: &[u8] = b"rustsync/6";
+const PROLOGUE: &[u8] = b"rustsync/7";
 const MAX_RECORD: usize = 65535;
 const PLAIN_CHUNK: usize = 60000;
 const MAX_MESSAGE: usize = 24 * 1024 * 1024;
@@ -296,12 +296,12 @@ pub async fn handshake_responder<S: AsyncRead + AsyncWrite + Unpin>(
     bail!("unknown device or wrong code")
 }
 
-/// Encrypt and send one application message (split into records as needed).
-pub async fn send_message<W: AsyncWrite + Unpin>(
-    w: &mut W,
-    t: &mut snow::TransportState,
-    data: &[u8],
-) -> Result<()> {
+/// Encrypt one application message (split into records as needed) and return everything that
+/// goes on the wire for it, length prefixes included, so it can be written in one go. The
+/// records must be sent in the order they were made.
+pub fn seal_message(t: &mut snow::TransportState, data: &[u8]) -> Result<Vec<u8>> {
+    let records = data.len() / PLAIN_CHUNK + 1;
+    let mut wire = Vec::with_capacity(data.len() + records * 32);
     let mut out = vec![0u8; MAX_RECORD];
     let mut plain = Vec::with_capacity(PLAIN_CHUNK + 1);
     let mut pieces = data.chunks(PLAIN_CHUNK).peekable();
@@ -310,8 +310,20 @@ pub async fn send_message<W: AsyncWrite + Unpin>(
         plain.push(if pieces.peek().is_some() { 1 } else { 0 });
         plain.extend_from_slice(piece);
         let n = t.write_message(&plain, &mut out)?;
-        write_frame(w, &out[..n]).await?;
+        wire.extend_from_slice(&(n as u16).to_be_bytes());
+        wire.extend_from_slice(&out[..n]);
     }
+    Ok(wire)
+}
+
+/// Encrypt and send one application message.
+pub async fn send_message<W: AsyncWrite + Unpin>(
+    w: &mut W,
+    t: &mut snow::TransportState,
+    data: &[u8],
+) -> Result<()> {
+    let wire = seal_message(t, data)?;
+    w.write_all(&wire).await?;
     Ok(())
 }
 
