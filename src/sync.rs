@@ -1883,6 +1883,11 @@ impl Node {
         let tailnet = self.tailnet_view();
         let online: HashSet<String> = self.sessions.lock().unwrap().keys().cloned().collect();
         let traffic: HashMap<String, Arc<Traffic>> = self.traffic.lock().unwrap().clone();
+        let ignores: HashMap<String, Vec<String>> = {
+            let libs: Vec<(String, Arc<LibRuntime>)> =
+                self.libs.lock().unwrap().iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+            libs.into_iter().map(|(id, rt)| (id, rt.folder.ignores().lines().to_vec())).collect()
+        };
         let st = self.state.lock().unwrap();
         let devices: Vec<DeviceInfo> = st
             .devices
@@ -1962,6 +1967,7 @@ impl Node {
                     .collect(),
                 storage: l.storage.word().to_string(),
                 paused: l.paused,
+                ignore: ignores.get(&l.id).cloned().unwrap_or_default(),
                 pending: l
                     .members
                     .iter()
@@ -2075,6 +2081,58 @@ impl Node {
         self.down.set(download);
         let say = |v: u64| if v == 0 { "no limit".to_string() } else { format!("{} per second", fmt_size(v)) };
         Ok(format!("Sending: {}. Fetching: {}.", say(upload), say(download)))
+    }
+
+    /// Write the ignore patterns of a library into its `.rustsyncignore` (which is synced, so
+    /// they apply on every device). No patterns: the file is removed.
+    pub fn set_ignore(&self, lib_id: &str, patterns: &[String]) -> Result<String> {
+        use crate::ignore::{Ignore, IGNORE_FILE, MAX_PATTERNS, MAX_PATTERN_LEN};
+        let Some(rt) = self.lib_rt(lib_id) else { bail!("no such library here (or it is an encrypted backup)") };
+        let lines: Vec<String> = patterns.iter().map(|p| p.trim().to_string()).filter(|p| !p.is_empty()).collect();
+        if lines.len() > MAX_PATTERNS {
+            bail!("at most {} patterns", MAX_PATTERNS);
+        }
+        if let Some(bad) = lines.iter().find(|l| l.chars().count() > MAX_PATTERN_LEN || l.chars().any(|c| c.is_control())) {
+            bail!("not a usable pattern: {:?}", bad);
+        }
+        let root = rt.folder.root.clone();
+        let path = root.join(IGNORE_FILE);
+        match std::fs::symlink_metadata(&path) {
+            Ok(md) if !md.is_file() => bail!("{} is not a plain file; not touching it", path.display()),
+            _ => {}
+        }
+        if lines.is_empty() {
+            if path.exists() {
+                std::fs::remove_file(&path).with_context(|| format!("cannot remove {}", path.display()))?;
+            }
+            return Ok("Nothing is ignored in this library any more.".to_string());
+        }
+        let mut text = String::from("# What RustSync leaves out of this library (synced to every device; see the README).\n");
+        for l in &lines {
+            text.push_str(l);
+            text.push('\n');
+        }
+        // Written next to it under a temp name (never synced), then put in place in one step.
+        let tmp = root.join(format!("{}ignore-{}", index::TMP_PREFIX, std::process::id()));
+        {
+            use std::io::Write;
+            use std::os::unix::fs::OpenOptionsExt;
+            let _ = std::fs::remove_file(&tmp);
+            let mut f = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o644)
+                .custom_flags(libc::O_NOFOLLOW)
+                .open(&tmp)
+                .with_context(|| format!("cannot write in {}", root.display()))?;
+            f.write_all(text.as_bytes())?;
+        }
+        std::fs::rename(&tmp, &path).with_context(|| format!("cannot write {}", path.display()))?;
+        let n = Ignore::parse(&text).lines().len();
+        Ok(format!(
+            "{} pattern(s) saved. Matching files are no longer synced; copies other devices already have stay where they are.",
+            n
+        ))
     }
 
     /// Say what a library's folder is stored on here.
@@ -2630,6 +2688,7 @@ impl Node {
             Request::SetProfile { profile } => out(self.set_profile(&profile)?),
             Request::SetLimits { upload, download } => out(self.set_limits(upload, download)?),
             Request::SetStorage { library, storage } => out(self.set_storage(&library, &storage)?),
+            Request::SetIgnore { library, patterns } => out(self.set_ignore(&library, &patterns)?),
             Request::Pause { library, device, paused } => {
                 if !library.is_empty() {
                     out(self.pause_library(&library, paused)?)
@@ -3614,21 +3673,24 @@ async fn session_loop(
         let traffic = traffic.clone();
         tokio::spawn(async move {
             while let Some((lib, entries, cost, files_left, bytes_left)) = apply_rx.recv().await {
-                if node.pauses.any(&lib, &origin) {
-                    // Paused after it arrived: it is sent again when syncing is resumed.
-                } else if let Some(rt) = node.lib_rt(&lib) {
-                    match apply::apply_entries(&rt.folder, &handle, entries).await {
-                        Ok(applied) => {
-                            if !applied.is_empty() {
-                                info!(device = %origin_name, library = %node.lib_label(&lib), "received {} change(s)", applied.len());
-                            }
-                            node.broadcast(&lib, &applied.changes, Some(origin.as_str()));
-                            node.broadcast(&lib, &applied.kept, None);
-                        }
-                        Err(e) => warn!(device = %origin_name, library = %node.lib_label(&lib), "could not apply changes: {:#}", e),
-                    }
-                }
+                apply_batch(&node, &handle, &origin, &origin_name, &lib, entries).await;
                 traffic.finish(&lib, files_left, bytes_left);
+                queued.fetch_sub(cost, Ordering::Relaxed);
+            }
+        });
+    }
+    // Deletions do not wait behind files that are still being fetched: they are quick, and a
+    // file that is deleted meanwhile stops being fetched (see apply).
+    let (gone_tx, mut gone_rx) = mpsc::unbounded_channel::<(String, Vec<Entry>, usize)>();
+    {
+        let node = node.clone();
+        let origin = dev.key.clone();
+        let origin_name = dev.display_name().to_string();
+        let handle = handle.clone();
+        let queued = queued.clone();
+        tokio::spawn(async move {
+            while let Some((lib, entries, cost)) = gone_rx.recv().await {
+                apply_batch(&node, &handle, &origin, &origin_name, &lib, entries).await;
                 queued.fetch_sub(cost, Ordering::Relaxed);
             }
         });
@@ -3768,12 +3830,24 @@ async fn session_loop(
                                     }
                                     None => (0, 0),
                                 };
-                                traffic.queue(&lib, files, size);
-                                queued.fetch_add(cost, Ordering::Relaxed);
-                                let lib2 = lib.clone();
-                                if apply_tx.send((lib, entries, cost, files, size)).is_err() {
-                                    queued.fetch_sub(cost, Ordering::Relaxed);
-                                    traffic.finish(&lib2, files, size);
+                                let total = entries.len().max(1);
+                                let (gone, entries): (Vec<Entry>, Vec<Entry>) = entries.into_iter().partition(|e| e.deleted);
+                                if !gone.is_empty() {
+                                    let c = (cost * gone.len() / total).max(1);
+                                    queued.fetch_add(c, Ordering::Relaxed);
+                                    if gone_tx.send((lib.clone(), gone, c)).is_err() {
+                                        queued.fetch_sub(c, Ordering::Relaxed);
+                                    }
+                                }
+                                if !entries.is_empty() {
+                                    let c = (cost * entries.len() / total).max(1);
+                                    traffic.queue(&lib, files, size);
+                                    queued.fetch_add(c, Ordering::Relaxed);
+                                    let lib2 = lib.clone();
+                                    if apply_tx.send((lib, entries, c, files, size)).is_err() {
+                                        queued.fetch_sub(c, Ordering::Relaxed);
+                                        traffic.finish(&lib2, files, size);
+                                    }
                                 }
                             }
                         }
@@ -3857,6 +3931,24 @@ async fn session_loop(
     pending.lock().unwrap().clear();
     drop(apply_tx);
     res
+}
+
+/// Apply one batch of changes a device sent, and pass on what changed here.
+async fn apply_batch(node: &Arc<Node>, handle: &Remote, origin: &str, origin_name: &str, lib: &str, entries: Vec<Entry>) {
+    if node.pauses.any(lib, origin) {
+        return; // paused after it arrived: it is sent again when syncing is resumed
+    }
+    let Some(rt) = node.lib_rt(lib) else { return };
+    match apply::apply_entries(&rt.folder, handle, entries).await {
+        Ok(applied) => {
+            if !applied.is_empty() {
+                info!(device = %origin_name, library = %node.lib_label(lib), "received {} change(s)", applied.len());
+            }
+            node.broadcast(lib, &applied.changes, Some(origin));
+            node.broadcast(lib, &applied.kept, None);
+        }
+        Err(e) => warn!(device = %origin_name, library = %node.lib_label(lib), "could not apply changes: {:#}", e),
+    }
 }
 
 /// One piece of a local file (for uploading it to an encrypted backup). `size` is the size the

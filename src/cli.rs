@@ -1389,6 +1389,38 @@ pub async fn run(config_path: &Path, cmd: Cmd) -> Result<()> {
             }
             Ok(())
         }
+        Cmd::Ignore { library, add, remove } => {
+            let info = status(&ctl).await?;
+            let libs: Vec<proto::LibraryInfo> = info.libraries.iter().filter(|l| !l.backup_only).cloned().collect();
+            if libs.is_empty() {
+                bail!("there are no libraries on this machine yet");
+            }
+            let labels: Vec<String> = libs.iter().map(|l| format!("{}  ({})", l.name, l.folder)).collect();
+            let i = pick("library", &labels, library, |i, t| name_or_prefix(&libs[i].name, &libs[i].id, t))?;
+            let mut patterns = libs[i].ignore.clone();
+            if add.is_empty() && remove.is_empty() {
+                if patterns.is_empty() {
+                    println!("{} leaves nothing out. Add a pattern with:  rustsync -c {} ignore {} --add target/", libs[i].name, ctl.config.display(), libs[i].name);
+                } else {
+                    println!("{} leaves out:", libs[i].name);
+                    for p in &patterns {
+                        println!("  {}", p);
+                    }
+                }
+                return Ok(());
+            }
+            for r in &remove {
+                patterns.retain(|p| p != r.trim());
+            }
+            for a in add {
+                let a = a.trim().to_string();
+                if !a.is_empty() && !patterns.contains(&a) {
+                    patterns.push(a);
+                }
+            }
+            call(&ctl, &Request::SetIgnore { library: libs[i].id.clone(), patterns }).await?;
+            Ok(())
+        }
         Cmd::Profile { name } => {
             match name {
                 None => {

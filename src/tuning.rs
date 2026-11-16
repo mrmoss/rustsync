@@ -151,7 +151,9 @@ impl Tuning {
             Profile::Laptop => Tuning { window: 8 * MIB, files: 2, hash_threads: 1 },
             Profile::Desktop => Tuning { window: 16 * MIB, files: 3, hash_threads: (cores / 2).clamp(1, 4) },
             Profile::Server => Tuning { window: 64 * MIB, files: 8, hash_threads: cores.clamp(1, 8) },
-            Profile::Phone => Tuning { window: 4 * MIB, files: 1, hash_threads: 1 },
+            // Phone storage is slow per file (every file goes through Android's media service), so
+            // a few small files are written at once; the window stays small.
+            Profile::Phone => Tuning { window: 8 * MIB, files: 3, hash_threads: 1 },
             Profile::Custom => {
                 let d = Tuning::of(Profile::Desktop, cores, None, None);
                 Tuning { window: window.unwrap_or(d.window), files: files.unwrap_or(d.files), hash_threads: d.hash_threads }
@@ -255,7 +257,7 @@ mod tests {
             Tuning::of(Profile::Server, 8, None, None),
         );
         assert!(phone.window <= laptop.window && laptop.window < server.window);
-        assert!(phone.files <= laptop.files && laptop.files < server.files);
+        assert!(phone.files < server.files && laptop.files < server.files);
     }
 
     #[test]
@@ -276,7 +278,7 @@ mod tests {
         assert_eq!(server.for_library(Storage::Hdd), (1, 1));
         let (files, threads) = server.for_library(Storage::Ssd);
         assert!(files > 1 && threads > 1);
-        assert_eq!(Tuning::of(Profile::Phone, 8, None, None).for_library(Storage::Ssd), (1, 1));
+        assert_eq!(Tuning::of(Profile::Phone, 8, None, None).for_library(Storage::Ssd), (3, 1));
         assert_eq!(Storage::parse("Hard disk"), Some(Storage::Hdd));
         assert_eq!(Storage::parse("SSD"), Some(Storage::Ssd));
         assert_eq!(Storage::parse("tape"), None);

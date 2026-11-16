@@ -224,19 +224,44 @@ android-apk: android-core
     echo "made dist/rustsync-{{version}}-android.apk"
 
 # Android: make a signing key, so that new versions of the app install over old ones
-android-keystore:
+android-keystore repo="mrmoss/rustsync":
     #!/bin/sh
+    # Makes the Android signing key once and, if the GitHub command line (gh) is set up, stores it
+    # as the four repository secrets, so every build from then on can update the app in place.
     set -eu
-    [ ! -e rustsync.jks ] || { echo "rustsync.jks already exists"; exit 1; }
-    keytool -genkeypair -v -keystore rustsync.jks -alias rustsync -keyalg RSA -keysize 4096 -validity 10000
+    key="$HOME/rustsync-android.jks"
+    notes="$HOME/rustsync-android-key.txt"
+    if [ -e "$key" ]; then
+        echo "$key already exists: using it (delete it only if you are sure no phone has an app signed with it)."
+        pass=$(sed -n 's/^password: //p' "$notes" 2>/dev/null || true)
+        [ -n "$pass" ] || { printf "Password of %s: " "$key"; stty -echo; read -r pass; stty echo; echo; }
+    else
+        command -v keytool >/dev/null || { echo "keytool is missing (it comes with Java; e.g. apt install openjdk-17-jdk-headless)"; exit 1; }
+        pass=$(head -c 32 /dev/urandom | base64 | tr -dc 'A-Za-z0-9' | head -c 32)
+        keytool -genkeypair -keystore "$key" -storetype PKCS12 -alias rustsync -keyalg RSA -keysize 4096 \
+            -validity 36500 -storepass "$pass" -keypass "$pass" -dname "CN=RustSync" >/dev/null
+        umask 077
+        printf 'RustSync Android signing key: %s\nalias: rustsync\npassword: %s\n' "$key" "$pass" > "$notes"
+        chmod 600 "$key" "$notes"
+        echo "Made $key (password in $notes)."
+    fi
+    if command -v gh >/dev/null && gh auth status >/dev/null 2>&1; then
+        base64 < "$key" | tr -d '\n' | gh secret set ANDROID_KEYSTORE_BASE64 --repo "{{repo}}"
+        printf %s "$pass" | gh secret set ANDROID_KEYSTORE_PASSWORD --repo "{{repo}}"
+        printf %s rustsync | gh secret set ANDROID_KEY_ALIAS --repo "{{repo}}"
+        printf %s "$pass" | gh secret set ANDROID_KEY_PASSWORD --repo "{{repo}}"
+        echo "Stored the four ANDROID_* secrets on {{repo}}. Builds from now on update the app in place."
+    else
+        echo "gh is not installed or not logged in (gh auth login). Add these repository secrets by hand"
+        echo "(Settings > Secrets and variables > Actions):"
+        echo "  ANDROID_KEYSTORE_BASE64   the output of:  base64 < $key | tr -d '\\n'"
+        echo "  ANDROID_KEYSTORE_PASSWORD $pass"
+        echo "  ANDROID_KEY_ALIAS         rustsync"
+        echo "  ANDROID_KEY_PASSWORD      $pass"
+    fi
     echo
-    echo "Made rustsync.jks. KEEP IT SAFE (it is not in git): whoever has it can sign updates."
-    echo "For GitHub builds, add these repository secrets (Settings > Secrets and variables > Actions):"
-    echo "  ANDROID_KEYSTORE_BASE64   the output of:  base64 < rustsync.jks | tr -d '\\n'"
-    echo "  ANDROID_KEYSTORE_PASSWORD the keystore password you just typed"
-    echo "  ANDROID_KEY_ALIAS         rustsync"
-    echo "  ANDROID_KEY_PASSWORD      the key password (the same, if you pressed enter)"
-    echo "For a local build:  ANDROID_KEYSTORE_FILE=\$PWD/rustsync.jks ANDROID_KEYSTORE_PASSWORD=... ANDROID_KEY_ALIAS=rustsync ANDROID_KEY_PASSWORD=... just android-apk"
+    echo "Keep a copy of $key and $notes somewhere safe (a password manager): if they are lost,"
+    echo "the next update needs an uninstall again. Whoever has them can sign updates of the app."
 
 # Format the code
 fmt:

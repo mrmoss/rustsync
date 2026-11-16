@@ -111,6 +111,17 @@ pub enum Cmd {
         #[arg(long)]
         device: bool,
     },
+    /// Show or change what a library leaves out (its .rustsyncignore), e.g. `--add target/`
+    Ignore {
+        /// Number, name or id of the library (listed if omitted)
+        library: Option<String>,
+        /// Patterns to add
+        #[arg(long)]
+        add: Vec<String>,
+        /// Patterns to remove
+        #[arg(long)]
+        remove: Vec<String>,
+    },
     /// Resume what `pause` paused
     Resume {
         /// Number, name or id of the library or device (listed if omitted)
@@ -261,6 +272,7 @@ pub mod vault;
 pub mod depot;
 pub mod proto;
 pub mod sync;
+pub mod ignore;
 pub mod tailnet;
 pub mod tuning;
 pub mod traffic;

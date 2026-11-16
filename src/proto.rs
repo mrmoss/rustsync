@@ -29,6 +29,8 @@ pub enum Request {
     SetLimits { upload: u64, download: u64 },
     /// Say what a library's folder is stored on here: ssd or hdd.
     SetStorage { library: String, storage: String },
+    /// Replace the ignore patterns of a library (its `.rustsyncignore`); none removes the file.
+    SetIgnore { library: String, patterns: Vec<String> },
     /// Pause or resume syncing a library (by id) or everything with a device (by key): give one.
     Pause {
         #[serde(default)]
@@ -309,6 +311,9 @@ pub struct LibraryInfo {
     /// Syncing it is paused here.
     #[serde(default)]
     pub paused: bool,
+    /// Its ignore patterns (`.rustsyncignore`).
+    #[serde(default)]
+    pub ignore: Vec<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]

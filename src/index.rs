@@ -12,7 +12,8 @@ use std::io::Read;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
+use crate::ignore::{Ignore, IGNORE_FILE, MAX_FILE_LEN};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::{debug, warn};
 
@@ -278,6 +279,8 @@ pub struct Folder {
     /// drives and many network shares. There permissions are neither applied nor compared, so a
     /// permission the disk cannot hold never looks like a change of the file.
     pub perms: bool,
+    /// The ignore patterns, and the (change time, size) of the file they were read from.
+    ignore: Mutex<(Option<(u64, u64)>, Arc<Ignore>)>,
 }
 
 /// Try whether permission bits set on a file in `root` stay as they were set.
@@ -331,7 +334,67 @@ impl Folder {
             files_at_once: AtomicUsize::new(2),
             hash_threads: AtomicUsize::new(1),
             perms,
+            ignore: Mutex::new((None, Arc::new(Ignore::default()))),
         })
+    }
+
+    /// The ignore patterns of this library (`.rustsyncignore` in its top folder), read again
+    /// whenever the file changed.
+    pub fn ignores(&self) -> Arc<Ignore> {
+        let path = self.root.join(IGNORE_FILE);
+        let stamp = fs::symlink_metadata(&path)
+            .ok()
+            .filter(|md| md.is_file() && md.len() <= MAX_FILE_LEN)
+            .map(|md| (mtime_of(&md), md.len()));
+        let mut cached = self.ignore.lock().unwrap();
+        if cached.0 == stamp && (stamp.is_some() || cached.1.is_empty()) {
+            return cached.1.clone();
+        }
+        let text = match stamp {
+            None => String::new(),
+            Some(_) => open_nofollow(&path, &self.root)
+                .and_then(|mut f| {
+                    let mut s = String::new();
+                    std::io::Read::read_to_string(&mut f, &mut s).map(|_| s)
+                })
+                .unwrap_or_default(),
+        };
+        *cached = (stamp, Arc::new(Ignore::parse(&text)));
+        cached.1.clone()
+    }
+
+    /// Is this folder, deleted in our index, kept only by downloads that are being given up
+    /// (our temp files, or folders like it)? Then it is as good as deleted: it goes as soon as
+    /// they are cleaned up.
+    pub fn leftovers_only(&self, rel: &str) -> bool {
+        fn check(f: &Folder, rel: &str, depth: usize) -> bool {
+            if depth > 64 {
+                return false;
+            }
+            let Ok(rd) = fs::read_dir(f.abs(rel)) else { return false };
+            let mut any = false;
+            for ent in rd {
+                let Ok(ent) = ent else { return false };
+                let Ok(name) = ent.file_name().into_string() else { return false };
+                any = true;
+                if name.starts_with(TMP_PREFIX) {
+                    continue;
+                }
+                let child = if rel.is_empty() { name } else { format!("{}/{}", rel, name) };
+                let is_dir = ent.file_type().map(|t| t.is_dir()).unwrap_or(false);
+                let deleted = matches!(f.get(&child), Some(e) if e.deleted);
+                if !(is_dir && deleted && check(f, &child, depth + 1)) {
+                    return false;
+                }
+            }
+            any
+        }
+        !rel.is_empty() && check(self, rel, 0)
+    }
+
+    /// The version (stamp and hash) recorded for a path, without copying the whole entry.
+    pub fn key_of(&self, rel: &str) -> Option<(u64, String)> {
+        self.index.lock().unwrap().get(rel).map(|e| (e.stamp, e.hash.clone()))
     }
 
     pub fn abs(&self, rel: &str) -> PathBuf {
@@ -447,8 +510,9 @@ pub fn scan(folder: &Folder, roots: &[String], deep: bool) -> Vec<Entry> {
     let mut updates: Vec<Entry> = Vec::new();
     let mut changed: Vec<Entry> = Vec::new();
     let mut to_hash: Vec<ToHash> = Vec::new();
+    let ign = folder.ignores();
     for r in &kept {
-        walk(folder, r, &old, deep, &mut seen, &mut updates, &mut changed, &mut to_hash);
+        walk(folder, &ign, r, &old, deep, &mut seen, &mut updates, &mut changed, &mut to_hash);
     }
 
     // Read and hash the files that look new or changed: several at once on an SSD, one after
@@ -489,8 +553,10 @@ pub fn scan(folder: &Folder, roots: &[String], deep: bool) -> Vec<Entry> {
         }
     }
 
+    // Ignored now: forgotten here, without telling anyone it is gone (their copies stay).
+    let forget: Vec<String> = old.iter().filter(|(p, o)| ign.is_ignored(p, o.kind == Kind::Dir)).map(|(p, _)| p.clone()).collect();
     for (p, o) in &old {
-        if !o.deleted && !seen.contains(p) {
+        if !o.deleted && !seen.contains(p) && !ign.is_ignored(p, o.kind == Kind::Dir) {
             let t = Entry {
                 path: p.clone(),
                 kind: o.kind,
@@ -508,8 +574,11 @@ pub fn scan(folder: &Folder, roots: &[String], deep: bool) -> Vec<Entry> {
         }
     }
 
-    if !updates.is_empty() {
+    if !updates.is_empty() || !forget.is_empty() {
         let mut idx = folder.index.lock().unwrap();
+        for p in &forget {
+            idx.remove(p);
+        }
         for e in updates {
             idx.insert(e.path.clone(), e);
         }
@@ -555,6 +624,7 @@ fn hash_all(folder: &Folder, items: &[ToHash], threads: usize) -> Vec<Hashed> {
 #[allow(clippy::too_many_arguments)]
 fn walk(
     folder: &Folder,
+    ign: &Ignore,
     rel: &str,
     old: &HashMap<String, Entry>,
     deep: bool,
@@ -579,6 +649,9 @@ fn walk(
         debug!("skipping symlink {}", rel);
         return;
     }
+    if ign.is_ignored(rel, md.is_dir()) {
+        return;
+    }
     let prev = old.get(rel);
     let kind = if md.is_dir() { Kind::Dir } else { Kind::File };
     // Where the disk cannot keep permissions, they are whatever the last version said (or the
@@ -592,6 +665,9 @@ fn walk(
     };
 
     if md.is_dir() {
+        if matches!(prev, Some(o) if o.deleted) && folder.leftovers_only(rel) {
+            return; // deleted, and only kept by downloads that are being given up
+        }
         if !rel.is_empty() {
             seen.insert(rel.to_string());
             let same = matches!(prev, Some(o) if !o.deleted && o.kind == Kind::Dir && o.mode == mode);
@@ -625,7 +701,7 @@ fn walk(
         names.sort();
         for n in names {
             let child = if rel.is_empty() { n } else { format!("{}/{}", rel, n) };
-            walk(folder, &child, old, deep, seen, updates, changed, to_hash);
+            walk(folder, ign, &child, old, deep, seen, updates, changed, to_hash);
         }
     } else if md.is_file() {
         seen.insert(rel.to_string());
@@ -803,6 +879,28 @@ mod tests {
         let (data, state) = (dir.join("data"), dir.join("state"));
         fs::create_dir_all(&data).unwrap();
         (dir, data, state)
+    }
+
+    #[test]
+    fn ignored_files_are_not_announced_and_not_deleted_elsewhere() {
+        let (dir, data, state) = test_folder("ignore");
+        fs::create_dir_all(data.join("target/debug")).unwrap();
+        fs::write(data.join("target/debug/big"), b"build output").unwrap();
+        fs::write(data.join("src.rs"), b"fn main() {}").unwrap();
+        let folder = Folder::open("ignore".into(), data.to_str().unwrap(), &state, 0).unwrap();
+        let first = scan(&folder, &[String::new()], false);
+        assert!(first.iter().any(|e| e.path == "target/debug/big"));
+        // now ignore it: it is forgotten here, but no deletion goes out
+        fs::write(data.join(IGNORE_FILE), "target/\n").unwrap();
+        let second = scan(&folder, &[String::new()], false);
+        assert!(second.iter().all(|e| !e.path.starts_with("target")), "{:?}", second);
+        assert!(second.iter().any(|e| e.path == IGNORE_FILE));
+        assert!(folder.get("target/debug/big").is_none() && folder.get("target").is_none());
+        assert!(data.join("target/debug/big").exists());
+        // and later changes in it are not seen
+        fs::write(data.join("target/new"), b"x").unwrap();
+        assert!(scan(&folder, &[String::new()], false).is_empty());
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

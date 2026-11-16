@@ -55,13 +55,17 @@ pub async fn apply_entries(folder: &Arc<Folder>, remote: &Remote, entries: Vec<E
     // hashes, change time, permissions).
     let now = now_ns();
     let mut rejected = 0usize;
+    let ign = folder.ignores();
     let todo: Vec<Entry> = {
         let idx = folder.index.lock().unwrap();
         entries
             .into_iter()
             .filter_map(|e| match sanitize_remote(e, now, folder.max_skew_ns) {
                 Ok(e) => {
-                    if remote_wins(idx.get(&e.path), &e) {
+                    // Ignored here: neither fetched nor deleted.
+                    if ign.is_ignored(&e.path, e.kind == Kind::Dir) {
+                        None
+                    } else if remote_wins(idx.get(&e.path), &e) {
                         Some(e)
                     } else {
                         None
@@ -186,8 +190,12 @@ fn apply_meta(folder: &Folder, e: &Entry) -> Result<Option<Entry>> {
                     return Ok(None);
                 }
                 if let Err(err) = fs::remove_dir(&abs) {
-                    warn!("cannot remove directory {}: {}", e.path, err);
-                    return Ok(None);
+                    // Files that are still being fetched into it are given up (they were
+                    // deleted too): it goes when they are cleaned up.
+                    if !folder.leftovers_only(&e.path) {
+                        warn!("cannot remove directory {}: {}", e.path, err);
+                        return Ok(None);
+                    }
                 }
             } else {
                 let indexed = matches!(&local, Some(l) if l.is_live_file() && disk_matches(&abs, l));
@@ -274,8 +282,8 @@ async fn apply_file(folder: &Arc<Folder>, remote: &Remote, e: &Entry) -> Result<
     ));
 
     let built = build_temp(
-        folder.id.clone(),
-        folder.root.clone(),
+        folder.clone(),
+        local.as_ref().map(|l| l.key()).map(|(s, h)| (s, h.to_string())),
         remote.clone(),
         e.clone(),
         abs.clone(),
@@ -285,24 +293,61 @@ async fn apply_file(folder: &Arc<Folder>, remote: &Remote, e: &Entry) -> Result<
     )
     .await;
     if let Err(err) = built {
+        let _guard = folder.fs_lock.lock().await;
         let _ = tokio::fs::remove_file(&tmp).await;
+        let (f, p) = (folder.clone(), e.path.clone());
+        let _ = tokio::task::spawn_blocking(move || tidy_parents(&f, &p)).await;
+        if err.downcast_ref::<Superseded>().is_some() {
+            return Ok(false); // a newer change (a deletion, say) arrived meanwhile
+        }
         return Err(err);
     }
 
     let _guard = folder.fs_lock.lock().await;
     let (f, e2, t2, l2) = (folder.clone(), e.clone(), tmp.clone(), local.clone());
-    let res = tokio::task::spawn_blocking(move || commit_file(&f, &e2, &t2, l2.as_ref())).await?;
-    if !matches!(res, Ok(true)) {
-        let _ = tokio::fs::remove_file(&tmp).await;
-    }
+    let res = tokio::task::spawn_blocking(move || {
+        let res = commit_file(&f, &e2, &t2, l2.as_ref());
+        if !matches!(res, Ok(true)) {
+            let _ = fs::remove_file(&t2);
+            tidy_parents(&f, &e2.path);
+        }
+        res
+    })
+    .await?;
     res
+}
+
+/// The file being fetched was changed or deleted meanwhile: the fetch stops.
+#[derive(Debug)]
+struct Superseded;
+
+impl std::fmt::Display for Superseded {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("a newer change arrived meanwhile")
+    }
+}
+
+impl std::error::Error for Superseded {}
+
+/// Folders above `rel` that were created for a file that then did not arrive, and that are
+/// deleted in our index: removed again if empty, so they do not come back as new folders.
+/// Caller holds fs_lock.
+fn tidy_parents(folder: &Folder, rel: &str) {
+    let mut path = rel;
+    while let Some(i) = path.rfind('/') {
+        path = &path[..i];
+        let gone = matches!(folder.get(path), Some(e) if e.deleted);
+        if !gone || fs::remove_dir(folder.abs(path)).is_err() {
+            break;
+        }
+    }
 }
 
 // Takes everything by value: borrowed data inside the buffered stream makes the future
 // fail Rust's "Send is not general enough" check when spawned on tokio.
 async fn build_temp(
-    folder_id: String,
-    root: PathBuf,
+    folder: Arc<Folder>,
+    planned: Option<(u64, String)>,
     remote: Remote,
     e: Entry,
     abs: PathBuf,
@@ -310,6 +355,8 @@ async fn build_temp(
     local_size: u64,
     tmp: PathBuf,
 ) -> Result<()> {
+    let (folder_id, root) = (folder.id.clone(), folder.root.clone());
+    let watch = folder;
     // New file, never following a symlink, and checked to really be inside the folder.
     let out = {
         use std::os::fd::AsRawFd;
@@ -361,9 +408,15 @@ async fn build_temp(
             let remote = remote.clone();
             let path = path.clone();
             let folder_id = folder_id.clone();
+            let watch = watch.clone();
+            let planned = planned.clone();
             async move {
                 if reuse {
                     return Ok::<Piece, anyhow::Error>(Piece::Local(i));
+                }
+                // Changed or deleted meanwhile (by a later message): stop fetching it.
+                if watch.key_of(&path) != planned {
+                    return Err(Superseded.into());
                 }
                 let len = expected_len(i);
                 let (data, window) = remote.get_chunk(folder_id, path, i as u32, want.clone(), len).await?;

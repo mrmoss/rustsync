@@ -408,6 +408,8 @@ Libraries (folders to sync)
   decline [OFFER]                   Say no to an offer
   refresh                           Ask connected devices for their libraries again
   storage [LIBRARY] [ssd|hdd]       Say what the library's folder is on here (see below)
+  ignore [LIBRARY] [--add P] [--remove P]
+                                    Show or change what a library leaves out (see below)
 
 Encrypted backups (see below)
   quota [LIBRARY] [SIZE]            Show or change the size limit of a backup kept here
@@ -569,7 +571,7 @@ Two simple choices tell rustsync how to treat a machine; there is nothing else t
 | `laptop` | saving battery, staying out of your way | up to 8 MiB at a time | 2 |
 | `desktop` (the default) | a computer you also use for other things | up to 16 MiB | 3 |
 | `server` | a machine that is there to sync and store | up to 64 MiB | 8 |
-| `phone` (the default in the Android app) | as little work at a time as possible | up to 4 MiB | 1 |
+| `phone` (the default in the Android app) | little work at a time, but several small files at once (phone storage is slow per file) | up to 8 MiB | 3 |
 
 Each device decides this for itself: a laptop that syncs with a server is never worked harder than
 its own profile allows, whatever the server is set to.
@@ -591,6 +593,26 @@ transfers that were running stop; changes made meanwhile on either side are exch
 resumed. The other device is told, and shows "paused on <this device>". A pause stays until it is
 resumed, also across restarts.
 
+## Leaving things out
+
+Build output, caches and the like rarely belong in a library: a Rust `target/` folder alone can be
+tens of thousands of files that change all the time. List what to leave out with the *Ignore…*
+button on a library, or `rustsync ignore LIBRARY --add target/`. The list is kept in a file called
+`.rustsyncignore` in the top folder of the library, which is synced, so it applies on every device.
+It works much like a `.gitignore`:
+
+```text
+target/          a folder of that name, anywhere (and everything in it)
+*.tmp            a file name, anywhere
+/notes/private   a path from the top of the library
+docs/**/*.pdf    ** stands for any number of folders
+!keep.tmp        takes a file back in (not inside a folder that is left out)
+```
+
+What is left out is not sent, not fetched and not deleted anywhere: copies that other devices
+already have stay where they are. To get rid of them, delete the folder first and add the pattern
+after.
+
 ## Deleting files
 
 A deleted file is gone on every device, also when another device still had a copy. When a
@@ -601,6 +623,9 @@ deletion reaches a device:
 - if the file there is **different** (it was changed there, and the change had not arrived yet), the
   change wins: it is kept and comes back to the other devices, as a newer version;
 - a folder is removed once it is empty; anything else in it stays.
+
+Deletions are handled straight away, even while the device is still fetching other files, and a
+file that is deleted while it is being fetched stops being fetched.
 
 A file a device finds for the first time counts as being as old as its change time, so a copy
 that only turned up again cannot undo a later deletion. On disks that cannot keep Unix permissions
@@ -646,18 +671,24 @@ APK on every push (open the run, download the `dist-android` artifact), and tagg
 it attached (`rustsync-<version>-android.apk`). Copy it to the phone and open it; Android asks to
 allow installing from that source.
 
-- **Signing key.** Without one, each build is signed with a throw-away key, so a new build can only
-  be installed after uninstalling the old one, which **deletes the phone's rustsync identity and
-  pairings**. To avoid that, make a key once with `just android-keystore` (or run
-  `keytool -genkeypair -v -keystore rustsync.jks -alias rustsync -keyalg RSA -keysize 4096 -validity 10000`)
-  and add the four repository secrets (Settings > Secrets and variables > Actions):
-  `ANDROID_KEYSTORE_BASE64` (the output of `base64 < rustsync.jks | tr -d '\n'`),
-  `ANDROID_KEYSTORE_PASSWORD`, `ANDROID_KEY_ALIAS` (`rustsync`) and `ANDROID_KEY_PASSWORD`.
-  Keep the `rustsync.jks` file safe (and a copy somewhere else: lose it and the next update needs an
-  uninstall again); it is not in git. Builds that don't have the key show a warning on the run.
-  Phones that have a build signed with a throw-away key need one last uninstall before the first
-  properly signed build; after that, updates just install over the old version, keeping everything.
-  The app's version code follows the version in `Cargo.toml`, so each new version counts as newer.
+- **Signing key (do this once).** Android only installs a new version over the old one if both
+  are signed with the same key. Until the repository has one, every GitHub build is signed with a
+  new throw-away key, so a new build only installs after uninstalling the old one, which **deletes
+  the phone's rustsync identity and pairings** (the build run shows a warning). To fix it for good,
+  run once on your computer, with the GitHub command line logged in (`gh auth login`):
+
+  ```sh
+  just android-keystore
+  ```
+
+  It makes the key (`~/rustsync-android.jks`, with its password in `~/rustsync-android-key.txt`)
+  and stores it as the four repository secrets `ANDROID_KEYSTORE_BASE64`,
+  `ANDROID_KEYSTORE_PASSWORD`, `ANDROID_KEY_ALIAS` and `ANDROID_KEY_PASSWORD` (without `gh` it
+  prints them for adding by hand under Settings > Secrets and variables > Actions). Keep both files
+  somewhere safe: lose them and the next update needs an uninstall again. A phone that has a build
+  signed with a throw-away key needs one last uninstall before the first properly signed build;
+  after that, updates install over the old version and keep everything. The app's version code
+  follows the version in `Cargo.toml`, so each new version counts as newer.
 - **Folders.** To sync folders like Documents or Pictures the app needs Android's "all files
   access" (the app asks when you first open it, and the *Home* page has a button if you said
   no). It also asks for notifications and for the camera (to scan pairing codes). Libraries are then

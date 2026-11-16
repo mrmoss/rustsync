@@ -39,6 +39,7 @@ enum Request {
     SetLimits { upload: u64, download: u64 },
     SetStorage { library: String, storage: String },
     Pause { library: String, device: String, paused: bool },
+    SetIgnore { library: String, patterns: Vec<String> },
     SetName { name: String },
     Rename { device: String, nickname: String },
     SetTailscale { enabled: bool },
@@ -235,6 +236,8 @@ struct LibraryInfo {
     storage: String,
     #[serde(default)]
     paused: bool,
+    #[serde(default)]
+    ignore: Vec<String>,
 }
 
 #[derive(Deserialize, Debug, Clone)]
@@ -654,6 +657,7 @@ enum Dialog {
     Share { lib_id: String, lib_name: String, device: usize, backup: bool },
     Accept { offer_id: String, from_key: String, name: String, folder: String, backup: bool, from: String, quota: String },
     Quota { id: String, name: String, text: String },
+    Ignore { id: String, name: String, text: String },
     Unshare { lib_id: String, lib_name: String, candidates: Vec<(String, String)>, sel: usize },
     Recovery { name: String, code: Option<String>, error: Option<String> },
     Log { title: String, device: Option<String>, library: Option<String>, text: Option<String>, error: Option<String> },
@@ -696,6 +700,7 @@ enum Action {
     SetStorage { id: String, storage: String },
     /// Pause or resume a library (by id) or a device (by key).
     Pause { library: String, device: String, paused: bool },
+    SetIgnore { id: String, patterns: Vec<String> },
     SetTailscale { enabled: bool },
     /// Ask Tailscale now and check which machines answer.
     CheckTailnet,
@@ -1212,6 +1217,7 @@ impl App {
             }
             Action::SetStorage { id, storage } => self.run(Request::SetStorage { library: id, storage }),
             Action::Pause { library, device, paused } => self.run(Request::Pause { library, device, paused }),
+            Action::SetIgnore { id, patterns } => self.run(Request::SetIgnore { library: id, patterns }),
             Action::SetTailscale { enabled } => self.run(Request::SetTailscale { enabled }),
             Action::CheckTailnet => self.run(Request::Tailnet),
             Action::SetAddress { key, addr } => self.run(Request::SetAddress { device: key, addr }),
@@ -2322,6 +2328,12 @@ impl App {
                             if ui.button(text).on_hover_text(tip).clicked() {
                                 self.perform(Action::Pause { library: l.id.clone(), device: String::new(), paused: !l.paused });
                             }
+                            if !l.backup_only {
+                                let label = if l.ignore.is_empty() { "Ignore…".to_string() } else { format!("Ignore ({})…", l.ignore.len()) };
+                                if ui.button(label).on_hover_text("Files and folders of this library that are not synced, such as build output").clicked() {
+                                    self.dialog = Dialog::Ignore { id: l.id.clone(), name: l.name.clone(), text: l.ignore.join("\n") };
+                                }
+                            }
                             if ui.button("Log…").clicked() {
                                 self.perform(Action::ShowLog {
                                     title: format!("Log: {}", l.name),
@@ -3202,6 +3214,37 @@ impl App {
                     ui.horizontal(|ui| {
                         if ui.add_enabled(parsed.is_ok(), egui::Button::new(RichText::new("Save").strong())).clicked() {
                             action = Some(Action::SetQuota { id: id.clone(), bytes: parsed.clone().unwrap_or(0) });
+                            close = true;
+                        }
+                        if ui.button("Cancel").clicked() {
+                            close = true;
+                        }
+                    });
+                });
+            }
+
+            Dialog::Ignore { id, name, text } => {
+                window("Leave out of the library").show(ctx, |ui| {
+                    ui.label(format!("What “{}” does not sync, one pattern per line:", name));
+                    ui.add(
+                        egui::TextEdit::multiline(text)
+                            .font(egui::TextStyle::Monospace)
+                            .desired_rows(8)
+                            .desired_width(f32::INFINITY)
+                            .hint_text("target/\nnode_modules/\n*.tmp"),
+                    );
+                    ui.label(
+                        RichText::new(
+                            "name/ is a folder of that name anywhere, *.tmp a file name anywhere, /docs/old a path from the top                              of the library, ** any number of folders, and !name takes a file back in. The list is kept in                              .rustsyncignore and synced, so it applies on every device. Copies other devices already have                              are not deleted.",
+                        )
+                        .small()
+                        .weak(),
+                    );
+                    ui.horizontal(|ui| {
+                        if ui.add(egui::Button::new(RichText::new("Save").strong())).clicked() {
+                            let patterns: Vec<String> =
+                                text.lines().map(|l| l.trim().to_string()).filter(|l| !l.is_empty() && !l.starts_with('#')).collect();
+                            action = Some(Action::SetIgnore { id: id.clone(), patterns });
                             close = true;
                         }
                         if ui.button("Cancel").clicked() {

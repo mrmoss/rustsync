@@ -231,6 +231,10 @@ sequenceDiagram
 - A deletion says what was deleted (the hash of the file). A device deletes its copy only if it is
   that content, or what it indexed and has not changed; a different version is kept and becomes a
   newer version. So a deletion cannot remove work that never reached the deleting device.
+- Ignore patterns come from `.rustsyncignore`, which is synced like any file: a device that syncs a
+  library can change what the others leave out (as it could delete the files). Leaving something
+  out never deletes it anywhere. The file is read without following links, at most 64 KiB and 500
+  patterns, and matching is bounded so a pattern cannot make a scan slow.
 - Files that are being fetched are kept open on the sending side for a few seconds (at most 8 per
   connection). They were opened with the same checks as always (no symlink, inside the library
   folder), every piece read from them is still checked against the index's hash before it is sent,
