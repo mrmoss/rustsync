@@ -38,6 +38,7 @@ enum Request {
     SetProfile { profile: String },
     SetLimits { upload: u64, download: u64 },
     SetStorage { library: String, storage: String },
+    Pause { library: String, device: String, paused: bool },
     SetName { name: String },
     Rename { device: String, nickname: String },
     SetTailscale { enabled: bool },
@@ -172,6 +173,11 @@ struct DeviceInfo {
     up_rate: u64,
     #[serde(default)]
     down_rate: u64,
+    /// We paused syncing with it / it paused syncing with us.
+    #[serde(default)]
+    paused: bool,
+    #[serde(default)]
+    paused_there: bool,
 }
 
 /// How a library is syncing with one device.
@@ -187,6 +193,9 @@ struct SyncInfo {
     /// ... and still to be fetched by that device from us, as it tells us.
     up_files: u64,
     up_bytes: u64,
+    /// "" / "here" / "there"
+    #[serde(default)]
+    paused: String,
 }
 
 impl SyncInfo {
@@ -224,6 +233,8 @@ struct LibraryInfo {
     /// What the folder is stored on here: "ssd" or "hdd".
     #[serde(default)]
     storage: String,
+    #[serde(default)]
+    paused: bool,
 }
 
 #[derive(Deserialize, Debug, Clone)]
@@ -559,6 +570,11 @@ fn files_text(n: u64) -> String {
 
 /// "receiving 3 files, 120 MB left; sending 1 file, 4 MB left", "up to date" or "offline".
 fn sync_summary(s: &SyncInfo) -> String {
+    match s.paused.as_str() {
+        "here" => return "paused".to_string(),
+        "there" => return format!("paused on {}", s.device),
+        _ => {}
+    }
     let mut parts = Vec::new();
     if s.down_files > 0 || s.down_bytes > 0 {
         parts.push(format!("receiving {}, {} left", files_text(s.down_files), fmt_size(s.down_bytes)));
@@ -678,6 +694,8 @@ enum Action {
     /// Bytes per second; 0 = no limit.
     SetLimits { upload: u64, download: u64 },
     SetStorage { id: String, storage: String },
+    /// Pause or resume a library (by id) or a device (by key).
+    Pause { library: String, device: String, paused: bool },
     SetTailscale { enabled: bool },
     /// Ask Tailscale now and check which machines answer.
     CheckTailnet,
@@ -711,7 +729,7 @@ struct App {
     port_edit: Option<String>,
     /// The speed limits being typed on the Settings page, sending and fetching (None: show the
     /// current ones).
-    limit_edit: Option<(String, String)>,
+    limit_edit: [Option<String>; 2],
     /// The log size being typed on the Settings page (None: show the current one).
     log_edit: Option<String>,
 }
@@ -759,7 +777,7 @@ impl App {
             browse: None,
             logo,
             port_edit: None,
-            limit_edit: None,
+            limit_edit: [None, None],
             log_edit: None,
         }
     }
@@ -1189,10 +1207,11 @@ impl App {
             }
             Action::SetProfile { profile } => self.run(Request::SetProfile { profile }),
             Action::SetLimits { upload, download } => {
-                self.limit_edit = None;
+                self.limit_edit = [None, None];
                 self.run(Request::SetLimits { upload, download })
             }
             Action::SetStorage { id, storage } => self.run(Request::SetStorage { library: id, storage }),
+            Action::Pause { library, device, paused } => self.run(Request::Pause { library, device, paused }),
             Action::SetTailscale { enabled } => self.run(Request::SetTailscale { enabled }),
             Action::CheckTailnet => self.run(Request::Tailnet),
             Action::SetAddress { key, addr } => self.run(Request::SetAddress { device: key, addr }),
@@ -2232,9 +2251,18 @@ impl App {
         for l in &status.libraries {
             card(ui, |ui| {
                 ui.horizontal(|ui| {
-                    tile(ui, Glyph::Folder, ACCENT, ACCENT_SOFT);
+                    if l.paused {
+                        tile(ui, Glyph::Folder, MUTED, HOVER);
+                    } else {
+                        tile(ui, Glyph::Folder, ACCENT, ACCENT_SOFT);
+                    }
                     ui.vertical(|ui| {
-                        ui.label(RichText::new(&l.name).strong().size(16.0));
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new(&l.name).strong().size(16.0));
+                            if l.paused {
+                                ui.label(RichText::new("Paused").color(AMBER).strong());
+                            }
+                        });
                         ui.add(egui::Label::new(RichText::new(&l.folder).small().weak()).wrap());
                         ui.horizontal_wrapped(|ui| {
                             ui.label(RichText::new(format!("id {}", short(&l.id))).small().weak().monospace());
@@ -2286,6 +2314,14 @@ impl App {
                                     sel: 0,
                                 };
                             }
+                            let (text, tip) = if l.paused {
+                                ("Resume", "Start syncing this library again")
+                            } else {
+                                ("Pause", "Stop sending and receiving changes of this library until you resume it. The other devices are told.")
+                            };
+                            if ui.button(text).on_hover_text(tip).clicked() {
+                                self.perform(Action::Pause { library: l.id.clone(), device: String::new(), paused: !l.paused });
+                            }
                             if ui.button("Log…").clicked() {
                                 self.perform(Action::ShowLog {
                                     title: format!("Log: {}", l.name),
@@ -2326,8 +2362,10 @@ impl App {
                     }
                 }
                 if !l.sync.is_empty() {
-                    let busy = l.sync.iter().any(|s| s.busy());
-                    let title = if busy {
+                    let busy = !l.paused && l.sync.iter().any(|s| s.busy() && s.paused.is_empty());
+                    let title = if l.paused {
+                        "Paused".to_string()
+                    } else if busy {
                         "Syncing now".to_string()
                     } else if l.sync.iter().all(|s| !s.online) {
                         format!("Syncing with {} (offline)", l.syncing_with.join(", "))
@@ -2433,7 +2471,14 @@ impl App {
                         tile(ui, Glyph::Devices, MUTED, HOVER);
                     }
                     ui.vertical(|ui| {
-                        ui.label(RichText::new(&d.name).strong());
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new(&d.name).strong());
+                            if d.paused {
+                                ui.label(RichText::new("Paused").color(AMBER).strong());
+                            } else if d.paused_there {
+                                ui.label(RichText::new("Paused on that device").color(AMBER));
+                            }
+                        });
                         if !d.nickname.is_empty() && !d.announced.is_empty() {
                             ui.label(RichText::new(format!("calls itself “{}”", d.announced)).small().weak());
                         }
@@ -2464,6 +2509,14 @@ impl App {
                                     name: d.name.clone(),
                                     text: d.addr.clone().unwrap_or_default(),
                                 };
+                            }
+                            let (text, tip) = if d.paused {
+                                ("Resume", "Start syncing with this device again")
+                            } else {
+                                ("Pause", "Stop syncing anything with this device until you resume it. It stays connected and is told.")
+                            };
+                            if ui.button(text).on_hover_text(tip).clicked() {
+                                self.perform(Action::Pause { library: String::new(), device: d.key.clone(), paused: !d.paused });
                             }
                             if ui
                                 .button("Rename…")
@@ -2734,45 +2787,73 @@ impl App {
             }
             ui.label(RichText::new(profile_hint(&current)).small().weak());
 
-            ui.add_space(6.0);
-            let shown = |v: u64| if v == 0 { String::new() } else { trim_number(v as f64 / 1e6) };
-            let now = (shown(status.upload_limit), shown(status.download_limit));
-            let (mut up, mut down) = self.limit_edit.clone().unwrap_or_else(|| now.clone());
-            // megabytes per second -> bytes per second; empty = no limit
+        });
+
+        ui.add_space(8.0);
+        card(ui, |ui| {
+            ui.label(RichText::new("Speed limits").strong());
+            ui.label(RichText::new("Off means as fast as the network allows. A limit applies at once.").small().weak());
+            ui.add_space(4.0);
+            // megabytes per second -> bytes per second
             let read = |t: &str| -> Option<u64> {
                 let t = t.trim().replace(',', ".");
-                if t.is_empty() {
-                    return Some(0);
-                }
-                t.parse::<f64>().ok().filter(|v| v.is_finite() && *v >= 0.0 && *v <= 100_000.0).map(|v| (v * 1e6).round() as u64)
+                t.parse::<f64>().ok().filter(|v| v.is_finite() && *v > 0.0 && *v <= 100_000.0).map(|v| (v * 1e6).round() as u64)
             };
-            let mut save = false;
-            ui.horizontal_wrapped(|ui| {
-                ui.label("Send at most");
-                let a = ui.add(egui::TextEdit::singleline(&mut up).desired_width(60.0).hint_text("no limit"));
-                ui.label("MB/s,  fetch at most");
-                let b = ui.add(egui::TextEdit::singleline(&mut down).desired_width(60.0).hint_text("no limit"));
-                ui.label("MB/s");
-                let changed = (up.trim(), down.trim()) != (now.0.as_str(), now.1.as_str());
-                if a.changed() || b.changed() {
-                    self.limit_edit = if changed { Some((up.clone(), down.clone())) } else { None };
-                }
-                let ok = read(&up).is_some() && read(&down).is_some();
-                let enter = (a.lost_focus() || b.lost_focus()) && ui.input(|i| i.key_pressed(egui::Key::Enter));
-                if changed && ok && (ui.button("Save").clicked() || enter) {
-                    save = true;
-                }
-                if changed && ui.button("Reset").clicked() {
-                    self.limit_edit = None;
+            let limits = [status.upload_limit, status.download_limit];
+            let labels = ["Limit sending (upload)", "Limit fetching (download)"];
+            let mut apply: Option<[u64; 2]> = None;
+            egui::Grid::new("speed_limits").num_columns(2).spacing([12.0, 8.0]).show(ui, |ui| {
+                for row in 0..2 {
+                    let current = limits[row];
+                    let editing = self.limit_edit[row].is_some();
+                    let mut on = current > 0 || editing;
+                    if ui.checkbox(&mut on, labels[row]).changed() {
+                        if on {
+                            self.limit_edit[row] = Some("10".to_string());
+                        } else {
+                            self.limit_edit[row] = None;
+                            let mut v = limits;
+                            v[row] = 0;
+                            apply = Some(v);
+                        }
+                    }
+                    ui.horizontal(|ui| {
+                        if !on {
+                            ui.label(RichText::new("no limit").weak());
+                            return;
+                        }
+                        let mut text = self.limit_edit[row].clone().unwrap_or_else(|| trim_number(current as f64 / 1e6));
+                        let resp = ui.add(
+                            egui::TextEdit::singleline(&mut text)
+                                .desired_width(110.0)
+                                .hint_text("e.g. 10"),
+                        );
+                        ui.label("MB/s");
+                        if resp.changed() {
+                            self.limit_edit[row] = Some(text.clone());
+                        }
+                        let value = read(&text);
+                        let changed = value != Some(current);
+                        if self.limit_edit[row].is_some() && changed {
+                            let enter = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                            if ui.add_enabled(value.is_some(), egui::Button::new("Save")).clicked() || (enter && value.is_some()) {
+                                let mut v = limits;
+                                v[row] = value.unwrap_or(0);
+                                apply = Some(v);
+                            }
+                            if current > 0 && ui.button("Cancel").clicked() {
+                                self.limit_edit[row] = None;
+                            }
+                        }
+                        if value.is_none() && !text.trim().is_empty() {
+                            ui.label(RichText::new("a number above 0").color(RED).small());
+                        }
+                    });
+                    ui.end_row();
                 }
             });
-            if read(&up).is_none() || read(&down).is_none() {
-                ui.label(RichText::new("A number of megabytes per second, or empty for no limit.").color(RED).small());
-            }
-            if save {
-                if let (Some(upload), Some(download)) = (read(&up), read(&down)) {
-                    self.perform(Action::SetLimits { upload, download });
-                }
+            if let Some([upload, download]) = apply {
+                self.perform(Action::SetLimits { upload, download });
             }
         });
 

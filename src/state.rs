@@ -27,6 +27,9 @@ pub struct Device {
     /// When it was last connected (seconds since 1970); 0 = never.
     #[serde(default)]
     pub last_seen: u64,
+    /// Syncing with it is paused (here; it is told).
+    #[serde(default)]
+    pub paused: bool,
 }
 
 impl Device {
@@ -110,6 +113,9 @@ pub struct Library {
     /// Only about this machine; never sent to other devices.
     #[serde(default)]
     pub storage: crate::tuning::Storage,
+    /// Syncing this library is paused here (the other devices are told).
+    #[serde(default)]
+    pub paused: bool,
 }
 
 impl Library {

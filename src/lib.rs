@@ -103,6 +103,22 @@ pub enum Cmd {
         /// on, off or status
         action: Option<String>,
     },
+    /// Pause syncing a library (or, with --device, everything with a device); the other side is told
+    Pause {
+        /// Number, name or id of the library or device (listed if omitted)
+        name: Option<String>,
+        /// Pause a device instead of a library
+        #[arg(long)]
+        device: bool,
+    },
+    /// Resume what `pause` paused
+    Resume {
+        /// Number, name or id of the library or device (listed if omitted)
+        name: Option<String>,
+        /// Resume a device instead of a library
+        #[arg(long)]
+        device: bool,
+    },
     /// Show or choose how hard this machine works: laptop, desktop, server, phone or custom
     Profile {
         /// The profile (shown if omitted)

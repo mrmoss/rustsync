@@ -312,16 +312,18 @@ private fun Libraries(model: Model, status: Status) {
                     Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(12.dp)) {
                         GlyphTile(Glyph.Folder)
                         Text(lib.name, style = MaterialTheme.typography.titleMedium)
+                        if (lib.paused) Text("Paused", color = Warn)
                     }
                     Text(lib.folder, fontFamily = FontFamily.Monospace, fontSize = 12.sp)
                     if (lib.backupOnly) Text("Encrypted backup (unreadable here)")
                     if (lib.sync.isNotEmpty()) {
                         var open by remember(lib.id) { mutableStateOf(false) }
-                        val busy = lib.sync.any { it.busy() }
+                        val busy = !lib.paused && lib.sync.any { it.busy() && it.paused.isEmpty() }
                         val names = lib.syncingWith.joinToString(", ")
                         TextButton(onClick = { open = !open }) {
                             Text(
                                 when {
+                                    lib.paused -> "Paused (tap for details)"
                                     busy -> "Syncing now (tap for details)"
                                     lib.sync.none { it.online } -> "Syncing with $names (offline)"
                                     else -> "Up to date with $names"
@@ -353,6 +355,7 @@ private fun Libraries(model: Model, status: Status) {
                         if (!lib.backupOnly) {
                             OutlinedButton(onClick = { sharing = lib }, enabled = status.devices.isNotEmpty()) { Text("Share") }
                         }
+                        TextButton(onClick = { model.pauseLibrary(lib.id, !lib.paused) }) { Text(if (lib.paused) "Resume" else "Pause") }
                         TextButton(onClick = { model.showLog("Log: ${lib.name}", null, lib.name) }) { Text("Log") }
                         TextButton(onClick = { removing = lib }) { Text("Remove") }
                     }
@@ -510,6 +513,8 @@ private fun Devices(model: Model, status: Status) {
                     Spacer(Modifier.size(12.dp))
                     Column(Modifier.weight(1f)) {
                         Text(d.name, style = MaterialTheme.typography.titleMedium)
+                        if (d.paused) Text("Paused", color = Warn)
+                        else if (d.pausedThere) Text("Paused on that device", color = Warn)
                         if (d.nickname.isNotEmpty() && d.announced.isNotEmpty()) {
                             Text("calls itself “${d.announced}”", style = MaterialTheme.typography.bodySmall)
                         }
@@ -527,6 +532,7 @@ private fun Devices(model: Model, status: Status) {
                         }
                     }
                     Column(horizontalAlignment = Alignment.End) {
+                        TextButton(onClick = { model.pauseDevice(d.key, !d.paused) }) { Text(if (d.paused) "Resume" else "Pause") }
                         TextButton(onClick = { model.showLog("Log: ${d.name}", d.name, null) }) { Text("Log") }
                         TextButton(onClick = { renaming = d }) { Text("Rename") }
                         TextButton(onClick = { readdressing = d }) { Text("Change address") }
@@ -753,6 +759,8 @@ private fun fmtRate(perSecond: Long) = fmtBytes(perSecond) + "/s"
 private fun filesText(n: Long) = if (n == 1L) "1 file" else "$n files"
 
 private fun syncSummary(s: SyncInfo): String {
+    if (s.paused == "here") return "paused"
+    if (s.paused == "there") return "paused on ${s.device}"
     val parts = mutableListOf<String>()
     if (s.downFiles > 0 || s.downBytes > 0) parts.add("receiving ${filesText(s.downFiles)}, ${fmtBytes(s.downBytes)} left")
     if (s.upFiles > 0 || s.upBytes > 0) parts.add("sending ${filesText(s.upFiles)}, ${fmtBytes(s.upBytes)} left")

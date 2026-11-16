@@ -25,6 +25,9 @@ data class DeviceInfo(
     val announced: String = "",
     /** Our own nickname for it; empty if none. */
     val nickname: String = "",
+    /** We paused syncing with it / it paused syncing with us. */
+    val paused: Boolean = false,
+    val pausedThere: Boolean = false,
 )
 
 /** How a library is syncing with one device: what is still to be fetched, each way. */
@@ -36,6 +39,8 @@ data class SyncInfo(
     val downBytes: Long,
     val upFiles: Long,
     val upBytes: Long,
+    /** "" (not paused), "here" or "there". */
+    val paused: String = "",
 ) {
     fun busy() = downFiles > 0 || downBytes > 0 || upFiles > 0 || upBytes > 0
 }
@@ -51,6 +56,7 @@ data class LibraryInfo(
     val used: Long,
     val quota: Long,
     val sync: List<SyncInfo> = emptyList(),
+    val paused: Boolean = false,
 )
 
 data class OfferInfo(val id: String, val name: String, val fromKey: String, val fromName: String, val backup: Boolean, val again: Boolean)
@@ -109,6 +115,8 @@ private fun parseStatus(o: JSONObject): Status {
                 downRate = d.optLong("down_rate", 0L),
                 announced = d.optString("announced"),
                 nickname = d.optString("nickname"),
+                paused = d.optBoolean("paused"),
+                pausedThere = d.optBoolean("paused_there"),
             )
         },
         libraries = (0 until (libraries?.length() ?: 0)).map {
@@ -133,8 +141,10 @@ private fun parseStatus(o: JSONObject): Status {
                         downBytes = s.optLong("down_bytes"),
                         upFiles = s.optLong("up_files"),
                         upBytes = s.optLong("up_bytes"),
+                        paused = s.optString("paused"),
                     )
                 },
+                paused = l.optBoolean("paused"),
             )
         },
         offers = (0 until (offers?.length() ?: 0)).map {
@@ -207,6 +217,8 @@ object Req {
     fun accept(offer: String, from: String, folder: String, quota: Long) =
         obj("Accept", JSONObject().put("offer", offer).put("from", from).put("folder", folder).put("quota", quota))
     fun decline(offer: String, from: String) = obj("Decline", JSONObject().put("offer", offer).put("from", from))
+    fun pause(library: String, device: String, paused: Boolean) =
+        obj("Pause", JSONObject().put("library", library).put("device", device).put("paused", paused))
 }
 
 /** One conversation with the daemon: a request, then answers until Done or Error. */

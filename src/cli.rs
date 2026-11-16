@@ -297,7 +297,15 @@ fn print_status(config: &Path, s: &StatusInfo) {
         println!(
             "  {:<16} {}  {}{}{}{}",
             if d.nickname.is_empty() { d.name.clone() } else { format!("{} (\"{}\")", d.nickname, d.announced) },
-            if d.online { "online " } else { "offline" },
+            if d.paused {
+                "paused "
+            } else if d.paused_there {
+                "paused on its side"
+            } else if d.online {
+                "online "
+            } else {
+                "offline"
+            },
             &d.key[..8.min(d.key.len())],
             d.addr.as_ref().map(|a| format!("  {}", a)).unwrap_or_default(),
             if d.online || d.last_seen == 0 {
@@ -328,6 +336,9 @@ fn print_status(config: &Path, s: &StatusInfo) {
             format!("  {:<16} {}", l.name, l.folder)
         };
         line.push_str(&format!("\n  {:<16} id {}", "", &l.id[..8.min(l.id.len())]));
+        if l.paused {
+            line.push_str(&format!("\n  {:<16} paused (resume with:  rustsync -c {} resume {})", "", c, l.name));
+        }
         if l.backup_only {
             if !l.kept_for.is_empty() {
                 line.push_str(&format!("\n  {:<16} kept for: {}", "", l.kept_for.join(", ")));
@@ -996,6 +1007,7 @@ pub async fn run(config_path: &Path, cmd: Cmd) -> Result<()> {
     }
     let cfg = config::load(config_path)?;
     let ctl = Ctl { sock: cfg.socket_path(), config: config_path.to_path_buf() };
+    let cmd_is_pause = matches!(cmd, Cmd::Pause { .. });
 
     match cmd {
         Cmd::Start => start(config_path, &cfg).await,
@@ -1347,6 +1359,33 @@ pub async fn run(config_path: &Path, cmd: Cmd) -> Result<()> {
                 // not running: just save it
                 config::set_log_size(config_path, bytes)?;
                 println!("Saved. It takes effect the next time rustsync starts.");
+            }
+            Ok(())
+        }
+        Cmd::Pause { name, device } | Cmd::Resume { name, device } => {
+            let paused = cmd_is_pause;
+            let info = status(&ctl).await?;
+            if device {
+                if info.devices.is_empty() {
+                    bail!("no paired devices yet");
+                }
+                let labels: Vec<String> = info
+                    .devices
+                    .iter()
+                    .map(|d| format!("{}{}", d.name, if d.paused { "  (paused)" } else { "" }))
+                    .collect();
+                let devices = &info.devices;
+                let i = pick("device", &labels, name, |i, t| name_or_prefix(&devices[i].name, &devices[i].key, t))?;
+                call(&ctl, &Request::Pause { library: String::new(), device: devices[i].key.clone(), paused }).await?;
+            } else {
+                if info.libraries.is_empty() {
+                    bail!("there are no libraries on this machine yet");
+                }
+                let libs = &info.libraries;
+                let labels: Vec<String> =
+                    libs.iter().map(|l| format!("{}  ({}){}", l.name, l.folder, if l.paused { "  (paused)" } else { "" })).collect();
+                let i = pick("library", &labels, name, |i, t| name_or_prefix(&libs[i].name, &libs[i].id, t))?;
+                call(&ctl, &Request::Pause { library: libs[i].id.clone(), device: String::new(), paused }).await?;
             }
             Ok(())
         }

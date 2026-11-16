@@ -389,6 +389,9 @@ Pairing devices
                       Give a paired device a nickname that only this machine uses
   tailscale [on|off|status]
                       Optional: list the machines of your Tailscale/Headscale network (see below)
+  pause [NAME] [--device]
+                      Pause syncing a library, or (--device) everything with a device;
+                      the other side is told. `resume` takes the same arguments
   profile [NAME]      How hard this machine works: laptop, desktop, server or phone (see below)
   limit [--up SIZE] [--down SIZE]
                       Speed limits per second, e.g. --up 2MB; "none" removes one
@@ -579,8 +582,30 @@ So a storage server can be set to `server` and still treat the libraries on its 
 On Linux a new library on a spinning disk is marked as such by itself; check it if the folder is on
 a RAID, a USB enclosure or a network share, where that cannot be seen.
 
-**Speed limits** (Settings > Performance, or `rustsync limit --up 2MB --down none`) cap what this
+**Speed limits** (Settings > Speed limits, or `rustsync limit --up 2MB --down none`) cap what this
 machine sends and fetches per second, on any profile. They apply at once.
+
+**Pausing.** A library, or everything with one device, can be paused (the *Pause* button on the
+library or the device, or `rustsync pause`). While paused nothing of it is sent or received, and
+transfers that were running stop; changes made meanwhile on either side are exchanged when it is
+resumed. The other device is told, and shows "paused on <this device>". A pause stays until it is
+resumed, also across restarts.
+
+## Deleting files
+
+A deleted file is gone on every device, also when another device still had a copy. When a
+deletion reaches a device:
+
+- the file is deleted if it is the same as what was deleted (even if that device had lost track of
+  it, after being stopped half way through receiving, for example);
+- if the file there is **different** (it was changed there, and the change had not arrived yet), the
+  change wins: it is kept and comes back to the other devices, as a newer version;
+- a folder is removed once it is empty; anything else in it stays.
+
+A file a device finds for the first time counts as being as old as its change time, so a copy
+that only turned up again cannot undo a later deletion. On disks that cannot keep Unix permissions
+(Android's shared storage, FAT/exFAT drives, many network shares) permissions are neither applied
+nor compared, so what such a disk reports is never taken as a change.
 
 For special cases there is a `custom` profile that takes its numbers from the config file:
 

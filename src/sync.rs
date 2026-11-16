@@ -129,6 +129,8 @@ pub enum Msg {
     Resync,
     /// How much of a library I am still fetching from you (for showing on your screen).
     Progress { lib: String, files: u64, bytes: u64 },
+    /// I paused (or resumed) syncing a library with you; an empty `lib` means everything.
+    Paused { lib: String, paused: bool },
 }
 
 impl Msg {
@@ -278,6 +280,9 @@ pub struct Remote {
     files: Arc<Semaphore>,
     /// The download speed limit.
     down: Arc<Limiter>,
+    /// What is paused, and which device this connection is to.
+    pauses: Arc<Pauses>,
+    peer: String,
 }
 
 impl Remote {
@@ -341,7 +346,13 @@ impl Remote {
         hash: String,
         len: u64,
     ) -> Result<(Vec<u8>, Option<OwnedSemaphorePermit>)> {
+        if self.pauses.any(&lib, &self.peer) {
+            bail!("syncing is paused");
+        }
         let room = self.window.clone().acquire_many_owned(tuning::units(len, self.window_units)).await.ok();
+        if self.pauses.any(&lib, &self.peer) {
+            bail!("syncing is paused");
+        }
         self.down.take(len.min(MAX_CHUNK as u64) as usize).await;
         let lib_id = lib.clone();
         let data = if let Some(vault) = &self.vault {
@@ -425,6 +436,54 @@ fn read_piece(f: &std::fs::File, offset: u64, len: usize) -> std::io::Result<Vec
     }
     buf.truncate(n);
     Ok(buf)
+}
+
+// ---------------------------------------------------------------- pausing
+
+/// What is paused. Set here: whole libraries and whole devices (also kept in the state file).
+/// Set by the other side: (device, library), or (device, "") for everything with us; only in
+/// memory, a device says it again each time it connects.
+#[derive(Default)]
+pub struct Pauses {
+    libs: Mutex<HashSet<String>>,
+    devs: Mutex<HashSet<String>>,
+    theirs: Mutex<HashSet<(String, String)>>,
+}
+
+/// How many pauses one device may tell us about (one per library, and one for everything).
+const MAX_THEIR_PAUSES: usize = 4096;
+
+impl Pauses {
+    /// Paused on this machine?
+    pub fn here(&self, lib: &str, dev: &str) -> bool {
+        self.libs.lock().unwrap().contains(lib) || self.devs.lock().unwrap().contains(dev)
+    }
+
+    /// Paused by that device?
+    pub fn there(&self, lib: &str, dev: &str) -> bool {
+        let t = self.theirs.lock().unwrap();
+        t.contains(&(dev.to_string(), String::new())) || t.contains(&(dev.to_string(), lib.to_string()))
+    }
+
+    /// Is nothing of this library to go to or come from this device right now?
+    pub fn any(&self, lib: &str, dev: &str) -> bool {
+        self.here(lib, dev) || self.there(lib, dev)
+    }
+
+    fn set_theirs(&self, dev: &str, lib: &str, paused: bool) {
+        let mut t = self.theirs.lock().unwrap();
+        let key = (dev.to_string(), lib.to_string());
+        if !paused {
+            t.remove(&key);
+        } else if t.iter().filter(|(d, _)| d == dev).count() < MAX_THEIR_PAUSES {
+            t.insert(key);
+        }
+    }
+
+    /// A device (re)connects: what it paused before no longer counts until it says so again.
+    fn forget_theirs(&self, dev: &str) {
+        self.theirs.lock().unwrap().retain(|(d, _)| d != dev);
+    }
 }
 
 // ---------------------------------------------------------------- node
@@ -658,6 +717,8 @@ pub struct Node {
     profile: Mutex<(Profile, Tuning)>,
     /// Files being written at the same time, over all libraries (replaced when the profile changes).
     file_slots: Mutex<Arc<Semaphore>>,
+    /// What is paused, here and by other devices.
+    pauses: Arc<Pauses>,
     /// Speed limits for what is sent and what is fetched.
     up: Arc<Limiter>,
     down: Arc<Limiter>,
@@ -794,6 +855,9 @@ impl Node {
 
     /// The encrypted backup of this library, if we keep one for that device.
     fn depot_for(&self, dev: &str, lib: &str) -> Option<Arc<Depot>> {
+        if self.pauses.any(lib, dev) {
+            return None;
+        }
         let allowed = {
             let st = self.state.lock().unwrap();
             st.libraries
@@ -861,6 +925,9 @@ impl Node {
                 continue;
             }
             let Some(s) = sessions.get(&m.device) else { continue };
+            if self.pauses.any(lib, &m.device) {
+                continue; // sent when it is resumed
+            }
             match m.role {
                 Role::Peer => {
                     for batch in split_batches(entries) {
@@ -882,7 +949,7 @@ impl Node {
 
     /// Send the whole index of a library to one connected syncing device.
     fn push_index(&self, dev: &str, lib: &str) {
-        if !self.is_peer(lib, dev) {
+        if !self.is_peer(lib, dev) || self.pauses.any(lib, dev) {
             return;
         }
         let Some(rt) = self.lib_rt(lib) else { return };
@@ -1352,6 +1419,7 @@ impl Node {
             id: net::hex(&random_bytes(16)),
             name: wanted.clone(),
             storage: tuning::guess_storage(Path::new(&canon)),
+            paused: false,
             folder: canon,
             vault: net::hex(&random_bytes(32)),
             members: Vec::new(),
@@ -1585,6 +1653,7 @@ impl Node {
                 quota,
                 excluded: Vec::new(),
                 storage: Storage::default(),
+                paused: false,
             };
             self.start_backup(&lib, true)?;
             self.drop_other_offers(&lib.id, &offer.from);
@@ -1603,6 +1672,7 @@ impl Node {
             id: offer.id.clone(),
             name: self.unique_name(&offer.name),
             storage: tuning::guess_storage(Path::new(&canon)),
+            paused: false,
             folder: canon,
             vault: offer.vault.clone(),
             members: vec![Member { device: offer.from.clone(), role: Role::Peer, accepted: true }],
@@ -1662,6 +1732,7 @@ impl Node {
             id: id.to_string(),
             name: self.unique_name(&clean_name(name)),
             storage: tuning::guess_storage(Path::new(&canon)),
+            paused: false,
             folder: canon,
             vault: vault_hex.to_string(),
             members: vec![Member { device: device_key.to_string(), role: Role::Store, accepted: false }],
@@ -1831,6 +1902,8 @@ impl Node {
                 down_rate: traffic.get(&d.key).map(|t| t.rates().1).unwrap_or(0),
                 sent: traffic.get(&d.key).map(|t| t.totals().0).unwrap_or(0),
                 received: traffic.get(&d.key).map(|t| t.totals().1).unwrap_or(0),
+                paused: d.paused,
+                paused_there: self.pauses.there("", &d.key),
             })
             .collect();
         let names = |keys: &Vec<String>| -> Vec<String> { keys.iter().map(|k| st.device_name(k)).collect() };
@@ -1861,6 +1934,13 @@ impl Node {
                             down_bytes,
                             up_files,
                             up_bytes,
+                            paused: if self.pauses.here(&l.id, k) {
+                                "here".to_string()
+                            } else if self.pauses.there(&l.id, k) {
+                                "there".to_string()
+                            } else {
+                                String::new()
+                            },
                         }
                     })
                     .collect(),
@@ -1881,6 +1961,7 @@ impl Node {
                     })
                     .collect(),
                 storage: l.storage.word().to_string(),
+                paused: l.paused,
                 pending: l
                     .members
                     .iter()
@@ -2015,6 +2096,126 @@ impl Node {
             Storage::Hdd => format!("{} is on a hard disk: its files are written and read one after another.", name),
             Storage::Ssd => format!("{} is on an SSD: several of its files are written and read at once.", name),
         })
+    }
+
+    // ------------------------------------------------------------ pausing
+
+    /// Is the library shared with this device in any way?
+    fn shares(&self, lib: &str, dev: &str) -> bool {
+        let st = self.state.lock().unwrap();
+        st.libraries.iter().any(|l| l.id == lib && l.members.iter().any(|m| m.device == dev))
+    }
+
+    /// What we tell a device that connects about what we paused.
+    fn pause_msgs_for(&self, dev: &str) -> Vec<Msg> {
+        let st = self.state.lock().unwrap();
+        let mut out = Vec::new();
+        if st.devices.iter().any(|d| d.key == dev && d.paused) {
+            out.push(Msg::Paused { lib: String::new(), paused: true });
+        }
+        for l in st.libraries.iter().filter(|l| l.paused && l.members.iter().any(|m| m.device == dev)) {
+            out.push(Msg::Paused { lib: l.id.clone(), paused: true });
+        }
+        out
+    }
+
+    /// After a pause ends: exchange what changed meanwhile with that device.
+    fn catch_up(&self, dev: &str, lib: Option<&str>) {
+        for (id, _) in self.libs_with(dev, Role::Peer) {
+            if lib.is_none_or(|l| l == id) {
+                self.push_index(dev, &id);
+            }
+        }
+        if let Some(s) = self.sessions.lock().unwrap().get(dev) {
+            let _ = s.jobs.send(DepotJob::SyncAll);
+        }
+    }
+
+    /// A device paused or resumed syncing with us.
+    fn their_pause(&self, dev: &str, lib: &str, paused: bool, _jobs: &mpsc::UnboundedSender<DepotJob>) {
+        let was = if lib.is_empty() { self.pauses.there("", dev) } else { self.pauses.there(lib, dev) };
+        self.pauses.set_theirs(dev, lib, paused);
+        if was == paused {
+            return;
+        }
+        let what = if lib.is_empty() { "everything".to_string() } else { self.lib_label(lib) };
+        if paused {
+            info!(device = %self.dev_label(dev), "it paused syncing {} with this machine", what);
+        } else {
+            info!(device = %self.dev_label(dev), "it resumed syncing {} with this machine", what);
+            self.catch_up(dev, if lib.is_empty() { None } else { Some(lib) });
+        }
+    }
+
+    /// Pause or resume a library here (with every device it is shared with).
+    pub fn pause_library(&self, lib_id: &str, paused: bool) -> Result<String> {
+        let (name, members) = {
+            let mut st = self.state.lock().unwrap();
+            let Some(l) = st.libraries.iter_mut().find(|l| l.id == lib_id) else {
+                bail!("no such library here");
+            };
+            l.paused = paused;
+            (l.name.clone(), l.members.iter().map(|m| m.device.clone()).collect::<Vec<_>>())
+        };
+        self.save_state();
+        {
+            let mut libs = self.pauses.libs.lock().unwrap();
+            if paused {
+                libs.insert(lib_id.to_string());
+            } else {
+                libs.remove(lib_id);
+            }
+        }
+        {
+            let sessions = self.sessions.lock().unwrap();
+            for dev in &members {
+                if let Some(s) = sessions.get(dev) {
+                    s.push(Msg::Paused { lib: lib_id.to_string(), paused });
+                }
+            }
+        }
+        if paused {
+            info!(library = %name, "paused");
+            Ok(format!("{} is paused: nothing of it is sent or received until you resume it. The other devices are told.", name))
+        } else {
+            info!(library = %name, "resumed");
+            for dev in &members {
+                self.catch_up(dev, Some(lib_id));
+            }
+            Ok(format!("{} is syncing again.", name))
+        }
+    }
+
+    /// Pause or resume everything with a device.
+    pub fn pause_device(&self, key: &str, paused: bool) -> Result<String> {
+        let name = {
+            let mut st = self.state.lock().unwrap();
+            let Some(d) = st.devices.iter_mut().find(|d| d.key == key) else {
+                bail!("no such device");
+            };
+            d.paused = paused;
+            d.display_name().to_string()
+        };
+        self.save_state();
+        {
+            let mut devs = self.pauses.devs.lock().unwrap();
+            if paused {
+                devs.insert(key.to_string());
+            } else {
+                devs.remove(key);
+            }
+        }
+        if let Some(s) = self.sessions.lock().unwrap().get(key) {
+            s.push(Msg::Paused { lib: String::new(), paused });
+        }
+        if paused {
+            info!(device = %name, "paused");
+            Ok(format!("Syncing with {} is paused (it stays connected and is told).", name))
+        } else {
+            info!(device = %name, "resumed");
+            self.catch_up(key, None);
+            Ok(format!("Syncing with {} again.", name))
+        }
     }
 
     // ------------------------------------------------------------ tailscale (optional)
@@ -2373,6 +2574,7 @@ impl Node {
                 host: Some(host),
                 port: Some(port),
                 last_seen: activity::unix_now(),
+                paused: false,
             });
         }
         self.save_state();
@@ -2428,6 +2630,15 @@ impl Node {
             Request::SetProfile { profile } => out(self.set_profile(&profile)?),
             Request::SetLimits { upload, download } => out(self.set_limits(upload, download)?),
             Request::SetStorage { library, storage } => out(self.set_storage(&library, &storage)?),
+            Request::Pause { library, device, paused } => {
+                if !library.is_empty() {
+                    out(self.pause_library(&library, paused)?)
+                } else if !device.is_empty() {
+                    out(self.pause_device(&device, paused)?)
+                } else {
+                    bail!("say which library or device to pause")
+                }
+            }
             Request::SetName { name } => out(self.set_own_name(&name)?),
             Request::SetTailscale { enabled } => out(self.set_tailscale(enabled)?),
             Request::Tailnet => Ok(vec![Reply::Tailnet(self.tailnet_now().await?), Reply::Done]),
@@ -2530,6 +2741,9 @@ pub async fn run_daemon(cfg: Config, keys: Keys) -> Result<()> {
     let profile = cfg.performance.profile();
     let tuned = cfg.performance.tuning(profile);
     let (up_limit, down_limit) = cfg.performance.limits();
+    let pauses = Pauses::default();
+    pauses.libs.lock().unwrap().extend(state.libraries.iter().filter(|l| l.paused).map(|l| l.id.clone()));
+    pauses.devs.lock().unwrap().extend(state.devices.iter().filter(|d| d.paused).map(|d| d.key.clone()));
     let node = Arc::new(Node {
         name: Mutex::new(cfg.device_name()),
         cfg,
@@ -2553,6 +2767,7 @@ pub async fn run_daemon(cfg: Config, keys: Keys) -> Result<()> {
         listener_stop: Mutex::new(CancellationToken::new()),
         profile: Mutex::new((profile, tuned)),
         file_slots: Mutex::new(Arc::new(Semaphore::new(tuned.files))),
+        pauses: Arc::new(pauses),
         up: Arc::new(Limiter::new(up_limit)),
         down: Arc::new(Limiter::new(down_limit)),
         tailscale_on: AtomicBool::new(tailscale_on),
@@ -3174,6 +3389,7 @@ async fn pair_inviter(
             host: None,
             port: None,
             last_seen: activity::unix_now(),
+            paused: false,
         });
     }
     node.save_state();
@@ -3380,6 +3596,8 @@ async fn session_loop(
         window_units: tuned.window_units(),
         files: node.file_slots.lock().unwrap().clone(),
         down: node.down.clone(),
+        pauses: node.pauses.clone(),
+        peer: dev.key.clone(),
     };
 
     // Libraries we sync with this device: its index batches are applied one after another.
@@ -3396,13 +3614,16 @@ async fn session_loop(
         let traffic = traffic.clone();
         tokio::spawn(async move {
             while let Some((lib, entries, cost, files_left, bytes_left)) = apply_rx.recv().await {
-                if let Some(rt) = node.lib_rt(&lib) {
+                if node.pauses.any(&lib, &origin) {
+                    // Paused after it arrived: it is sent again when syncing is resumed.
+                } else if let Some(rt) = node.lib_rt(&lib) {
                     match apply::apply_entries(&rt.folder, &handle, entries).await {
                         Ok(applied) => {
                             if !applied.is_empty() {
                                 info!(device = %origin_name, library = %node.lib_label(&lib), "received {} change(s)", applied.len());
                             }
-                            node.broadcast(&lib, &applied, Some(origin.as_str()))
+                            node.broadcast(&lib, &applied.changes, Some(origin.as_str()));
+                            node.broadcast(&lib, &applied.kept, None);
                         }
                         Err(e) => warn!(device = %origin_name, library = %node.lib_label(&lib), "could not apply changes: {:#}", e),
                     }
@@ -3417,8 +3638,13 @@ async fn session_loop(
     // pulls (and decrypts). It does nothing when there are none.
     tokio::spawn(depot_worker(node.clone(), handle.clone(), dev.key.clone(), jobs_rx, cancel.clone()));
 
-    // Tell the other side which libraries we share/offer; send our index of the ones we sync.
+    // Tell the other side which libraries we share/offer, and what we paused; send our index of
+    // the ones we sync.
+    node.pauses.forget_theirs(&dev.key);
     let _ = tx.try_send(node.libraries_msg_for(&dev.key));
+    for m in node.pause_msgs_for(&dev.key) {
+        let _ = tx.try_send(m);
+    }
     for (id, _) in node.libs_with(&dev.key, Role::Peer) {
         node.push_index(&dev.key, &id);
     }
@@ -3484,6 +3710,11 @@ async fn session_loop(
                     Msg::Resync => {
                         let _ = tx.try_send(node.libraries_msg_for(&dev.key));
                     }
+                    Msg::Paused { lib, paused } => {
+                        if lib.len() <= 128 && (lib.is_empty() || node.shares(&lib, &dev.key)) {
+                            node.their_pause(&dev.key, &lib, paused, &jobs_tx);
+                        }
+                    }
                     Msg::Chunk { req, data } => {
                         let waiter = pending.lock().unwrap().remove(&req);
                         if let Some(w) = waiter {
@@ -3521,7 +3752,7 @@ async fn session_loop(
                         if entries.len() > MAX_RECV_ENTRIES || bytes.len() > MAX_INDEX_MSG {
                             break Err(anyhow!("oversized index message"));
                         }
-                        if node.is_peer(&lib, &dev.key) {
+                        if node.is_peer(&lib, &dev.key) && !node.pauses.any(&lib, &dev.key) {
                             let cost = bytes.len().max(256);
                             if queued.load(Ordering::Relaxed) + cost > MAX_QUEUED_APPLY {
                                 warn!(device = %dev.display_name(), "sending faster than we can apply; skipped an update (it is re-sent at the next full scan)");
@@ -3659,7 +3890,7 @@ async fn serve_chunk(
     budget: Arc<Semaphore>,
     budget_units: u32,
 ) -> Option<(Vec<u8>, OwnedSemaphorePermit)> {
-    if !node.is_peer(lib, from) {
+    if !node.is_peer(lib, from) || node.pauses.any(lib, from) {
         return None;
     }
     let rt = node.lib_rt(lib)?;
@@ -3725,6 +3956,9 @@ async fn depot_worker(
         match job {
             DepotJob::SyncAll => {
                 for (lib_id, rt) in node.libs_with(&depot_key, Role::Store) {
+                    if node.pauses.any(&lib_id, &depot_key) {
+                        continue;
+                    }
                     if let Err(e) = depot_pull(&node, &remote, &depot_key, &lib_id, &rt, &mut known).await {
                         warn!(device = %node.dev_label(&depot_key), library = %node.lib_label(&lib_id), "backup download failed: {:#}", e);
                         continue;
@@ -3748,7 +3982,7 @@ async fn depot_worker(
             DepotJob::Push(lib_id) => {
                 // Allow the next change to queue another job, then work from the current index.
                 node.depot_pending.lock().unwrap().remove(&(depot_key.clone(), lib_id.clone()));
-                if !node.is_store(&lib_id, &depot_key) {
+                if !node.is_store(&lib_id, &depot_key) || node.pauses.any(&lib_id, &depot_key) {
                     continue;
                 }
                 if let Some(rt) = node.lib_rt(&lib_id) {
@@ -3760,7 +3994,7 @@ async fn depot_worker(
                 }
             }
             DepotJob::Prune(lib_id) => {
-                if !node.is_store(&lib_id, &depot_key) {
+                if !node.is_store(&lib_id, &depot_key) || node.pauses.any(&lib_id, &depot_key) {
                     continue;
                 }
                 if let Some(rt) = node.lib_rt(&lib_id) {
@@ -3917,7 +4151,8 @@ async fn depot_pull(
     debug!("depot: {} new/changed record(s)", entries.len());
     let with_vault = remote.with_vault(rt.vault.clone());
     let applied = apply::apply_entries(&rt.folder, &with_vault, entries).await?;
-    node.broadcast(lib, &applied, Some(depot_key));
+    node.broadcast(lib, &applied.changes, Some(depot_key));
+    node.broadcast(lib, &applied.kept, None);
     Ok(())
 }
 
@@ -4001,6 +4236,34 @@ mod tests {
     use super::*;
 
     #[test]
+    fn pauses_here_and_there() {
+        let p = Pauses::default();
+        assert!(!p.any("lib", "dev"));
+        p.libs.lock().unwrap().insert("lib".into());
+        assert!(p.here("lib", "dev") && p.here("lib", "other") && !p.here("lib2", "dev"));
+        p.libs.lock().unwrap().clear();
+        p.devs.lock().unwrap().insert("dev".into());
+        assert!(p.here("lib", "dev") && p.here("lib2", "dev") && !p.here("lib", "other"));
+        p.devs.lock().unwrap().clear();
+        // the other side paused one library, then everything
+        p.set_theirs("dev", "lib", true);
+        assert!(p.there("lib", "dev") && !p.there("lib2", "dev") && !p.there("lib", "other"));
+        assert!(p.any("lib", "dev") && !p.here("lib", "dev"));
+        p.set_theirs("dev", "", true);
+        assert!(p.there("lib2", "dev"));
+        p.set_theirs("dev", "", false);
+        assert!(!p.there("lib2", "dev") && p.there("lib", "dev"));
+        // when it connects again it says it again; until then nothing counts
+        p.forget_theirs("dev");
+        assert!(!p.any("lib", "dev"));
+        // a device cannot make us remember without end
+        for i in 0..MAX_THEIR_PAUSES + 10 {
+            p.set_theirs("dev", &format!("l{}", i), true);
+        }
+        assert_eq!(p.theirs.lock().unwrap().len(), MAX_THEIR_PAUSES);
+    }
+
+    #[test]
     fn handshake_sources_are_grouped() {
         let a: IpAddr = "2001:db8:1:2:aaaa:bbbb:cccc:dddd".parse().unwrap();
         let b: IpAddr = "2001:db8:1:2:1:2:3:4".parse().unwrap();
@@ -4045,6 +4308,7 @@ mod tests {
             host: None,
             port: None,
             last_seen: 0,
+            paused: false,
         };
         assert_eq!(d.display_name(), "laptop");
         d.nickname = "Mum's laptop".to_string();

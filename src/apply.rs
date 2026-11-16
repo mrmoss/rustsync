@@ -6,8 +6,8 @@
 //! hash before an atomic rename.
 
 use crate::index::{
-    chunk_size, disk_matches, fd_inside, mtime_of, now_ns, open_nofollow, remote_wins, sanitize_remote, Entry, Folder,
-    Kind, TMP_PREFIX,
+    chunk_size, disk_matches, fd_inside, hash_file, mtime_of, now_ns, open_nofollow, remote_wins, sanitize_remote, Entry,
+    Folder, Kind, TMP_PREFIX,
 };
 use crate::sync::Remote;
 use anyhow::{anyhow, bail, Context, Result};
@@ -17,9 +17,9 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, UNIX_EPOCH};
+use std::time::{Duration, Instant, UNIX_EPOCH};
 use tokio::sync::OwnedSemaphorePermit;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -31,8 +31,26 @@ fn record(folder: &Folder, e: Entry) {
     folder.index.lock().unwrap().insert(e.path.clone(), e);
 }
 
-/// Returns the entries that were actually applied (so they can be forwarded to other peers).
-pub async fn apply_entries(folder: &Arc<Folder>, remote: &Remote, entries: Vec<Entry>) -> Result<Vec<Entry>> {
+/// What applying a batch did.
+#[derive(Default)]
+pub struct Applied {
+    /// Changes made here (forwarded to the other devices that sync the library).
+    pub changes: Vec<Entry>,
+    /// Files the other device deleted that are kept here because they are different: newer
+    /// versions that go to every device, the one that deleted them included.
+    pub kept: Vec<Entry>,
+}
+
+impl Applied {
+    pub fn is_empty(&self) -> bool {
+        self.changes.is_empty() && self.kept.is_empty()
+    }
+    pub fn len(&self) -> usize {
+        self.changes.len() + self.kept.len()
+    }
+}
+
+pub async fn apply_entries(folder: &Arc<Folder>, remote: &Remote, entries: Vec<Entry>) -> Result<Applied> {
     // Nothing from another device is trusted: every entry is validated first (path, sizes,
     // hashes, change time, permissions).
     let now = now_ns();
@@ -61,7 +79,7 @@ pub async fn apply_entries(folder: &Arc<Folder>, remote: &Remote, entries: Vec<E
         warn!("ignored {} invalid or out-of-range entries from another device", rejected);
     }
     if todo.is_empty() {
-        return Ok(Vec::new());
+        return Ok(Applied::default());
     }
 
     let mut deletes: Vec<Entry> = todo.iter().filter(|e| e.deleted).cloned().collect();
@@ -71,6 +89,7 @@ pub async fn apply_entries(folder: &Arc<Folder>, remote: &Remote, entries: Vec<E
     let files: Vec<Entry> = todo.iter().filter(|e| !e.deleted && e.kind == Kind::File).cloned().collect();
 
     let mut applied = Vec::new();
+    let mut kept = Vec::new();
 
     for e in deletes.into_iter().chain(dirs) {
         let res = {
@@ -79,8 +98,9 @@ pub async fn apply_entries(folder: &Arc<Folder>, remote: &Remote, entries: Vec<E
             tokio::task::spawn_blocking(move || apply_meta(&f, &e2)).await?
         };
         match res {
-            Ok(true) => applied.push(e),
-            Ok(false) => {}
+            Ok(Some(done)) if e.deleted && !done.deleted => kept.push(done),
+            Ok(Some(done)) => applied.push(done),
+            Ok(None) => {}
             Err(err) => warn!("{}: {:#}", e.path, err),
         }
     }
@@ -101,7 +121,15 @@ pub async fn apply_entries(folder: &Arc<Folder>, remote: &Remote, entries: Vec<E
         })
         .buffer_unordered(at_once);
     futures_util::pin_mut!(jobs);
+    // What was received is written down now and then, not only at the end: if the program is
+    // stopped half way through a large batch, it still knows which files it got.
+    let mut saved = Instant::now();
     while let Some((e, res)) = jobs.next().await {
+        if saved.elapsed() > Duration::from_secs(30) {
+            let f = folder.clone();
+            let _ = tokio::task::spawn_blocking(move || f.persist_now()).await;
+            saved = Instant::now();
+        }
         match res {
             Ok(true) => {
                 debug!("synced {}", e.path);
@@ -114,7 +142,7 @@ pub async fn apply_entries(folder: &Arc<Folder>, remote: &Remote, entries: Vec<E
 
     let f = folder.clone();
     let _ = tokio::task::spawn_blocking(move || f.persist_now()).await;
-    Ok(applied)
+    Ok(Applied { changes: applied, kept })
 }
 
 /// Refuse to write through a symlinked or non-directory ancestor.
@@ -138,30 +166,54 @@ fn check_ancestors(folder: &Folder, rel: &str) -> Result<()> {
     Ok(())
 }
 
-/// Deletions and directories. Caller holds fs_lock.
-fn apply_meta(folder: &Folder, e: &Entry) -> Result<bool> {
+/// Deletions and directories. Caller holds fs_lock. Returns what was recorded (None: nothing).
+fn apply_meta(folder: &Folder, e: &Entry) -> Result<Option<Entry>> {
     check_ancestors(folder, &e.path)?;
     let abs = folder.abs(&e.path);
     let local = folder.get(&e.path);
     if !remote_wins(local.as_ref(), e) {
-        return Ok(false);
+        return Ok(None);
     }
     let existing = fs::symlink_metadata(&abs).ok();
 
     if e.deleted {
         if let Some(md) = existing {
-            // Only delete what we have indexed and that is unchanged; never destroy unscanned local work.
-            let safe = matches!(&local, Some(l) if !l.deleted && disk_matches(&abs, l));
-            if !safe {
-                warn!("not deleting {}: it has local changes", e.path);
-                return Ok(false);
-            }
             if md.is_dir() {
+                // Only a directory we know of, and only once it is empty (anything still in it
+                // is not ours to remove).
+                if !matches!(&local, Some(l) if !l.deleted && disk_matches(&abs, l)) {
+                    warn!("not deleting {}: it has local changes", e.path);
+                    return Ok(None);
+                }
                 if let Err(err) = fs::remove_dir(&abs) {
                     warn!("cannot remove directory {}: {}", e.path, err);
-                    return Ok(false);
+                    return Ok(None);
                 }
             } else {
+                let indexed = matches!(&local, Some(l) if l.is_live_file() && disk_matches(&abs, l));
+                // Is what is here the same as what the other device deleted? (Older deletions
+                // do not say what was deleted: then it has to be what we indexed.)
+                let same = if e.hash.is_empty() {
+                    indexed
+                } else if indexed {
+                    local.as_ref().is_some_and(|l| l.hash == e.hash)
+                } else {
+                    md.is_file() && hash_file(&abs, &folder.root).is_ok_and(|(h, _, _)| h == e.hash)
+                };
+                if !same {
+                    if let (true, Some(l)) = (indexed, &local) {
+                        // A different version is here (changed here, or one the other device never
+                        // had): it is kept, and becomes the newest version so it reaches the other
+                        // devices again. A change wins over a deletion.
+                        let mut keep = l.clone();
+                        keep.stamp = now_ns().max(e.stamp.saturating_add(1));
+                        record(folder, keep.clone());
+                        info!("kept {}: it was deleted on another device, but the version here is different", e.path);
+                        return Ok(Some(keep));
+                    }
+                    warn!("not deleting {}: it has local changes", e.path);
+                    return Ok(None);
+                }
                 fs::remove_file(&abs)?;
             }
         }
@@ -172,17 +224,19 @@ fn apply_meta(folder: &Folder, e: &Entry) -> Result<bool> {
                 let safe = md.is_file() && matches!(&local, Some(l) if l.is_live_file() && disk_matches(&abs, l));
                 if !safe {
                     warn!("not replacing {} with a directory: it has local changes", e.path);
-                    return Ok(false);
+                    return Ok(None);
                 }
                 fs::remove_file(&abs)?;
                 fs::create_dir(&abs)?;
             }
             None => fs::create_dir_all(&abs)?,
         }
-        fs::set_permissions(&abs, fs::Permissions::from_mode(e.mode))?;
+        if folder.perms {
+            fs::set_permissions(&abs, fs::Permissions::from_mode(e.mode))?;
+        }
     }
     record(folder, e.clone());
-    Ok(true)
+    Ok(Some(e.clone()))
 }
 
 async fn apply_file(folder: &Arc<Folder>, remote: &Remote, e: &Entry) -> Result<bool> {
@@ -192,6 +246,16 @@ async fn apply_file(folder: &Arc<Folder>, remote: &Remote, e: &Entry) -> Result<
         return Ok(false);
     }
     check_ancestors(folder, &e.path)?;
+
+    // The same content is here already (only its version or change time differs): take over the
+    // version without copying the file.
+    if let Some(l) = &local {
+        if l.is_live_file() && l.hash == e.hash && l.chunks == e.chunks && disk_matches(&abs, l) {
+            let _guard = folder.fs_lock.lock().await;
+            let (f, e2, l2) = (folder.clone(), e.clone(), l.clone());
+            return tokio::task::spawn_blocking(move || adopt_same(&f, &e2, &l2)).await?;
+        }
+    }
 
     // Chunks we already have, if the local file is exactly what we indexed.
     let local_chunks: Vec<String> = match &local {
@@ -395,6 +459,34 @@ fn write_pieces(
     Ok(whole.finalize().to_hex().to_string())
 }
 
+/// The file here already has the content of `e`: give it `e`'s change time and permissions and
+/// record `e`. Caller holds fs_lock.
+fn adopt_same(folder: &Folder, e: &Entry, planned: &Entry) -> Result<bool> {
+    let abs = folder.abs(&e.path);
+    let now_local = folder.get(&e.path);
+    if now_local.as_ref().map(|l| l.key()) != Some(planned.key()) || !disk_matches(&abs, planned) {
+        return Ok(false); // something changed meanwhile; the next exchange tries again
+    }
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        let f = fs::OpenOptions::new().write(true).custom_flags(libc::O_NOFOLLOW).open(&abs)?;
+        use std::os::fd::AsRawFd;
+        if !fd_inside(f.as_raw_fd(), &folder.root) {
+            bail!("{} is outside the library folder", e.path);
+        }
+        f.set_modified(UNIX_EPOCH + Duration::from_nanos(e.mtime_ns))?;
+    }
+    if folder.perms {
+        fs::set_permissions(&abs, fs::Permissions::from_mode(e.mode))?;
+    }
+    let md = fs::symlink_metadata(&abs)?;
+    let mut rec = e.clone();
+    rec.mtime_ns = mtime_of(&md);
+    rec.size = md.len();
+    record(folder, rec);
+    Ok(true)
+}
+
 /// Atomically move the finished temp file into place. Caller holds fs_lock.
 fn commit_file(folder: &Folder, e: &Entry, tmp: &Path, planned: Option<&Entry>) -> Result<bool> {
     let abs = folder.abs(&e.path);
@@ -434,7 +526,9 @@ fn commit_file(folder: &Folder, e: &Entry, tmp: &Path, planned: Option<&Entry>) 
             .open(tmp)?
             .set_modified(t)?;
     }
-    fs::set_permissions(tmp, fs::Permissions::from_mode(e.mode))?;
+    if folder.perms {
+        fs::set_permissions(tmp, fs::Permissions::from_mode(e.mode))?;
+    }
     fs::rename(tmp, &abs)?;
 
     let md = fs::symlink_metadata(&abs)?;
@@ -443,4 +537,71 @@ fn commit_file(folder: &Folder, e: &Entry, tmp: &Path, planned: Option<&Entry>) 
     rec.size = md.len();
     record(folder, rec);
     Ok(true)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::index::scan;
+
+    fn folder(name: &str) -> (PathBuf, PathBuf, Folder) {
+        let dir = std::env::temp_dir().join(format!("rustsync-apply-{}-{}", name, std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let data = dir.join("data");
+        fs::create_dir_all(&data).unwrap();
+        fs::write(data.join("f"), b"version one").unwrap();
+        let f = Folder::open(name.into(), data.to_str().unwrap(), &dir.join("state"), 0).unwrap();
+        scan(&f, &[String::new()], false);
+        (dir, data, f)
+    }
+
+    fn deletion(f: &Folder, hash: &str) -> Entry {
+        let mut e = f.get("f").unwrap();
+        e.deleted = true;
+        e.size = 0;
+        e.mtime_ns = 0;
+        e.chunks.clear();
+        e.hash = hash.to_string();
+        e.stamp += 1_000;
+        e
+    }
+
+    #[test]
+    fn a_deletion_removes_the_same_file() {
+        let (dir, data, f) = folder("same");
+        let hash = f.get("f").unwrap().hash;
+        let done = apply_meta(&f, &deletion(&f, &hash)).unwrap().unwrap();
+        assert!(done.deleted && !data.join("f").exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_deletion_removes_the_same_file_even_if_the_index_is_behind() {
+        let (dir, data, f) = folder("behind");
+        let hash = f.get("f").unwrap().hash;
+        // same content, but the change time no longer matches what was indexed
+        let t = fs::File::options().write(true).open(data.join("f")).unwrap();
+        t.set_modified(UNIX_EPOCH + Duration::from_secs(1_000_000)).unwrap();
+        drop(t);
+        assert!(apply_meta(&f, &deletion(&f, &hash)).unwrap().is_some());
+        assert!(!data.join("f").exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_different_version_wins_over_a_deletion() {
+        let (dir, data, f) = folder("differs");
+        let gone = deletion(&f, &"0".repeat(64));
+        let kept = apply_meta(&f, &gone).unwrap().unwrap();
+        assert!(!kept.deleted && kept.stamp > gone.stamp);
+        assert!(data.join("f").exists());
+        assert_eq!(f.get("f").unwrap().stamp, kept.stamp);
+        // an unindexed change is left alone (the next scan picks it up)
+        fs::write(data.join("f"), b"changed here").unwrap();
+        let mut again = gone.clone();
+        again.stamp = kept.stamp + 1;
+        assert!(apply_meta(&f, &again).unwrap().is_none());
+        assert!(data.join("f").exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
 }

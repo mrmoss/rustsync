@@ -224,6 +224,13 @@ sequenceDiagram
   whose number of pieces does not fit that rule is refused, so another device cannot choose piece
   sizes. What a device asks for at a time is bounded by its own profile (see the README), never by
   what the other side would like to send.
+- Pausing (a library, or a device) is decided by each side for itself: a device that paused sends
+  nothing of it and accepts nothing of it, whatever the other side does. What another device says
+  it paused only stops us from sending and asking; at most 4096 such notes are kept per device, and
+  only in memory.
+- A deletion says what was deleted (the hash of the file). A device deletes its copy only if it is
+  that content, or what it indexed and has not changed; a different version is kept and becomes a
+  newer version. So a deletion cannot remove work that never reached the deleting device.
 - Files that are being fetched are kept open on the sending side for a few seconds (at most 8 per
   connection). They were opened with the same checks as always (no symlink, inside the library
   folder), every piece read from them is still checked against the index's hash before it is sent,

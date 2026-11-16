@@ -37,6 +37,8 @@ val AccentSoft = Color(0xFF34221A)
 val Good = Color(0xFF52C98C)
 val GoodSoft = Color(0xFF193228)
 val Muted = Color(0xFF9696A2)
+/** The desktop window's amber: something is paused or needs a look. */
+val Warn = Color(0xFFF0B650)
 
 private val Dark = darkColorScheme(
     primary = Accent,

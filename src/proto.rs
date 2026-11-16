@@ -29,6 +29,14 @@ pub enum Request {
     SetLimits { upload: u64, download: u64 },
     /// Say what a library's folder is stored on here: ssd or hdd.
     SetStorage { library: String, storage: String },
+    /// Pause or resume syncing a library (by id) or everything with a device (by key): give one.
+    Pause {
+        #[serde(default)]
+        library: String,
+        #[serde(default)]
+        device: String,
+        paused: bool,
+    },
     /// The newest lines of the activity log, about a device and/or a library (both empty: all).
     Log { device: Option<String>, library: Option<String>, lines: usize },
     /// How much the logs may grow (bytes; also written to the config file).
@@ -208,6 +216,12 @@ pub struct DeviceInfo {
     pub sent: u64,
     #[serde(default)]
     pub received: u64,
+    /// We paused syncing with it.
+    #[serde(default)]
+    pub paused: bool,
+    /// It paused syncing with us (everything).
+    #[serde(default)]
+    pub paused_there: bool,
 }
 
 /// "1.2 MB/s"
@@ -238,11 +252,19 @@ pub struct SyncInfo {
     /// Still to be fetched by that device from us, as it tells us.
     pub up_files: u64,
     pub up_bytes: u64,
+    /// "" (not paused), "here" (paused on this machine) or "there" (paused on that device).
+    #[serde(default)]
+    pub paused: String,
 }
 
 impl SyncInfo {
     /// One line: "up to date", "receiving 3 files, 120 MB left; sending 1 file, 4 MB left", "offline".
     pub fn summary(&self) -> String {
+        match self.paused.as_str() {
+            "here" => return "paused".to_string(),
+            "there" => return "paused on that device".to_string(),
+            _ => {}
+        }
         let mut parts = Vec::new();
         if self.down_files > 0 || self.down_bytes > 0 {
             parts.push(format!("receiving {}, {} left", files_text(self.down_files), fmt_size(self.down_bytes)));
@@ -284,6 +306,9 @@ pub struct LibraryInfo {
     /// What the folder is stored on here: "ssd" or "hdd".
     #[serde(default)]
     pub storage: String,
+    /// Syncing it is paused here.
+    #[serde(default)]
+    pub paused: bool,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]

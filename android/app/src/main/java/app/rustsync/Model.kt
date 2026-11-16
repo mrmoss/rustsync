@@ -199,6 +199,8 @@ class Model(app: Application) : AndroidViewModel(app) {
     fun setAddress(device: String, addr: String) = run(Req.setAddress(device, addr))
     fun setName(name: String) = run(Req.setName(name))
     fun rename(device: String, nickname: String) = run(Req.rename(device, nickname))
+    fun pauseLibrary(id: String, paused: Boolean) = run(Req.pause(id, "", paused))
+    fun pauseDevice(key: String, paused: Boolean) = run(Req.pause("", key, paused))
     fun createLibrary(name: String, folder: String) = run(Req.create(name, folder))
     fun removeLibrary(id: String) = run(Req.removeLibrary(id))
     fun share(library: String, device: String, backup: Boolean) = run(Req.share(library, device, backup))

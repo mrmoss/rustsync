@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::Read;
-use std::os::unix::fs::MetadataExt;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
@@ -94,6 +94,14 @@ pub fn now_ns() -> u64 {
         .unwrap_or(0)
 }
 
+/// The version of something a scan finds for the first time: its change time on disk (never
+/// later than now). A file this machine only lost track of (it was received, but the index was
+/// not saved before the program was stopped, for example) is then older than whatever happened to
+/// it elsewhere since, such as being deleted, instead of looking like a brand-new change.
+fn first_stamp(mtime_ns: u64) -> u64 {
+    mtime_ns.clamp(1, now_ns().max(1))
+}
+
 fn next_stamp(old: Option<&Entry>) -> u64 {
     let now = now_ns();
     match old {
@@ -144,7 +152,10 @@ pub fn sanitize_remote(mut e: Entry, now: u64, max_skew: u64) -> Result<Entry, &
         return Err("change time too far in the future (check the clocks)");
     }
     if e.deleted {
-        if e.size != 0 || !e.chunks.is_empty() || !e.hash.is_empty() {
+        // A deleted file may carry the hash of what was deleted (so a copy that is still the same
+        // can be recognised); nothing else.
+        let bad_hash = !e.hash.is_empty() && (e.kind == Kind::Dir || !is_hex64(&e.hash));
+        if e.size != 0 || !e.chunks.is_empty() || bad_hash {
             return Err("malformed deletion");
         }
     } else {
@@ -263,6 +274,27 @@ pub struct Folder {
     pub files_at_once: AtomicUsize,
     /// How many files are read and hashed at the same time when scanning (1 on a hard disk).
     pub hash_threads: AtomicUsize,
+    /// Can files here keep their permission bits? Not on Android's shared storage, FAT/exFAT
+    /// drives and many network shares. There permissions are neither applied nor compared, so a
+    /// permission the disk cannot hold never looks like a change of the file.
+    pub perms: bool,
+}
+
+/// Try whether permission bits set on a file in `root` stay as they were set.
+fn holds_permissions(root: &Path) -> bool {
+    use std::os::unix::fs::OpenOptionsExt;
+    let probe = root.join(format!("{}perm-{}", TMP_PREFIX, std::process::id()));
+    let _ = fs::remove_file(&probe);
+    let made = fs::OpenOptions::new().write(true).create_new(true).mode(0o600).custom_flags(libc::O_NOFOLLOW).open(&probe);
+    if made.is_err() {
+        return true; // nothing can be written here anyway
+    }
+    let ok = [0o600u32, 0o640, 0o604].iter().all(|&m| {
+        fs::set_permissions(&probe, fs::Permissions::from_mode(m)).is_ok()
+            && fs::symlink_metadata(&probe).map(|md| md.mode() & 0o777 == m).unwrap_or(false)
+    });
+    let _ = fs::remove_file(&probe);
+    ok
 }
 
 impl Folder {
@@ -288,6 +320,7 @@ impl Folder {
                 Err(e) => warn!("ignoring unreadable state file {}: {}", state_path.display(), e),
             }
         }
+        let perms = holds_permissions(&root);
         Ok(Folder {
             id,
             root,
@@ -297,6 +330,7 @@ impl Folder {
             fs_lock: tokio::sync::Mutex::new(()),
             files_at_once: AtomicUsize::new(2),
             hash_threads: AtomicUsize::new(1),
+            perms,
         })
     }
 
@@ -444,7 +478,7 @@ pub fn scan(folder: &Folder, roots: &[String], deep: bool) -> Vec<Entry> {
                     mode: item.mode,
                     size,
                     mtime_ns: item.mtime,
-                    stamp: next_stamp(prev),
+                    stamp: if prev.is_none() { first_stamp(item.mtime) } else { next_stamp(prev) },
                     hash,
                     chunks,
                 };
@@ -465,7 +499,8 @@ pub fn scan(folder: &Folder, roots: &[String], deep: bool) -> Vec<Entry> {
                 size: 0,
                 mtime_ns: 0,
                 stamp: next_stamp(Some(o)),
-                hash: String::new(),
+                // What was deleted: another device deletes its copy only if it is the same.
+                hash: if o.kind == Kind::File { o.hash.clone() } else { String::new() },
                 chunks: Vec::new(),
             };
             updates.push(t.clone());
@@ -544,8 +579,17 @@ fn walk(
         debug!("skipping symlink {}", rel);
         return;
     }
-    let mode = md.mode() & 0o777;
     let prev = old.get(rel);
+    let kind = if md.is_dir() { Kind::Dir } else { Kind::File };
+    // Where the disk cannot keep permissions, they are whatever the last version said (or the
+    // usual ones for something new): what the disk reports is not a change.
+    let mode = if folder.perms {
+        md.mode() & 0o777
+    } else {
+        prev.filter(|o| !o.deleted && o.kind == kind)
+            .map(|o| o.mode)
+            .unwrap_or(if kind == Kind::Dir { 0o755 } else { 0o644 })
+    };
 
     if md.is_dir() {
         if !rel.is_empty() {
@@ -559,7 +603,7 @@ fn walk(
                     mode,
                     size: 0,
                     mtime_ns: 0,
-                    stamp: next_stamp(prev),
+                    stamp: if prev.is_none() { first_stamp(mtime_of(&md)) } else { next_stamp(prev) },
                     hash: String::new(),
                     chunks: Vec::new(),
                 };
@@ -612,6 +656,7 @@ fn walk(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
 
     #[test]
     fn hashes_must_be_lowercase_hex() {
@@ -749,6 +794,81 @@ mod tests {
         assert_eq!(one.len(), 21);
         assert_eq!(one, hashes(4, "four"));
         assert_eq!(one.iter().find(|e| e.0 == "sub/big").unwrap().2, 3);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    fn test_folder(name: &str) -> (PathBuf, PathBuf, PathBuf) {
+        let dir = std::env::temp_dir().join(format!("rustsync-{}-{}", name, std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let (data, state) = (dir.join("data"), dir.join("state"));
+        fs::create_dir_all(&data).unwrap();
+        (dir, data, state)
+    }
+
+    #[test]
+    fn deletions_say_what_was_deleted() {
+        let (dir, data, state) = test_folder("tomb");
+        fs::write(data.join("a"), b"hello").unwrap();
+        fs::create_dir_all(data.join("d")).unwrap();
+        let folder = Folder::open("tomb".into(), data.to_str().unwrap(), &state, 0).unwrap();
+        let first = scan(&folder, &[String::new()], false);
+        let hash = first.iter().find(|e| e.path == "a").unwrap().hash.clone();
+        fs::remove_file(data.join("a")).unwrap();
+        fs::remove_dir(data.join("d")).unwrap();
+        let gone = scan(&folder, &[String::new()], false);
+        let a = gone.iter().find(|e| e.path == "a").unwrap();
+        assert!(a.deleted && a.hash == hash);
+        let d = gone.iter().find(|e| e.path == "d").unwrap();
+        assert!(d.deleted && d.hash.is_empty());
+        // and such deletions are accepted from other devices
+        let now = now_ns();
+        assert!(sanitize_remote(a.clone(), now, 0).is_ok());
+        let mut bad = d.clone();
+        bad.hash = hash.clone();
+        assert!(sanitize_remote(bad, now, 0).is_err());
+        let mut bad = a.clone();
+        bad.hash = "X".repeat(64);
+        assert!(sanitize_remote(bad, now, 0).is_err());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_file_found_for_the_first_time_is_as_old_as_its_change_time() {
+        let (dir, data, state) = test_folder("first");
+        let old = SystemTime::now() - Duration::from_secs(3600 * 24 * 30);
+        let f = fs::File::create(data.join("old")).unwrap();
+        f.set_modified(old).unwrap();
+        drop(f);
+        fs::write(data.join("new"), b"x").unwrap();
+        let folder = Folder::open("first".into(), data.to_str().unwrap(), &state, 0).unwrap();
+        let found = scan(&folder, &[String::new()], false);
+        let o = found.iter().find(|e| e.path == "old").unwrap();
+        assert_eq!(o.stamp, o.mtime_ns);
+        assert!(o.stamp < now_ns() - 1_000_000_000 * 3600);
+        // a later change of a known file is a new version, newer than anything before
+        fs::write(data.join("old"), b"changed").unwrap();
+        let changed = scan(&folder, &[String::new()], false);
+        let o2 = changed.iter().find(|e| e.path == "old").unwrap();
+        assert!(o2.stamp > o.stamp && o2.stamp >= now_ns() - 60 * 1_000_000_000);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn permissions_the_disk_cannot_keep_are_not_changes() {
+        let (dir, data, state) = test_folder("perms");
+        fs::write(data.join("f"), b"x").unwrap();
+        fs::set_permissions(data.join("f"), fs::Permissions::from_mode(0o644)).unwrap();
+        let mut folder = Folder::open("perms".into(), data.to_str().unwrap(), &state, 0).unwrap();
+        assert!(folder.perms, "a normal temp folder keeps permissions");
+        scan(&folder, &[String::new()], false);
+        fs::set_permissions(data.join("f"), fs::Permissions::from_mode(0o660)).unwrap();
+        folder.perms = false;
+        assert!(scan(&folder, &[String::new()], false).is_empty());
+        assert!(scan(&folder, &[String::new()], true).is_empty());
+        folder.perms = true;
+        let changed = scan(&folder, &[String::new()], false);
+        assert_eq!(changed.len(), 1);
+        assert_eq!(changed[0].mode, 0o660);
         let _ = fs::remove_dir_all(&dir);
     }
 
