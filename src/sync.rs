@@ -53,7 +53,13 @@ const AUTO_PRUNE_EVERY: Duration = Duration::from_secs(3600);
 const MAX_BACKUP_HINTS: usize = 64; // new backup locations learned from one device at once
 const OUT_QUEUE: usize = 256; // messages waiting to be sent to one device
 const FRAME_QUEUE: usize = 64; // received frames waiting to be processed
-const MAX_QUEUED_APPLY: usize = 64 * 1024 * 1024; // bytes of index updates waiting to be applied
+/// Memory for what one device says it has of one library (see `LibRuntime::remote`).
+const MAX_REMOTE_INDEX: usize = 512 * 1024 * 1024;
+/// After a device announced something, wait this long for the rest of it before acting (a
+/// rename, say, is a deletion and a new file, which may come in separate messages).
+const PULL_SETTLE: Duration = Duration::from_millis(400);
+/// A file that failed is tried again after this long (longer after repeated failures).
+const PULL_RETRY: Duration = Duration::from_secs(20);
 // Data being read for one device, or waiting to be sent to it: requests beyond this wait.
 const SERVE_BUDGET: u64 = 64 * 1024 * 1024;
 const MAX_SERVE_WAITING: usize = 2048; // requests from one device that may wait for their turn
@@ -675,6 +681,112 @@ pub struct LibRuntime {
     pub folder: Arc<Folder>,
     pub vault: Arc<Vault>,
     cancel: CancellationToken,
+    /// What every device that syncs this library with us says it has: device -> its index.
+    /// Syncing works from this, not from the order in which messages arrive: what we need is
+    /// whatever version of a path is newer than ours, whoever has it (see `pull_pass`).
+    remote: Mutex<HashMap<String, RemoteIndex>>,
+    /// Something changed (a device announced something, a file arrived, a local change): look
+    /// again at what is needed.
+    kick: tokio::sync::Notify,
+    /// Files being fetched now: path -> (version, stop it).
+    running: Mutex<HashMap<String, Running>>,
+    /// Recent failures: path -> (version, how many times, not again before).
+    failed: Mutex<HashMap<String, (u64, u32, Instant)>>,
+    /// New files whose content is already here under another name: path -> (version, first
+    /// seen). They wait a moment, because the deletion of the old name may still come (a rename
+    /// that the other device reported in two steps); then the file is moved, not copied.
+    maybe_moved: Mutex<HashMap<String, (u64, Instant)>>,
+    /// A look again is already planned for later.
+    kick_planned: AtomicBool,
+}
+
+/// A file being fetched.
+struct Running {
+    stamp: u64,
+    stop: Arc<AtomicBool>,
+    /// The device it is fetched from.
+    from: String,
+}
+
+/// One device's index of a library, as it told us.
+#[derive(Default)]
+struct RemoteIndex {
+    entries: HashMap<String, Entry>,
+    /// Roughly the memory it takes.
+    cost: usize,
+}
+
+impl LibRuntime {
+    fn new(folder: Arc<Folder>, vault: Arc<Vault>) -> LibRuntime {
+        LibRuntime {
+            folder,
+            vault,
+            cancel: CancellationToken::new(),
+            remote: Mutex::new(HashMap::new()),
+            kick: tokio::sync::Notify::new(),
+            running: Mutex::new(HashMap::new()),
+            failed: Mutex::new(HashMap::new()),
+            maybe_moved: Mutex::new(HashMap::new()),
+            kick_planned: AtomicBool::new(false),
+        }
+    }
+
+    /// Look again in a while (once, however often this is asked).
+    fn kick_later(self: &Arc<Self>, after: Duration) {
+        if self.kick_planned.swap(true, Ordering::Relaxed) {
+            return;
+        }
+        let rt = self.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(after).await;
+            rt.kick_planned.store(false, Ordering::Relaxed);
+            rt.kick.notify_one();
+        });
+    }
+
+    /// A device told us about some of its files: remember it (nothing is done yet).
+    fn note_remote(&self, dev: &str, who: &str, entries: Vec<Entry>) {
+        let now = index::now_ns();
+        let ign = self.folder.ignores();
+        let (mut rejected, mut full) = (0usize, false);
+        {
+            let mut remote = self.remote.lock().unwrap();
+            let ri = remote.entry(dev.to_string()).or_default();
+            for e in entries {
+                let e = match index::sanitize_remote(e, now, self.folder.max_skew_ns) {
+                    Ok(e) => e,
+                    Err(why) => {
+                        debug!("ignoring an entry: {}", why);
+                        rejected += 1;
+                        continue;
+                    }
+                };
+                if ign.is_ignored(&e.path, e.kind == index::Kind::Dir) {
+                    continue;
+                }
+                let old = ri.entries.get(&e.path).map(entry_cost).unwrap_or(0);
+                let cost = ri.cost.saturating_sub(old) + entry_cost(&e);
+                if cost > MAX_REMOTE_INDEX {
+                    full = true;
+                    continue;
+                }
+                ri.cost = cost;
+                ri.entries.insert(e.path.clone(), e);
+            }
+        }
+        if rejected > 0 {
+            warn!(device = %who, "ignored {} invalid or out-of-range entries", rejected);
+        }
+        if full {
+            warn!(device = %who, "this library is too large to keep track of everything that device has; some of it is not synced");
+        }
+        self.kick.notify_one();
+    }
+
+    /// Does this device already have exactly this version?
+    fn remote_has(&self, dev: &str, e: &Entry) -> bool {
+        self.remote.lock().unwrap().get(dev).and_then(|ri| ri.entries.get(&e.path)).is_some_and(|r| r.key() == e.key())
+    }
 }
 
 struct Invite {
@@ -700,6 +812,8 @@ pub struct Node {
     state: Mutex<State>,
     libs: Mutex<HashMap<String, Arc<LibRuntime>>>,
     sessions: Mutex<HashMap<String, SessionHandle>>,
+    /// How to ask each connected device for data (one per connection).
+    remotes: Mutex<HashMap<String, Remote>>,
     /// What went to and came from each device (by device key).
     traffic: Mutex<HashMap<String, Arc<Traffic>>>,
     invites: Mutex<Vec<Invite>>,
@@ -842,6 +956,14 @@ impl Node {
             .unwrap_or(false)
     }
 
+    /// A device (re)connects: what it told us before no longer counts; it sends its index again.
+    fn forget_remote(&self, dev: &str) {
+        let libs: Vec<Arc<LibRuntime>> = self.libs.lock().unwrap().values().cloned().collect();
+        for rt in libs {
+            rt.remote.lock().unwrap().remove(dev);
+        }
+    }
+
     fn lib_rt(&self, id: &str) -> Option<Arc<LibRuntime>> {
         self.libs.lock().unwrap().get(id).cloned()
     }
@@ -935,7 +1057,12 @@ impl Node {
             }
             match m.role {
                 Role::Peer => {
-                    for batch in split_batches(entries) {
+                    // Not what the device has already (what it sent us, for one).
+                    let todo: Vec<Entry> = match self.lib_rt(lib) {
+                        Some(rt) => entries.iter().filter(|e| !rt.remote_has(&m.device, e)).cloned().collect(),
+                        None => entries.to_vec(),
+                    };
+                    for batch in split_batches(&todo) {
                         s.push(Msg::Index { lib: lib.to_string(), entries: batch });
                     }
                 }
@@ -1336,9 +1463,10 @@ impl Node {
         let (files, threads) = self.profile.lock().unwrap().1.for_library(lib.storage);
         folder.files_at_once.store(files, Ordering::Relaxed);
         folder.hash_threads.store(threads, Ordering::Relaxed);
+        folder.me.store(index::device_id(&self.keys.public), Ordering::Relaxed);
         index::clean_tmp(&folder.root);
         let vault = Arc::new(Vault::new(&net::parse_hex32(&lib.vault, "the library's vault key")?));
-        let rt = Arc::new(LibRuntime { folder: folder.clone(), vault, cancel: CancellationToken::new() });
+        let rt = Arc::new(LibRuntime::new(folder.clone(), vault));
 
         // Pick up everything that changed while we were not running.
         let f2 = folder.clone();
@@ -1349,6 +1477,7 @@ impl Node {
         let deep_every = self.cfg.sync_options.deep_scan_every;
         tokio::spawn(watch_loop(self.clone(), rt.clone(), rx, watcher));
         tokio::spawn(periodic_loop(self.clone(), rt.clone(), every, deep_every));
+        tokio::spawn(pull_loop(self.clone(), rt.clone()));
         self.libs.lock().unwrap().insert(lib.id.clone(), rt);
         info!(library = %lib.name, "syncing folder {}", folder.root.display());
         Ok(())
@@ -2184,9 +2313,10 @@ impl Node {
 
     /// After a pause ends: exchange what changed meanwhile with that device.
     fn catch_up(&self, dev: &str, lib: Option<&str>) {
-        for (id, _) in self.libs_with(dev, Role::Peer) {
+        for (id, rt) in self.libs_with(dev, Role::Peer) {
             if lib.is_none_or(|l| l == id) {
                 self.push_index(dev, &id);
+                rt.kick.notify_one();
             }
         }
         if let Some(s) = self.sessions.lock().unwrap().get(dev) {
@@ -2817,6 +2947,7 @@ pub async fn run_daemon(cfg: Config, keys: Keys) -> Result<()> {
         state: Mutex::new(state),
         libs: Mutex::new(HashMap::new()),
         sessions: Mutex::new(HashMap::new()),
+        remotes: Mutex::new(HashMap::new()),
         traffic: Mutex::new(HashMap::new()),
         invites: Mutex::new(Vec::new()),
         dialers: Mutex::new(HashSet::new()),
@@ -3149,6 +3280,321 @@ async fn scan_and_broadcast(node: &Arc<Node>, rt: &Arc<LibRuntime>, roots: Vec<S
     if !changed.is_empty() {
         debug!("library {}: {} local change(s)", short(&folder.id), changed.len());
         node.broadcast(&folder.id, &changed, None);
+        rt.kick.notify_one();
+    }
+}
+
+// ---------------------------------------------------------------- pulling
+
+/// Each library's puller. It brings this machine to the newest version of every path that a
+/// device syncing the library has, whatever order the messages came in: devices only say what
+/// they have (their index), and this decides what to do and does it, in an order that works:
+/// folders, then renames and moves (done on the disk here, nothing is fetched), then deletions,
+/// then the files that have to be fetched.
+async fn pull_loop(node: Arc<Node>, rt: Arc<LibRuntime>) {
+    let mut every = tokio::time::interval(Duration::from_secs(10));
+    loop {
+        tokio::select! {
+            _ = rt.cancel.cancelled() => break,
+            _ = rt.kick.notified() => {}
+            _ = every.tick() => {}
+        }
+        // Let the rest of what is being announced arrive first.
+        tokio::time::sleep(PULL_SETTLE).await;
+        pull_pass(&node, &rt).await;
+    }
+    for (_, r) in rt.running.lock().unwrap().drain() {
+        r.stop.store(true, Ordering::Relaxed);
+    }
+}
+
+/// Something a device has that is newer than what we have.
+struct Need {
+    entry: Entry,
+    /// Connected devices that have exactly this version.
+    sources: Vec<String>,
+}
+
+fn path_depth(p: &str) -> usize {
+    p.matches('/').count()
+}
+
+fn note_failure(rt: &LibRuntime, path: &str, stamp: u64) {
+    let mut failed = rt.failed.lock().unwrap();
+    if failed.len() > 100_000 {
+        failed.clear();
+    }
+    let count = match failed.get(path) {
+        Some((s, n, _)) if *s == stamp => n + 1,
+        _ => 1,
+    };
+    failed.insert(path.to_string(), (stamp, count, Instant::now() + PULL_RETRY * count.min(15)));
+}
+
+async fn pull_pass(node: &Arc<Node>, rt: &Arc<LibRuntime>) {
+    let folder = rt.folder.clone();
+    let lib = folder.id.clone();
+    let ign = folder.ignores();
+    let known: Vec<String> = rt.remote.lock().unwrap().keys().cloned().collect();
+    // Whose word counts: devices that sync this library with us, and nothing paused.
+    let counted: HashSet<String> = known.iter().filter(|d| node.is_peer(&lib, d) && !node.pauses.any(&lib, d)).cloned().collect();
+    let connected: HashSet<String> = node.remotes.lock().unwrap().keys().cloned().collect();
+
+    // 1. The newest version of every path that is newer than ours, and who has exactly it.
+    let need: Vec<Need> = {
+        let local = folder.index.lock().unwrap();
+        let remote = rt.remote.lock().unwrap();
+        let mut best: HashMap<&str, (&Entry, Vec<&str>)> = HashMap::new();
+        for (dev, ri) in remote.iter() {
+            if !counted.contains(dev) {
+                continue;
+            }
+            for (path, e) in &ri.entries {
+                if !index::remote_wins(local.get(path), e) || ign.is_ignored(path, e.kind == index::Kind::Dir) {
+                    continue;
+                }
+                match best.get_mut(path.as_str()) {
+                    None => {
+                        best.insert(path.as_str(), (e, vec![dev.as_str()]));
+                    }
+                    Some((b, who)) => {
+                        if e.key() == b.key() {
+                            who.push(dev.as_str());
+                        } else if index::remote_wins(Some(*b), e) {
+                            *b = e;
+                            who.clear();
+                            who.push(dev.as_str());
+                        }
+                    }
+                }
+            }
+        }
+        best.into_values()
+            .map(|(e, who)| Need {
+                entry: e.clone(),
+                sources: who.into_iter().filter(|d| connected.contains(*d)).map(str::to_string).collect(),
+            })
+            .collect()
+    };
+
+    // 2. Downloads of something that is no longer wanted (deleted, or a newer version) stop.
+    {
+        let wanted: HashMap<&str, u64> =
+            need.iter().filter(|n| n.entry.is_live_file()).map(|n| (n.entry.path.as_str(), n.entry.stamp)).collect();
+        for (path, r) in rt.running.lock().unwrap().iter() {
+            if wanted.get(path.as_str()) != Some(&r.stamp) {
+                r.stop.store(true, Ordering::Relaxed);
+            }
+        }
+    }
+
+    // What is left to fetch, for the progress shown: (path, version, size, first device that has it).
+    let left: Vec<(String, u64, u64, Option<String>)> = need
+        .iter()
+        .filter(|n| n.entry.is_live_file())
+        .map(|n| (n.entry.path.clone(), n.entry.stamp, n.entry.size, n.sources.first().cloned()))
+        .collect();
+
+    // 3. Sort it out (what failed a moment ago waits a little).
+    let now = Instant::now();
+    let (mut dirs, mut files, mut dels) = (Vec::new(), Vec::new(), Vec::new());
+    {
+        let failed = rt.failed.lock().unwrap();
+        for n in need {
+            if failed.get(&n.entry.path).is_some_and(|(s, _, until)| *s == n.entry.stamp && *until > now) {
+                continue;
+            }
+            if n.entry.deleted {
+                dels.push(n);
+            } else if n.entry.kind == index::Kind::Dir {
+                dirs.push(n);
+            } else {
+                files.push(n);
+            }
+        }
+    }
+    let mut changes: Vec<Entry> = Vec::new();
+
+    // 4. Folders, shallowest first.
+    dirs.sort_by_key(|n| path_depth(&n.entry.path));
+    for n in dirs {
+        let _guard = folder.fs_lock.lock().await;
+        let (f, e) = (folder.clone(), n.entry.clone());
+        match tokio::task::spawn_blocking(move || apply::apply_meta(&f, &e)).await {
+            Ok(Ok(Some(done))) => changes.push(done),
+            Ok(Ok(None)) => note_failure(rt, &n.entry.path, n.entry.stamp), // refused (local changes): try later
+            Ok(Err(err)) => {
+                warn!(library = %node.lib_label(&lib), "{}: {:#}", n.entry.path, err);
+                note_failure(rt, &n.entry.path, n.entry.stamp);
+            }
+            Err(_) => {}
+        }
+    }
+
+    // 5. Renames and moves: a path being deleted holds the content of a path being created.
+    let mut movable: HashMap<String, Vec<(Entry, Entry)>> = HashMap::new();
+    {
+        let local = folder.index.lock().unwrap();
+        for d in &dels {
+            if let Some(l) = local.get(&d.entry.path) {
+                if l.is_live_file() && l.size > 0 && (d.entry.hash.is_empty() || d.entry.hash == l.hash) {
+                    movable.entry(l.hash.clone()).or_default().push((l.clone(), d.entry.clone()));
+                }
+            }
+        }
+    }
+    let mut moved: HashSet<String> = HashSet::new();
+    let mut to_fetch: Vec<Need> = Vec::new();
+    for n in files {
+        let pick = movable
+            .get_mut(&n.entry.hash)
+            .and_then(|v| v.iter().position(|(l, _)| l.size == n.entry.size).map(|i| v.swap_remove(i)));
+        if let Some((from, gone)) = pick {
+            let _guard = folder.fs_lock.lock().await;
+            let (f, a, b, c) = (folder.clone(), from.clone(), gone.clone(), n.entry.clone());
+            match tokio::task::spawn_blocking(move || apply::move_local(&f, &a, &b, &c)).await {
+                Ok(Ok(true)) => {
+                    debug!("{} moved to {}", from.path, n.entry.path);
+                    moved.insert(from.path.clone());
+                    // what was recorded (its version has seen ours too)
+                    changes.extend(folder.get(&n.entry.path));
+                    changes.extend(folder.get(&gone.path));
+                    continue;
+                }
+                Ok(Err(err)) => warn!(library = %node.lib_label(&lib), "moving {} to {}: {:#}", from.path, n.entry.path, err),
+                _ => {}
+            }
+        }
+        to_fetch.push(n);
+    }
+
+    // 6. Deletions, deepest first.
+    dels.retain(|n| !moved.contains(&n.entry.path));
+    dels.sort_by_key(|n| std::cmp::Reverse(path_depth(&n.entry.path)));
+    for n in dels {
+        let _guard = folder.fs_lock.lock().await;
+        let (f, e) = (folder.clone(), n.entry.clone());
+        match tokio::task::spawn_blocking(move || apply::apply_meta(&f, &e)).await {
+            // (a version that differs from what was deleted is kept, and comes back as newer)
+            Ok(Ok(Some(done))) => changes.push(done),
+            Ok(Ok(None)) => note_failure(rt, &n.entry.path, n.entry.stamp), // refused (local changes): try later
+            Ok(Err(err)) => {
+                warn!(library = %node.lib_label(&lib), "{}: {:#}", n.entry.path, err);
+                note_failure(rt, &n.entry.path, n.entry.stamp);
+            }
+            Err(_) => {}
+        }
+    }
+
+    // 7. Files to fetch: a few at a time (each one that finishes starts the next).
+    let limit = folder.files_at_once.load(Ordering::Relaxed).clamp(1, 16) * 2;
+    let local_copies: HashMap<String, String> = {
+        let wanted: HashSet<&str> = to_fetch.iter().filter(|n| n.entry.size > 0).map(|n| n.entry.hash.as_str()).collect();
+        let local = folder.index.lock().unwrap();
+        local
+            .values()
+            .filter(|l| l.is_live_file() && l.size > 0 && wanted.contains(l.hash.as_str()))
+            .map(|l| (l.hash.clone(), l.path.clone()))
+            .collect()
+    };
+    // How long a new file whose content is already here waits for a deletion that makes it a move.
+    const MOVE_WAIT: Duration = Duration::from_secs(5);
+    {
+        let mut mm = rt.maybe_moved.lock().unwrap();
+        let candidates: HashMap<&str, u64> = to_fetch
+            .iter()
+            .filter(|n| local_copies.get(&n.entry.hash).is_some_and(|p| *p != n.entry.path))
+            .map(|n| (n.entry.path.as_str(), n.entry.stamp))
+            .collect();
+        mm.retain(|p, v| candidates.get(p.as_str()) == Some(&v.0));
+        for (p, s) in candidates {
+            mm.entry(p.to_string()).or_insert((s, now));
+        }
+    }
+    for n in to_fetch {
+        let local_copy = local_copies.get(&n.entry.hash).filter(|p| **p != n.entry.path).cloned();
+        if local_copy.is_some() {
+            let waited = rt.maybe_moved.lock().unwrap().get(&n.entry.path).map(|(_, t)| now.duration_since(*t)).unwrap_or_default();
+            if waited < MOVE_WAIT {
+                rt.kick_later(MOVE_WAIT - waited + Duration::from_millis(100));
+                continue;
+            }
+        }
+        let tries = {
+            let running = rt.running.lock().unwrap();
+            if running.len() >= limit {
+                break;
+            }
+            if running.contains_key(&n.entry.path) {
+                continue;
+            }
+            rt.failed.lock().unwrap().get(&n.entry.path).filter(|(s, _, _)| *s == n.entry.stamp).map(|(_, c, _)| *c as usize).unwrap_or(0)
+        };
+        if n.sources.is_empty() {
+            continue; // no device that has it is connected right now
+        }
+        let dev = n.sources[tries % n.sources.len()].clone();
+        let Some(remote) = node.remotes.lock().unwrap().get(&dev).cloned() else { continue };
+        let stop = Arc::new(AtomicBool::new(false));
+        let (path, stamp) = (n.entry.path.clone(), n.entry.stamp);
+        rt.running.lock().unwrap().insert(path.clone(), Running { stamp, stop: stop.clone(), from: dev.clone() });
+        let (node, rt, lib, entry) = (node.clone(), rt.clone(), lib.clone(), n.entry);
+        tokio::spawn(async move {
+            let res = apply::fetch_file(&rt.folder, &remote, &entry, local_copy, stop.clone()).await;
+            {
+                let mut running = rt.running.lock().unwrap();
+                if running.get(&path).is_some_and(|r| r.stamp == stamp) {
+                    running.remove(&path);
+                }
+            }
+            node.traffic_for(&dev).file_done(&lib, &path, stamp);
+            match res {
+                Ok(true) => {
+                    rt.failed.lock().unwrap().remove(&path);
+                    debug!("synced {}", path);
+                    // what was recorded (its version has seen ours too)
+                    if let Some(rec) = rt.folder.get(&path) {
+                        node.broadcast(&lib, std::slice::from_ref(&rec), None);
+                    }
+                }
+                Ok(false) => {
+                    if !stop.load(Ordering::Relaxed) {
+                        note_failure(&rt, &path, stamp); // refused (changed here meanwhile): try later
+                    }
+                }
+                Err(err) => {
+                    if !stop.load(Ordering::Relaxed) {
+                        warn!(device = %node.dev_label(&dev), library = %node.lib_label(&lib), "{}: {:#}", path, err);
+                        note_failure(&rt, &path, stamp);
+                    }
+                }
+            }
+            // the next file, or anything that changed meanwhile
+            rt.kick.notify_one();
+        });
+    }
+
+    // 8. What changed here goes to the devices that do not have it yet.
+    if !changes.is_empty() {
+        info!(library = %node.lib_label(&lib), "applied {} change(s) from other devices", changes.len());
+        let f = folder.clone();
+        let _ = tokio::task::spawn_blocking(move || f.persist_now()).await;
+        node.broadcast(&lib, &changes, None);
+    }
+
+    // 9. Progress: what is left, per device it is (or will be) fetched from.
+    let mut per_dev: HashMap<String, Vec<(String, u64, u64)>> = HashMap::new();
+    {
+        let running = rt.running.lock().unwrap();
+        for (path, stamp, size, first) in left {
+            let from = running.get(&path).filter(|r| r.stamp == stamp).map(|r| r.from.clone()).or(first);
+            if let Some(d) = from {
+                per_dev.entry(d).or_default().push((path, stamp, size.min(1 << 50)));
+            }
+        }
+    }
+    for d in known.iter().chain(connected.iter()).collect::<HashSet<_>>() {
+        node.traffic_for(d).set_todo(&lib, per_dev.remove(d.as_str()).unwrap_or_default());
     }
 }
 
@@ -3177,6 +3623,7 @@ async fn watch_loop(
     mut rx: mpsc::Receiver<PathBuf>,
     _watcher: RecommendedWatcher, // kept alive for as long as this task runs
 ) {
+    let mut last_follow_up: Option<Instant> = None;
     loop {
         let first = tokio::select! {
             _ = rt.cancel.cancelled() => return,
@@ -3207,7 +3654,17 @@ async fn watch_loop(
         if roots.is_empty() {
             continue;
         }
+        // Something new appeared: that may be the new name of something renamed or moved, whose
+        // old name some systems (Android's shared storage, for one) do not report. A full scan
+        // right after finds the old name gone, so the other devices hear of both together and
+        // move the file instead of copying it.
+        let new_name = roots.iter().any(|r| !matches!(rt.folder.get(r), Some(e) if !e.deleted));
         scan_and_broadcast(&node, &rt, roots, false).await;
+        if new_name && last_follow_up.is_none_or(|t| t.elapsed() > Duration::from_secs(5)) {
+            last_follow_up = Some(Instant::now());
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            scan_and_broadcast(&node, &rt, vec![String::new()], false).await;
+        }
     }
 }
 
@@ -3664,49 +4121,10 @@ async fn session_loop(
         peer: dev.key.clone(),
     };
 
-    // Libraries we sync with this device: its index batches are applied one after another.
-    // `queued` counts the bytes waiting; beyond the budget new batches are skipped (and the whole
-    // index is asked for again later), so a flood cannot grow our memory without limit.
-    let queued = Arc::new(AtomicUsize::new(0));
-    let wants = Arc::new(IndexWants { tx: tx.clone(), last: Mutex::new(HashMap::new()) });
-    // With each batch goes the list of its files that were counted as "left" (path, version), so
-    // that whatever is still counted when the batch is done is taken off.
-    let (apply_tx, mut apply_rx) = mpsc::unbounded_channel::<(String, Vec<Entry>, usize, Vec<(String, u64)>)>();
-    {
-        let node = node.clone();
-        let origin = dev.key.clone();
-        let origin_name = dev.display_name().to_string();
-        let handle = handle.clone();
-        let queued = queued.clone();
-        let traffic = traffic.clone();
-        let wants = wants.clone();
-        tokio::spawn(async move {
-            while let Some((lib, entries, cost, counted)) = apply_rx.recv().await {
-                apply_batch(&node, &handle, &origin, &origin_name, &lib, entries, &wants).await;
-                for (path, stamp) in counted {
-                    traffic.file_done(&lib, &path, stamp);
-                }
-                queued.fetch_sub(cost, Ordering::Relaxed);
-            }
-        });
-    }
-    // Deletions do not wait behind files that are still being fetched: they are quick, and a
-    // file that is deleted meanwhile stops being fetched (see apply).
-    let (gone_tx, mut gone_rx) = mpsc::unbounded_channel::<(String, Vec<Entry>, usize)>();
-    {
-        let node = node.clone();
-        let origin = dev.key.clone();
-        let origin_name = dev.display_name().to_string();
-        let handle = handle.clone();
-        let queued = queued.clone();
-        let wants = wants.clone();
-        tokio::spawn(async move {
-            while let Some((lib, entries, cost)) = gone_rx.recv().await {
-                apply_batch(&node, &handle, &origin, &origin_name, &lib, entries, &wants).await;
-                queued.fetch_sub(cost, Ordering::Relaxed);
-            }
-        });
-    }
+    // What this device has is learnt from its index (it sends the whole index now, then its
+    // changes); syncing is done by each library's puller, from that.
+    node.forget_remote(&dev.key);
+    node.remotes.lock().unwrap().insert(dev.key.clone(), handle.clone());
 
     // Libraries this device keeps an encrypted backup of: one worker uploads (encrypted) and
     // pulls (and decrypts). It does nothing when there are none.
@@ -3839,51 +4257,9 @@ async fn session_loop(
                         if entries.len() > MAX_RECV_ENTRIES || bytes.len() > MAX_INDEX_MSG {
                             break Err(anyhow!("oversized index message"));
                         }
-                        if node.is_peer(&lib, &dev.key) && !node.pauses.any(&lib, &dev.key) {
-                            let cost = bytes.len().max(256);
-                            if queued.load(Ordering::Relaxed) + cost > MAX_QUEUED_APPLY {
-                                warn!(device = %dev.display_name(), "sending faster than we can apply; skipped an update (it is asked for again in a while)");
-                                wants.ask(&lib, Duration::from_secs(60));
-                            } else {
-                                // What of this we do not have yet is counted as "left" (for the
-                                // progress shown), file by file: a file announced again before it
-                                // arrived is not counted twice, and one that is deleted or
-                                // replaced meanwhile leaves the count at once, whatever else is
-                                // still waiting.
-                                let mut counted: Vec<(String, u64)> = Vec::new();
-                                if let Some(rt) = node.lib_rt(&lib) {
-                                    let idx = rt.folder.index.lock().unwrap();
-                                    for e in entries.iter() {
-                                        if e.deleted {
-                                            traffic.superseded(&lib, &e.path, e.stamp);
-                                        } else if e.is_live_file()
-                                            && index::remote_wins(idx.get(&e.path), e)
-                                            && traffic.queue_file(&lib, &e.path, e.stamp, e.size.min(1 << 50))
-                                        {
-                                            counted.push((e.path.clone(), e.stamp));
-                                        }
-                                    }
-                                }
-                                let total = entries.len().max(1);
-                                let (gone, entries): (Vec<Entry>, Vec<Entry>) = entries.into_iter().partition(|e| e.deleted);
-                                if !gone.is_empty() {
-                                    let c = (cost * gone.len() / total).max(1);
-                                    queued.fetch_add(c, Ordering::Relaxed);
-                                    if gone_tx.send((lib.clone(), gone, c)).is_err() {
-                                        queued.fetch_sub(c, Ordering::Relaxed);
-                                    }
-                                }
-                                if !entries.is_empty() {
-                                    let c = (cost * entries.len() / total).max(1);
-                                    queued.fetch_add(c, Ordering::Relaxed);
-                                    if let Err(back) = apply_tx.send((lib, entries, c, counted)) {
-                                        queued.fetch_sub(c, Ordering::Relaxed);
-                                        let (lib, _, _, counted) = back.0;
-                                        for (path, stamp) in counted {
-                                            traffic.file_done(&lib, &path, stamp);
-                                        }
-                                    }
-                                }
+                        if node.is_peer(&lib, &dev.key) {
+                            if let Some(rt) = node.lib_rt(&lib) {
+                                rt.note_remote(&dev.key, dev.display_name(), entries);
                             }
                         }
                     }
@@ -3964,69 +4340,17 @@ async fn session_loop(
     writer.abort();
     // Fail any fetches still waiting on this session (apply tasks clean up their temp files).
     pending.lock().unwrap().clear();
-    drop(apply_tx);
+    {
+        let mut remotes = node.remotes.lock().unwrap();
+        if remotes.get(&dev.key).is_some_and(|r| Arc::ptr_eq(&r.pending, &pending)) {
+            remotes.remove(&dev.key);
+        }
+    }
+    // Other devices may have what was being fetched from this one.
+    for rt in node.libs.lock().unwrap().values() {
+        rt.kick.notify_one();
+    }
     res
-}
-
-/// Asks a device for its whole index again (later, and not more than once at a time).
-struct IndexWants {
-    tx: mpsc::Sender<Msg>,
-    /// library -> when it was asked for (or is going to be)
-    last: Mutex<HashMap<String, Instant>>,
-}
-
-impl IndexWants {
-    fn ask(&self, lib: &str, after: Duration) {
-        {
-            let mut last = self.last.lock().unwrap();
-            let now = Instant::now();
-            if last.get(lib).is_some_and(|t| now.duration_since(*t) < after + Duration::from_secs(30)) {
-                return;
-            }
-            if last.len() > 4096 {
-                last.clear();
-            }
-            last.insert(lib.to_string(), now + after);
-        }
-        let (tx, lib) = (self.tx.clone(), lib.to_string());
-        tokio::spawn(async move {
-            tokio::time::sleep(after).await;
-            let _ = tx.send(Msg::WantIndex { lib }).await;
-        });
-    }
-}
-
-/// Apply one batch of changes a device sent, and pass on what changed here.
-async fn apply_batch(
-    node: &Arc<Node>,
-    handle: &Remote,
-    origin: &str,
-    origin_name: &str,
-    lib: &str,
-    entries: Vec<Entry>,
-    wants: &IndexWants,
-) {
-    if node.pauses.any(lib, origin) {
-        return; // paused after it arrived: it is sent again when syncing is resumed
-    }
-    let Some(rt) = node.lib_rt(lib) else { return };
-    match apply::apply_entries(&rt.folder, handle, entries).await {
-        Ok(applied) => {
-            if !applied.is_empty() {
-                info!(device = %origin_name, library = %node.lib_label(lib), "received {} change(s)", applied.len());
-            }
-            node.broadcast(lib, &applied.changes, Some(origin));
-            node.broadcast(lib, &applied.kept, None);
-            if applied.failed > 0 {
-                // Tried again with a fresh copy of its index in a while.
-                wants.ask(lib, Duration::from_secs(60));
-            }
-        }
-        Err(e) => {
-            warn!(device = %origin_name, library = %node.lib_label(lib), "could not apply changes: {:#}", e);
-            wants.ask(lib, Duration::from_secs(60));
-        }
-    }
 }
 
 /// One piece of a local file (for uploading it to an encrypted backup). `size` is the size the

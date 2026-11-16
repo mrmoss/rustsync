@@ -1,8 +1,12 @@
 //! Per-folder index: what we believe every path looks like, plus scanning the disk.
 //!
-//! Conflict rule: every entry carries a `stamp` (wall-clock nanoseconds of the change).
-//! The entry with the higher (stamp, hash) wins; deletions are tombstones that compete
-//! the same way, so a deleted file is not resurrected by a stale peer.
+//! Versions: every entry carries a version vector (`Version`): for each device that changed the
+//! path, a counter of its changes. One version is newer than another if it has seen everything
+//! the other has seen and more; if each has seen something the other has not, the two changes
+//! were made independently (a conflict), and a fixed rule picks the same winner on every device
+//! (see `remote_wins`). Deletions are entries too (tombstones), so a deleted file is not brought
+//! back by a device that only had an old copy. The `stamp` (the wall-clock time of the change) is
+//! only used to pick a winner between independent changes, never to decide what is newer.
 
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
@@ -11,7 +15,7 @@ use std::fs;
 use std::io::Read;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use crate::ignore::{Ignore, IGNORE_FILE, MAX_FILE_LEN};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -66,6 +70,143 @@ pub enum Kind {
     Dir,
 }
 
+/// A version vector: for each device (by its short id, see `device_id`), a counter that grows
+/// with every change it makes. Sorted by device; device 0 stands for every change made before
+/// versions were kept this way (its counter is the old time stamp).
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq, Eq, Hash)]
+pub struct Version(pub Vec<(u64, u64)>);
+
+/// How two versions relate.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Order {
+    Equal,
+    /// It has seen everything the other has, and more.
+    Newer,
+    Older,
+    /// Each has seen a change the other has not: they were made independently.
+    Concurrent,
+}
+
+/// Most devices a version may name.
+pub const MAX_VERSION_DEVICES: usize = 64;
+
+/// The short id of a device in versions: the first 8 bytes of its public key (never 0, which
+/// stands for changes made before versions were kept).
+pub fn device_id(public_key: &[u8]) -> u64 {
+    let mut b = [0u8; 8];
+    for (i, x) in public_key.iter().take(8).enumerate() {
+        b[i] = *x;
+    }
+    u64::from_be_bytes(b).max(1)
+}
+
+impl Version {
+    /// A version for something recorded before versions were kept: the old time stamp, under
+    /// device 0. Every device converts the same way, so what was in sync stays in sync.
+    pub fn legacy(stamp: u64) -> Version {
+        Version(vec![(0, stamp.max(1))])
+    }
+
+    pub fn get(&self, dev: u64) -> u64 {
+        match self.0.binary_search_by_key(&dev, |x| x.0) {
+            Ok(i) => self.0[i].1,
+            Err(_) => 0,
+        }
+    }
+
+    /// This version and one more change, made by `me`. The counter is at least the time in
+    /// seconds, so it keeps growing even if this machine forgot what it was.
+    pub fn bump(&self, me: u64) -> Version {
+        let now = now_ns() / 1_000_000_000;
+        let mut v = self.0.clone();
+        match v.binary_search_by_key(&me, |x| x.0) {
+            Ok(i) => v[i].1 = v[i].1.saturating_add(1).max(now),
+            Err(i) => v.insert(i, (me, now.max(1))),
+        }
+        Version(v)
+    }
+
+    /// The version that has seen everything both have seen.
+    pub fn merge(&self, other: &Version) -> Version {
+        let mut out: Vec<(u64, u64)> = Vec::with_capacity(self.0.len().max(other.0.len()));
+        let (mut i, mut j) = (0, 0);
+        while i < self.0.len() || j < other.0.len() {
+            match (self.0.get(i), other.0.get(j)) {
+                (Some(a), Some(b)) if a.0 == b.0 => {
+                    out.push((a.0, a.1.max(b.1)));
+                    i += 1;
+                    j += 1;
+                }
+                (Some(a), Some(b)) if a.0 < b.0 => {
+                    out.push(*a);
+                    i += 1;
+                }
+                (Some(_), Some(b)) => {
+                    out.push(*b);
+                    j += 1;
+                }
+                (Some(a), None) => {
+                    out.push(*a);
+                    i += 1;
+                }
+                (None, Some(b)) => {
+                    out.push(*b);
+                    j += 1;
+                }
+                (None, None) => break,
+            }
+        }
+        Version(out)
+    }
+
+    pub fn compare(&self, other: &Version) -> Order {
+        let (mut newer, mut older) = (false, false);
+        let (mut i, mut j) = (0, 0);
+        while i < self.0.len() || j < other.0.len() {
+            let (a, b) = match (self.0.get(i), other.0.get(j)) {
+                (Some(x), Some(y)) if x.0 == y.0 => {
+                    i += 1;
+                    j += 1;
+                    (x.1, y.1)
+                }
+                (Some(x), Some(y)) if x.0 < y.0 => {
+                    i += 1;
+                    (x.1, 0)
+                }
+                (Some(_), Some(y)) => {
+                    j += 1;
+                    (0, y.1)
+                }
+                (Some(x), None) => {
+                    i += 1;
+                    (x.1, 0)
+                }
+                (None, Some(y)) => {
+                    j += 1;
+                    (0, y.1)
+                }
+                (None, None) => break,
+            };
+            newer |= a > b;
+            older |= a < b;
+        }
+        match (newer, older) {
+            (false, false) => Order::Equal,
+            (true, false) => Order::Newer,
+            (false, true) => Order::Older,
+            (true, true) => Order::Concurrent,
+        }
+    }
+
+    /// Well formed: devices in order, each once, counters above 0, not too many.
+    pub fn valid(&self) -> bool {
+        !self.0.is_empty()
+            && self.0.len() <= MAX_VERSION_DEVICES
+            && self.0.windows(2).all(|w| w[0].0 < w[1].0)
+            && self.0.iter().all(|(_, c)| *c > 0)
+    }
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct Entry {
     /// Path relative to the folder root, '/' separated.
@@ -76,8 +217,15 @@ pub struct Entry {
     pub size: u64,
     /// Local observation cache: size + mtime unchanged means "don't re-hash".
     pub mtime_ns: u64,
-    /// Logical change time used for conflict resolution.
+    /// Wall-clock time of the change (ns). Only used to pick a winner between changes made
+    /// independently (see `remote_wins`), and to name conflict copies.
     pub stamp: u64,
+    /// Which changes this version has seen.
+    #[serde(default)]
+    pub version: Version,
+    /// The device that made this change (its short id).
+    #[serde(default)]
+    pub by: u64,
     /// blake3 of the whole file (hex).
     pub hash: String,
     /// blake3 of each piece (hex); see `chunk_size`.
@@ -85,19 +233,93 @@ pub struct Entry {
 }
 
 impl Entry {
-    pub fn key(&self) -> (u64, &str) {
-        (self.stamp, self.hash.as_str())
+    /// What tells two versions of a path apart.
+    pub fn key(&self) -> (&Version, &str) {
+        (&self.version, self.hash.as_str())
     }
     pub fn is_live_file(&self) -> bool {
         !self.deleted && self.kind == Kind::File
     }
 }
 
+/// Should `remote` replace what we have (`local`)? Yes if it is newer. For two changes made
+/// independently every device picks the same winner:
+/// - the same content (or both deleted): not really a conflict; the other side's version is
+///   taken too (it is merged with ours when recorded, so both end up with a version that has
+///   seen both);
+/// - a deletion against a change: the change wins, unless it is exactly what was deleted;
+/// - otherwise the later change wins (then the device that made it, then the content). The
+///   loser is kept as a conflict copy where it is replaced (see apply).
 pub fn remote_wins(local: Option<&Entry>, remote: &Entry) -> bool {
-    match local {
-        None => true,
-        Some(l) => remote.key() > l.key(),
+    let Some(l) = local else { return true };
+    match remote.version.compare(&l.version) {
+        Order::Newer => true,
+        Order::Older | Order::Equal => false,
+        Order::Concurrent => concurrent_winner_is(remote, l),
     }
+}
+
+/// Of two changes made independently, is `a` the one every device keeps?
+fn concurrent_winner_is(a: &Entry, b: &Entry) -> bool {
+    let same = (a.deleted && b.deleted) || (!a.deleted && !b.deleted && a.kind == b.kind && a.hash == b.hash && a.mode == b.mode);
+    if same {
+        return true;
+    }
+    let stale = |gone: &Entry, there: &Entry| gone.kind == Kind::File && !gone.hash.is_empty() && gone.hash == there.hash;
+    match (a.deleted, b.deleted) {
+        (true, false) => stale(a, b),
+        (false, true) => !stale(b, a),
+        _ => (a.stamp, a.by, a.hash.as_str(), a.mode) > (b.stamp, b.by, b.hash.as_str(), b.mode),
+    }
+}
+
+/// Are these two independent versions of a file with different content (a real conflict, where
+/// the loser should be kept as a copy)?
+pub fn is_conflict(a: &Entry, b: &Entry) -> bool {
+    a.is_live_file() && b.is_live_file() && a.hash != b.hash && a.version.compare(&b.version) == Order::Concurrent
+}
+
+/// The name a conflict copy of `e` gets: `notes.sync-conflict-20261115-143012-ab12cd34.txt`.
+pub fn conflict_name(e: &Entry) -> String {
+    let (dir, name) = match e.path.rfind('/') {
+        Some(i) => (&e.path[..=i], &e.path[i + 1..]),
+        None => ("", e.path.as_str()),
+    };
+    let (stem, ext) = match name.rfind('.') {
+        Some(i) if i > 0 => (&name[..i], &name[i..]),
+        _ => (name, ""),
+    };
+    let secs = (e.stamp / 1_000_000_000) as i64;
+    let (y, m, d) = civil_from_days(secs.div_euclid(86_400));
+    let t = secs.rem_euclid(86_400);
+    let stem: String = stem.chars().take(150).collect();
+    format!(
+        "{}{}.sync-conflict-{:04}{:02}{:02}-{:02}{:02}{:02}-{:08x}{}",
+        dir,
+        stem,
+        y,
+        m,
+        d,
+        t / 3600,
+        t % 3600 / 60,
+        t % 60,
+        e.by >> 32,
+        ext
+    )
+}
+
+/// Calendar date of a day number (days since 1970-01-01).
+fn civil_from_days(z: i64) -> (i64, u32, u32) {
+    let z = z + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
+    (if m <= 2 { y + 1 } else { y }, m, d)
 }
 
 pub fn now_ns() -> u64 {
@@ -113,6 +335,14 @@ pub fn now_ns() -> u64 {
 /// it elsewhere since, such as being deleted, instead of looking like a brand-new change.
 fn first_stamp(mtime_ns: u64) -> u64 {
     mtime_ns.clamp(1, now_ns().max(1))
+}
+
+/// The version of a change made here to what was `old`.
+fn next_version(old: Option<&Entry>, me: u64) -> Version {
+    match old {
+        Some(o) => o.version.bump(me),
+        None => Version::default().bump(me),
+    }
 }
 
 fn next_stamp(old: Option<&Entry>) -> u64 {
@@ -163,6 +393,9 @@ pub fn sanitize_remote(mut e: Entry, now: u64, max_skew: u64) -> Result<Entry, &
     }
     if e.stamp > now.saturating_add(max_skew) {
         return Err("change time too far in the future (check the clocks)");
+    }
+    if !e.version.valid() {
+        return Err("malformed version");
     }
     if e.deleted {
         // A deleted file may carry the hash of what was deleted (so a copy that is still the same
@@ -287,6 +520,8 @@ pub struct Folder {
     pub files_at_once: AtomicUsize,
     /// How many files are read and hashed at the same time when scanning (1 on a hard disk).
     pub hash_threads: AtomicUsize,
+    /// This device's short id, for the versions of the changes made here.
+    pub me: AtomicU64,
     /// Can files here keep their permission bits? Not on Android's shared storage, FAT/exFAT
     /// drives and many network shares. There permissions are neither applied nor compared, so a
     /// permission the disk cannot hold never looks like a change of the file.
@@ -332,6 +567,10 @@ impl Folder {
                         if e.is_live_file() && e.chunks.len() as u64 != chunk_count(e.size) {
                             e.mtime_ns = 0;
                         }
+                        // Recorded before versions were kept: the same conversion on every device.
+                        if e.version.0.is_empty() {
+                            e.version = Version::legacy(e.stamp);
+                        }
                         index.insert(e.path.clone(), e);
                     }
                 }
@@ -348,6 +587,7 @@ impl Folder {
             fs_lock: tokio::sync::Mutex::new(()),
             files_at_once: AtomicUsize::new(2),
             hash_threads: AtomicUsize::new(1),
+            me: AtomicU64::new(1),
             perms,
             ignore: Mutex::new((None, Arc::new(Ignore::default()))),
             stash: Mutex::new(HashMap::new()),
@@ -483,8 +723,8 @@ impl Folder {
     }
 
     /// The version (stamp and hash) recorded for a path, without copying the whole entry.
-    pub fn key_of(&self, rel: &str) -> Option<(u64, String)> {
-        self.index.lock().unwrap().get(rel).map(|e| (e.stamp, e.hash.clone()))
+    pub fn key_of(&self, rel: &str) -> Option<(Version, String)> {
+        self.index.lock().unwrap().get(rel).map(|e| (e.version.clone(), e.hash.clone()))
     }
 
     pub fn abs(&self, rel: &str) -> PathBuf {
@@ -600,6 +840,7 @@ pub fn scan(folder: &Folder, roots: &[String], deep: bool) -> Vec<Entry> {
     let mut updates: Vec<Entry> = Vec::new();
     let mut changed: Vec<Entry> = Vec::new();
     let mut to_hash: Vec<ToHash> = Vec::new();
+    let me = folder.me.load(Ordering::Relaxed);
     folder.purge_stash(STASH_KEEP);
     let ign = folder.ignores();
     for r in &kept {
@@ -634,6 +875,8 @@ pub fn scan(folder: &Folder, roots: &[String], deep: bool) -> Vec<Entry> {
                     size,
                     mtime_ns: item.mtime,
                     stamp: if prev.is_none() { first_stamp(item.mtime) } else { next_stamp(prev) },
+                    version: next_version(prev, me),
+                    by: me,
                     hash,
                     chunks,
                 };
@@ -656,6 +899,8 @@ pub fn scan(folder: &Folder, roots: &[String], deep: bool) -> Vec<Entry> {
                 size: 0,
                 mtime_ns: 0,
                 stamp: next_stamp(Some(o)),
+                version: o.version.bump(me),
+                by: me,
                 // What was deleted: another device deletes its copy only if it is the same.
                 hash: if o.kind == Kind::File { o.hash.clone() } else { String::new() },
                 chunks: Vec::new(),
@@ -771,6 +1016,8 @@ fn walk(
                     size: 0,
                     mtime_ns: 0,
                     stamp: if prev.is_none() { first_stamp(mtime_of(&md)) } else { next_stamp(prev) },
+                    version: next_version(prev, folder.me.load(Ordering::Relaxed)),
+                    by: folder.me.load(Ordering::Relaxed),
                     hash: String::new(),
                     chunks: Vec::new(),
                 };
@@ -809,6 +1056,8 @@ fn walk(
                     let mut e = o.clone();
                     e.mode = mode;
                     e.stamp = next_stamp(prev);
+                    e.version = next_version(prev, folder.me.load(Ordering::Relaxed));
+                    e.by = folder.me.load(Ordering::Relaxed);
                     updates.push(e.clone());
                     changed.push(e);
                 }
@@ -843,6 +1092,8 @@ mod tests {
             size,
             mtime_ns: 1,
             stamp: 1_000,
+            version: Version(vec![(5, 1)]),
+            by: 5,
             hash: "0".repeat(64),
             chunks: vec!["1".repeat(64); n],
         }
@@ -1091,6 +1342,112 @@ mod tests {
         assert_eq!(changed.len(), 1);
         assert_eq!(changed[0].mode, 0o660);
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn versions_know_what_came_first() {
+        let a = Version::default().bump(1); // made on device 1
+        let b = a.bump(2); // then changed on device 2
+        assert_eq!(b.compare(&a), Order::Newer);
+        assert_eq!(a.compare(&b), Order::Older);
+        assert_eq!(a.compare(&a.clone()), Order::Equal);
+        let c = a.bump(3); // changed on device 3 without having seen b
+        assert_eq!(b.compare(&c), Order::Concurrent);
+        let m = b.merge(&c);
+        assert_eq!(m.compare(&b), Order::Newer);
+        assert_eq!(m.compare(&c), Order::Newer);
+        assert_eq!(m.get(1), a.get(1));
+        // counters keep growing, also after a long time or a lost counter
+        let d = Version(vec![(1, 5)]).bump(1);
+        assert!(d.get(1) > 5);
+        assert!(Version(vec![(1, u64::MAX)]).bump(1).get(1) == u64::MAX);
+        // well formed only
+        assert!(a.valid() && m.valid());
+        assert!(!Version::default().valid());
+        assert!(!Version(vec![(2, 1), (1, 1)]).valid());
+        assert!(!Version(vec![(1, 1), (1, 2)]).valid());
+        assert!(!Version(vec![(1, 0)]).valid());
+        assert!(!Version((1..=65).map(|i| (i, 1)).collect()).valid());
+        // what was recorded before versions: the same conversion everywhere
+        assert_eq!(Version::legacy(7).compare(&Version::legacy(7)), Order::Equal);
+        assert_eq!(Version::legacy(8).compare(&Version::legacy(7)), Order::Newer);
+        assert_eq!(Version::legacy(7).bump(4).compare(&Version::legacy(7)), Order::Newer);
+        assert_eq!(device_id(&[0u8; 32]), 1);
+        assert_eq!(device_id(&[1, 2, 3, 4, 5, 6, 7, 8, 9]), 0x0102030405060708);
+    }
+
+    #[test]
+    fn independent_changes_are_settled_the_same_way_everywhere() {
+        let base = file_entry(10);
+        let mut mine = base.clone();
+        mine.version = base.version.bump(1);
+        mine.by = 1;
+        mine.stamp = 2_000;
+        mine.hash = "1".repeat(64);
+        let mut theirs = base.clone();
+        theirs.version = base.version.bump(2);
+        theirs.by = 2;
+        theirs.stamp = 3_000;
+        theirs.hash = "2".repeat(64);
+        // the later change wins, on both sides
+        assert!(remote_wins(Some(&mine), &theirs));
+        assert!(!remote_wins(Some(&theirs), &mine));
+        assert!(is_conflict(&mine, &theirs));
+        // a newer version always wins, whatever the clock says
+        let mut later = mine.clone();
+        later.version = mine.version.bump(1);
+        later.stamp = 1;
+        assert!(remote_wins(Some(&mine), &later));
+        assert!(!remote_wins(Some(&later), &mine));
+        assert!(!is_conflict(&mine, &later));
+        // the same content: no conflict, each takes the other's version (merged when recorded)
+        let mut same = theirs.clone();
+        same.hash = mine.hash.clone();
+        assert!(remote_wins(Some(&mine), &same) && remote_wins(Some(&same), &mine));
+        assert!(!is_conflict(&mine, &same));
+        // a deletion against a change: the change wins...
+        let mut gone = theirs.clone();
+        gone.deleted = true;
+        gone.hash = base.hash.clone();
+        assert!(!remote_wins(Some(&mine), &gone));
+        assert!(remote_wins(Some(&gone), &mine));
+        // ...unless it is exactly what was deleted
+        let mut stale = mine.clone();
+        stale.hash = base.hash.clone();
+        assert!(remote_wins(Some(&stale), &gone));
+        assert!(!remote_wins(Some(&gone), &stale));
+        // two deletions: no conflict
+        let mut gone2 = mine.clone();
+        gone2.deleted = true;
+        assert!(remote_wins(Some(&gone2), &gone) && remote_wins(Some(&gone), &gone2));
+    }
+
+    #[test]
+    fn conflict_copies_have_a_telling_name() {
+        let mut e = file_entry(1);
+        e.path = "docs/notes.txt".into();
+        e.stamp = 1_794_650_400 * 1_000_000_000 + 5; // 2026-11-14 10:00:00
+        e.by = 0xab12_cd34_0000_0001;
+        assert_eq!(conflict_name(&e), "docs/notes.sync-conflict-20261114-100000-ab12cd34.txt");
+        e.path = "README".into();
+        assert_eq!(conflict_name(&e), "README.sync-conflict-20261114-100000-ab12cd34");
+        e.path = "a/.hidden".into();
+        assert_eq!(conflict_name(&e), "a/.hidden.sync-conflict-20261114-100000-ab12cd34");
+        assert_eq!(civil_from_days(0), (1970, 1, 1));
+        assert_eq!(civil_from_days(-1), (1969, 12, 31));
+        assert_eq!(civil_from_days(20_407), (2025, 11, 15));
+    }
+
+    #[test]
+    fn versions_from_other_devices_must_be_well_formed() {
+        let now = now_ns();
+        let mut e = file_entry(1);
+        e.stamp = now;
+        assert!(sanitize_remote(e.clone(), now, 0).is_ok());
+        e.version = Version::default();
+        assert!(sanitize_remote(e.clone(), now, 0).is_err());
+        e.version = Version(vec![(3, 1), (2, 1)]);
+        assert!(sanitize_remote(e, now, 0).is_err());
     }
 
     #[test]

@@ -15,7 +15,42 @@ use chacha20poly1305::{XChaCha20Poly1305, XNonce};
 
 /// New records start with this, so records written by older versions (which have a different
 /// layout) can still be read.
-const RECORD_MAGIC: [u8; 4] = [0, b'r', b's', 2];
+const RECORD_MAGIC: [u8; 4] = [0, b'r', b's', 3];
+/// Records written before versions were kept (0.6 to 0.21).
+const RECORD_MAGIC_2: [u8; 4] = [0, b'r', b's', 2];
+
+/// The layout of an entry in records with RECORD_MAGIC_2.
+#[derive(serde::Deserialize)]
+#[cfg_attr(test, derive(serde::Serialize))]
+struct EntryV2 {
+    path: String,
+    kind: crate::index::Kind,
+    deleted: bool,
+    mode: u32,
+    size: u64,
+    mtime_ns: u64,
+    stamp: u64,
+    hash: String,
+    chunks: Vec<String>,
+}
+
+impl From<EntryV2> for Entry {
+    fn from(e: EntryV2) -> Entry {
+        Entry {
+            path: e.path,
+            kind: e.kind,
+            deleted: e.deleted,
+            mode: e.mode,
+            size: e.size,
+            mtime_ns: e.mtime_ns,
+            stamp: e.stamp,
+            version: crate::index::Version::legacy(e.stamp),
+            by: 0,
+            hash: e.hash,
+            chunks: e.chunks,
+        }
+    }
+}
 
 /// Read a record the way versions before 0.6 wrote it (a fixed-width binary layout: 8-byte
 /// lengths, 4-byte enum numbers, little endian). Only used to read old backups; every record
@@ -74,7 +109,19 @@ fn legacy_entry(b: &[u8]) -> Result<Entry> {
     for _ in 0..n {
         chunks.push(r.string()?);
     }
-    Ok(Entry { path, kind, deleted, mode, size, mtime_ns, stamp, hash, chunks })
+    Ok(Entry {
+        path,
+        kind,
+        deleted,
+        mode,
+        size,
+        mtime_ns,
+        stamp,
+        version: crate::index::Version::legacy(stamp),
+        by: 0,
+        hash,
+        chunks,
+    })
 }
 
 pub struct Vault {
@@ -238,10 +285,13 @@ impl Vault {
 
     pub fn open_record(&self, slot: &str, sealed: &[u8]) -> Result<Entry> {
         let plain = open(&self.records, slot.as_bytes(), sealed)?;
-        let e: Entry = match plain.strip_prefix(&RECORD_MAGIC[..]) {
-            Some(rest) => postcard::from_bytes(rest)?,
-            // Written by an older version.
-            None => legacy_entry(&plain)?,
+        let e: Entry = if let Some(rest) = plain.strip_prefix(&RECORD_MAGIC[..]) {
+            postcard::from_bytes(rest)?
+        } else if let Some(rest) = plain.strip_prefix(&RECORD_MAGIC_2[..]) {
+            postcard::from_bytes::<EntryV2>(rest)?.into()
+        } else {
+            // Written by a version before 0.6.
+            legacy_entry(&plain)?
         };
         if self.slot(&e.path) != slot {
             bail!("the depot returned a record for the wrong path");
@@ -274,6 +324,8 @@ mod tests {
             size: 5,
             mtime_ns: 7,
             stamp: 9,
+            version: crate::index::Version(vec![(3, 4)]),
+            by: 3,
             hash: "ab".repeat(32),
             chunks: vec!["cd".repeat(32), "ef".repeat(32)],
         }
@@ -310,6 +362,7 @@ mod tests {
         assert_eq!(back.path, e.path);
         assert_eq!(back.chunks, e.chunks);
         assert_eq!(back.stamp, 9);
+        assert_eq!(back.version, e.version);
 
         let old = seal(&v.records, slot.as_bytes(), &old_layout(&e));
         let back = v.open_record(&slot, &old).unwrap();
@@ -318,6 +371,29 @@ mod tests {
         assert_eq!(back.chunks, e.chunks);
         assert_eq!(back.mode, 0o644);
         assert_eq!(back.mtime_ns, 7);
+    }
+
+    #[test]
+    fn records_from_before_versions_still_open() {
+        let v = Vault::new(&[7u8; 32]);
+        let e = entry();
+        let slot = v.slot(&e.path);
+        let old = EntryV2 {
+            path: e.path.clone(),
+            kind: e.kind,
+            deleted: false,
+            mode: e.mode,
+            size: e.size,
+            mtime_ns: e.mtime_ns,
+            stamp: 42,
+            hash: e.hash.clone(),
+            chunks: e.chunks.clone(),
+        };
+        let mut plain = RECORD_MAGIC_2.to_vec();
+        plain.extend(postcard::to_allocvec(&old).unwrap());
+        let back = v.open_record(&slot, &seal(&v.records, slot.as_bytes(), &plain)).unwrap();
+        assert_eq!(back.hash, e.hash);
+        assert_eq!(back.version, crate::index::Version::legacy(42));
     }
 
     #[test]

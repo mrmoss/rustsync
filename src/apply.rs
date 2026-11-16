@@ -6,8 +6,8 @@
 //! hash before an atomic rename.
 
 use crate::index::{
-    chunk_size, disk_matches, fd_inside, hash_file, mtime_of, now_ns, open_nofollow, remote_wins, safe_rel,
-    sanitize_remote, Entry, Folder, Kind, TMP_PREFIX,
+    chunk_size, conflict_name, disk_matches, fd_inside, hash_file, is_conflict, mtime_of, now_ns, open_nofollow,
+    remote_wins, safe_rel, sanitize_remote, Entry, Folder, Kind, TMP_PREFIX,
 };
 use crate::sync::Remote;
 use anyhow::{anyhow, bail, Context, Result};
@@ -16,7 +16,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, UNIX_EPOCH};
 use tokio::sync::OwnedSemaphorePermit;
@@ -28,8 +28,16 @@ fn depth(p: &str) -> usize {
     p.matches('/').count()
 }
 
-fn record(folder: &Folder, e: Entry) {
-    folder.index.lock().unwrap().insert(e.path.clone(), e);
+/// Write down what is now here. Its version is merged with what we had, so that what we
+/// record has seen both (that is what settles two changes made independently). Returns what
+/// was recorded.
+fn record(folder: &Folder, mut e: Entry) -> Entry {
+    let mut idx = folder.index.lock().unwrap();
+    if let Some(l) = idx.get(&e.path) {
+        e.version = l.version.merge(&e.version);
+    }
+    idx.insert(e.path.clone(), e.clone());
+    e
 }
 
 /// What applying a batch did.
@@ -140,7 +148,7 @@ pub async fn apply_entries(folder: &Arc<Folder>, remote: &Remote, entries: Vec<E
             let source = sources.get(&e.hash).filter(|p| **p != e.path).cloned();
             async move {
                 let _slot = remote.file_slot().await;
-                let res = apply_file(&folder, &remote, &e, source).await;
+                let res = apply_file(&folder, &remote, &e, source, Arc::new(AtomicBool::new(false))).await;
                 // Arrived, skipped or given up: it no longer counts as "left".
                 remote.file_done(&folder.id, &e.path, e.stamp);
                 (e, res)
@@ -197,7 +205,7 @@ fn check_ancestors(folder: &Folder, rel: &str) -> Result<()> {
 }
 
 /// Deletions and directories. Caller holds fs_lock. Returns what was recorded (None: nothing).
-fn apply_meta(folder: &Folder, e: &Entry) -> Result<Option<Entry>> {
+pub fn apply_meta(folder: &Folder, e: &Entry) -> Result<Option<Entry>> {
     check_ancestors(folder, &e.path)?;
     let abs = folder.abs(&e.path);
     let local = folder.get(&e.path);
@@ -224,27 +232,16 @@ fn apply_meta(folder: &Folder, e: &Entry) -> Result<Option<Entry>> {
                     }
                 }
             } else {
+                // The versions say the deletion wins over what we indexed. What is on the disk must
+                // be that, or exactly what was deleted (our index may be behind); anything else is
+                // a change made here that was not scanned yet: it stays (the next scan makes it a
+                // new version, and a change wins over a deletion).
                 let indexed = matches!(&local, Some(l) if l.is_live_file() && disk_matches(&abs, l));
-                // Is what is here the same as what the other device deleted? (Older deletions
-                // do not say what was deleted: then it has to be what we indexed.)
-                let same = if e.hash.is_empty() {
-                    indexed
-                } else if indexed {
-                    local.as_ref().is_some_and(|l| l.hash == e.hash)
-                } else {
-                    md.is_file() && hash_file(&abs, &folder.root).is_ok_and(|(h, _, _)| h == e.hash)
-                };
+                let same = indexed
+                    || (!e.hash.is_empty()
+                        && md.is_file()
+                        && hash_file(&abs, &folder.root).is_ok_and(|(h, _, _)| h == e.hash));
                 if !same {
-                    if let (true, Some(l)) = (indexed, &local) {
-                        // A different version is here (changed here, or one the other device never
-                        // had): it is kept, and becomes the newest version so it reaches the other
-                        // devices again. A change wins over a deletion.
-                        let mut keep = l.clone();
-                        keep.stamp = now_ns().max(e.stamp.saturating_add(1));
-                        record(folder, keep.clone());
-                        info!("kept {}: it was deleted on another device, but the version here is different", e.path);
-                        return Ok(Some(keep));
-                    }
                     warn!("not deleting {}: it has local changes", e.path);
                     return Ok(None);
                 }
@@ -273,8 +270,7 @@ fn apply_meta(folder: &Folder, e: &Entry) -> Result<Option<Entry>> {
             fs::set_permissions(&abs, fs::Permissions::from_mode(e.mode))?;
         }
     }
-    record(folder, e.clone());
-    Ok(Some(e.clone()))
+    Ok(Some(record(folder, e.clone())))
 }
 
 /// Put a finished temp file in place (or give it up), holding the lock that keeps scans away.
@@ -317,8 +313,59 @@ fn copy_local(src: &Path, root: &Path, tmp: &Path, hash: &str) -> Result<bool> {
     Ok(whole.finalize().to_hex().as_str() == hash)
 }
 
+/// Fetch one file from `remote` (or make it from content that is here already) and put it in
+/// place, waiting for a turn first (the device writes only so many files at once). `source`: the
+/// path of another file here with the same content, if there is one. `stop`: set it to give up
+/// (a newer change of the file arrived).
+pub async fn fetch_file(
+    folder: &Arc<Folder>,
+    remote: &Remote,
+    e: &Entry,
+    source: Option<String>,
+    stop: Arc<AtomicBool>,
+) -> Result<bool> {
+    let _slot = remote.file_slot().await;
+    if stop.load(Ordering::Relaxed) {
+        return Ok(false);
+    }
+    apply_file(folder, remote, e, source, stop).await
+}
+
+/// A rename or move: the file at `from` (which another device deleted, as `gone` says) has the
+/// content of `to`. Move it there instead of fetching it again. Caller holds fs_lock. False if
+/// it could not be done that way (nothing was changed then).
+pub fn move_local(folder: &Folder, from: &Entry, gone: &Entry, to: &Entry) -> Result<bool> {
+    let src = folder.abs(&from.path);
+    match folder.get(&from.path) {
+        Some(l) if l.key() == from.key() && l.is_live_file() && disk_matches(&src, &l) => {}
+        _ => return Ok(false),
+    }
+    if !remote_wins(folder.get(&to.path).as_ref(), to) || !remote_wins(Some(from), gone) {
+        return Ok(false);
+    }
+    check_ancestors(folder, &to.path)?;
+    let dst = folder.abs(&to.path);
+    let parent = dst.parent().ok_or_else(|| anyhow!("bad path"))?;
+    fs::create_dir_all(parent)?;
+    let tmp = parent.join(format!("{}{}-{}", TMP_PREFIX, std::process::id(), TMP_COUNTER.fetch_add(1, Ordering::Relaxed)));
+    if fs::rename(&src, &tmp).is_err() {
+        return Ok(false); // another disk, say: it is fetched or copied the usual way
+    }
+    let planned = folder.get(&to.path);
+    match commit_file(folder, to, &tmp, planned.as_ref()) {
+        Ok(true) => {
+            record(folder, gone.clone());
+            Ok(true)
+        }
+        other => {
+            let _ = fs::rename(&tmp, &src);
+            other.map(|_| false)
+        }
+    }
+}
+
 /// `source`: the path of another file here that has the same content, if there is one.
-async fn apply_file(folder: &Arc<Folder>, remote: &Remote, e: &Entry, source: Option<String>) -> Result<bool> {
+async fn apply_file(folder: &Arc<Folder>, remote: &Remote, e: &Entry, source: Option<String>, stop: Arc<AtomicBool>) -> Result<bool> {
     let abs = folder.abs(&e.path);
     let local = folder.get(&e.path);
     if !remote_wins(local.as_ref(), e) {
@@ -377,13 +424,14 @@ async fn apply_file(folder: &Arc<Folder>, remote: &Remote, e: &Entry, source: Op
 
     let built = build_temp(
         folder.clone(),
-        local.as_ref().map(|l| l.key()).map(|(s, h)| (s, h.to_string())),
+        local.as_ref().map(|l| (l.version.clone(), l.hash.clone())),
         remote.clone(),
         e.clone(),
         abs.clone(),
         local_chunks,
         local_size,
         tmp.clone(),
+        stop,
     )
     .await;
     if let Err(err) = built {
@@ -430,13 +478,14 @@ fn tidy_parents(folder: &Folder, rel: &str) {
 // fail Rust's "Send is not general enough" check when spawned on tokio.
 async fn build_temp(
     folder: Arc<Folder>,
-    planned: Option<(u64, String)>,
+    planned: Option<(crate::index::Version, String)>,
     remote: Remote,
     e: Entry,
     abs: PathBuf,
     local_chunks: Vec<String>,
     local_size: u64,
     tmp: PathBuf,
+    stop: Arc<AtomicBool>,
 ) -> Result<()> {
     let (folder_id, root) = (folder.id.clone(), folder.root.clone());
     let watch = folder;
@@ -493,12 +542,13 @@ async fn build_temp(
             let folder_id = folder_id.clone();
             let watch = watch.clone();
             let planned = planned.clone();
+            let stop = stop.clone();
             async move {
                 if reuse {
                     return Ok::<Piece, anyhow::Error>(Piece::Local(i));
                 }
                 // Changed or deleted meanwhile (by a later message): stop fetching it.
-                if watch.key_of(&path) != planned {
+                if stop.load(Ordering::Relaxed) || watch.key_of(&path) != planned {
                     return Err(Superseded.into());
                 }
                 let len = expected_len(i);
@@ -623,6 +673,28 @@ fn adopt_same(folder: &Folder, e: &Entry, planned: &Entry) -> Result<bool> {
     Ok(true)
 }
 
+/// Move the local file of `l` aside, to the conflict-copy name of its version.
+fn keep_conflict_copy(folder: &Folder, l: &Entry) -> Result<()> {
+    let base = conflict_name(l);
+    let (stem, ext) = match base.rfind('.') {
+        Some(i) if i > base.rfind('/').map_or(0, |s| s + 1) => (&base[..i], &base[i..]),
+        _ => (base.as_str(), ""),
+    };
+    for n in 0..10 {
+        let name = if n == 0 { base.clone() } else { format!("{}-{}{}", stem, n, ext) };
+        if !safe_rel(&name) {
+            break;
+        }
+        let to = folder.abs(&name);
+        if fs::symlink_metadata(&to).is_err() {
+            fs::rename(folder.abs(&l.path), &to)?;
+            info!("{}: changed here and on another device at the same time; this machine's version is kept as {}", l.path, name);
+            return Ok(());
+        }
+    }
+    bail!("{}: changed here and on another device at the same time, and no name is free for a copy", l.path)
+}
+
 /// Atomically move the finished temp file into place. Caller holds fs_lock.
 fn commit_file(folder: &Folder, e: &Entry, tmp: &Path, planned: Option<&Entry>) -> Result<bool> {
     let abs = folder.abs(&e.path);
@@ -647,6 +719,11 @@ fn commit_file(folder: &Folder, e: &Entry, tmp: &Path, planned: Option<&Entry>) 
             if !ok {
                 warn!("{} changed locally during sync; will retry on next exchange", e.path);
                 return Ok(false);
+            }
+            // Changed here and there independently: what is here lost, and is kept as a copy next
+            // to it (which is then synced like any new file).
+            if let Some(l) = now_local.as_ref().filter(|l| is_conflict(l, e)) {
+                keep_conflict_copy(folder, l)?;
             }
         }
         Err(_) => {}
@@ -699,6 +776,8 @@ mod tests {
         e.chunks.clear();
         e.hash = hash.to_string();
         e.stamp += 1_000;
+        e.version = e.version.bump(777);
+        e.by = 777;
         e
     }
 
@@ -749,19 +828,67 @@ mod tests {
     }
 
     #[test]
-    fn a_different_version_wins_over_a_deletion() {
+    fn a_rename_moves_the_file_instead_of_fetching_it() {
+        let (dir, data, f) = folder("move");
+        let from = f.get("f").unwrap();
+        let gone = deletion(&f, &from.hash);
+        let mut to = from.clone();
+        to.path = "sub/g".to_string();
+        to.stamp = gone.stamp;
+        assert!(move_local(&f, &from, &gone, &to).unwrap());
+        assert!(!data.join("f").exists());
+        assert_eq!(fs::read(data.join("sub/g")).unwrap(), b"version one");
+        assert!(f.get("f").unwrap().deleted);
+        assert_eq!(f.get("sub/g").unwrap().hash, from.hash);
+        // a second time there is nothing to move
+        assert!(!move_local(&f, &from, &gone, &to).unwrap());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_deletion_that_has_seen_our_version_wins_but_an_unscanned_change_stays() {
         let (dir, data, f) = folder("differs");
-        let gone = deletion(&f, &"0".repeat(64));
-        let kept = apply_meta(&f, &gone).unwrap().unwrap();
-        assert!(!kept.deleted && kept.stamp > gone.stamp);
-        assert!(data.join("f").exists());
-        assert_eq!(f.get("f").unwrap().stamp, kept.stamp);
-        // an unindexed change is left alone (the next scan picks it up)
+        // an unscanned change here: not deleted (the next scan makes it a new version)
         fs::write(data.join("f"), b"changed here").unwrap();
-        let mut again = gone.clone();
-        again.stamp = kept.stamp + 1;
-        assert!(apply_meta(&f, &again).unwrap().is_none());
+        let gone = deletion(&f, &"0".repeat(64));
+        assert!(apply_meta(&f, &gone).unwrap().is_none());
         assert!(data.join("f").exists());
+        // what we indexed, with the deletion having seen it: deleted
+        fs::write(data.join("f"), b"version one").unwrap();
+        scan(&f, &[String::new()], false);
+        let gone = deletion(&f, &"0".repeat(64));
+        assert!(apply_meta(&f, &gone).unwrap().is_some_and(|e| e.deleted));
+        assert!(!data.join("f").exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_change_made_here_and_there_at_once_keeps_both() {
+        let (dir, data, f) = folder("conflict");
+        let mine = f.get("f").unwrap();
+        // the other device changed the same version independently, later
+        let mut theirs = mine.clone();
+        theirs.version = mine.version.bump(999);
+        theirs.by = 999;
+        theirs.stamp = mine.stamp + 1_000_000_000;
+        theirs.hash = blake3::hash(b"version two").to_hex().to_string();
+        let mut local_change = mine.clone();
+        local_change.version = mine.version.bump(f.me.load(Ordering::Relaxed));
+        record(&f, local_change.clone());
+        assert!(remote_wins(f.get("f").as_ref(), &theirs));
+        let tmp = data.join(format!("{}in", TMP_PREFIX));
+        fs::write(&tmp, b"version two").unwrap();
+        let mut theirs_on_disk = theirs.clone();
+        theirs_on_disk.size = 11;
+        assert!(commit_file(&f, &theirs_on_disk, &tmp, f.get("f").as_ref()).unwrap());
+        assert_eq!(fs::read(data.join("f")).unwrap(), b"version two");
+        // ours is kept next to it
+        let copy = conflict_name(&local_change);
+        assert_eq!(fs::read(data.join(&copy)).unwrap(), b"version one");
+        // and what is recorded has seen both changes
+        let rec = f.get("f").unwrap();
+        assert_eq!(rec.version.compare(&theirs.version), crate::index::Order::Newer);
+        assert_eq!(rec.version.compare(&local_change.version), crate::index::Order::Newer);
         let _ = fs::remove_dir_all(&dir);
     }
 }

@@ -126,9 +126,11 @@ being smaller and simpler to set up and run:
 | **Backups on a machine you don't trust** | "Untrusted" devices can hold encrypted folders. | Built in as a library mode (`share --backup`): the server stores only encrypted data, your other machines find and use the backup by themselves, it has a size limit and a clean-up command, and a **recovery code or kit** gets everything back if every machine is lost. |
 | **Managing it** | A web interface in your browser, plus a settings file. | A command line and a native desktop window, both talking to the same background service. Devices and libraries are managed with commands, not by editing a file. |
 | **Folder roles** | Send and receive, send only, or receive only, per folder. | Each library is either synced both ways or an encrypted backup. No send-only or receive-only yet. |
-| **Conflicts** | Keeps both versions (a conflict copy). | The most recent change wins, by the clock; no copy of the loser is kept. Keep clocks in sync. |
-| **File versioning, ignore patterns** | Yes. | No. |
-| **Platforms** | Windows, macOS, Linux, the BSDs, Android and more. | Linux, macOS and the BSDs on 64-bit Intel/AMD and ARM. No Windows or Android yet. |
+| **How changes are applied** | Each device keeps what the others have (their index) and pulls what it is missing; renames are done locally. Versions are version vectors. | The same: each device keeps the others' indexes and pulls what it is missing, in a fixed order (folders, renames and moves, deletions, then files); renames and moves are done locally. Versions are version vectors. |
+| **Conflicts** | Keeps both versions (a conflict copy). | The same: keeps both (`name.sync-conflict-…`); a change wins over a deletion. |
+| **Ignore patterns** | Yes (`.stignore`). | Yes (`.rustsyncignore`, synced to every device). |
+| **File versioning** | Yes. | No. |
+| **Platforms** | Windows, macOS, Linux, the BSDs, Android and more. | Linux, macOS, the BSDs and Android on 64-bit Intel/AMD and ARM. No Windows. |
 | **Maturity** | Years of use and a large community. | Brand new, written by an AI, little real-world testing. |
 | **Language** | Go. | Rust. |
 
@@ -593,6 +595,24 @@ transfers that were running stop; changes made meanwhile on either side are exch
 resumed. The other device is told, and shows "paused on <this device>". A pause stays until it is
 resumed, also across restarts.
 
+For special cases there is a `custom` profile that takes its numbers from the config file:
+
+```toml
+[performance]
+profile = "custom"
+window = "32MB"           # how much is asked for from one device at a time (4 MiB to 256 MiB)
+files = 6                 # files written at the same time, over all libraries (1 to 16)
+upload_limit = "2MB"      # per second; leave out or 0 for none (any profile)
+download_limit = "0"
+```
+
+What happens underneath, on every profile: a file is cut into pieces whose size depends on the size
+of the file (128 KiB up to 64 MiB, 1 MiB up to 16 GiB, 4 MiB above that), so a small file that
+changes sends little and a large file needs few requests; the largest file that can be synced is
+512 GiB. Sending and receiving on a connection do not wait for each other, files that are being
+fetched stay open on the sending side, and hashing and disk work are kept away from the network
+threads.
+
 ## Leaving things out
 
 Build output, caches and the like rarely belong in a library: a Rust `target/` folder alone can be
@@ -613,10 +633,28 @@ What is left out is not sent, not fetched and not deleted anywhere: copies that 
 already have stay where they are. To get rid of them, delete the folder first and add the pattern
 after.
 
-## Deleting files
+## How changes travel
 
-A deleted file is gone on every device, also when another device still had a copy. When a
-deletion reaches a device:
+Devices tell each other only **what they have**: every file and folder with its version, and what
+was deleted. Each device keeps what the others told it, and works out on
+its own what it is missing: for every path, the newest version any device has. Then it gets there
+in an order that always works, whatever order the messages came in:
+
+1. folders are created;
+2. **renames and moves** are done on its own disk: a file that is to be deleted under one name and
+   to appear under another with the same content is simply moved, nothing is sent;
+3. deletions;
+4. the files it still needs are fetched, a few at a time, from any connected device that has that
+   version (content it has already, under another name, is copied on its own disk instead).
+
+The data itself travels on request, piece by piece, separately from these notes. A file that is
+deleted or changed again while it is being fetched stops being fetched. When a device announces a
+new name before the old one is gone (some systems report a rename in two steps), the others wait a
+few seconds before copying, so that it can still become a move; a device that notices something
+new also looks for what disappeared right away, so both halves of a rename go out together.
+
+**Deleting.** A deleted file is gone on every device, also when another device still had a copy.
+When a deletion reaches a device:
 
 - the file is deleted if it is the same as what was deleted (even if that device had lost track of
   it, after being stopped half way through receiving, for example);
@@ -624,39 +662,26 @@ deletion reaches a device:
   change wins: it is kept and comes back to the other devices, as a newer version;
 - a folder is removed once it is empty; anything else in it stays.
 
-Deletions are handled straight away, even while the device is still fetching other files, and a
-file that is deleted while it is being fetched stops being fetched.
-
-**Renaming and moving** files or folders does not send their content again. To the other devices a
-rename is a deletion and a new file with the same content; a device that gets the deletion keeps the
-file aside for a few minutes (in a hidden `.fsync-tmp-stash` folder at the top of the library) and
-puts it back under the new name when that is announced. If the new name is announced first, the
-file is copied on the device's own disk. Only content a device does not have at all is fetched.
-(Disk space of deleted files is therefore given back a few minutes after the deletion, not at
-once.)
+A deleted file is kept aside for a few minutes (in a hidden `.fsync-tmp-stash` folder at the top of
+the library), so that it can still be moved if its new name only turns up later; disk space of
+deleted files is therefore given back a few minutes after the deletion.
 
 A file a device finds for the first time counts as being as old as its change time, so a copy
 that only turned up again cannot undo a later deletion. On disks that cannot keep Unix permissions
 (Android's shared storage, FAT/exFAT drives, many network shares) permissions are neither applied
 nor compared, so what such a disk reports is never taken as a change.
 
-For special cases there is a `custom` profile that takes its numbers from the config file:
+**Versions and conflicts.** A version is a *version vector*: for each device that changed a file, a
+counter of its changes. A version is newer than another if it has seen everything the other has
+seen, and more; clocks play no part in that. When two devices change the same file without having
+seen each other's change (both offline, say), that is a conflict, and every device settles it the
+same way:
 
-```toml
-[performance]
-profile = "custom"
-window = "32MB"           # how much is asked for from one device at a time (4 MiB to 256 MiB)
-files = 6                 # files written at the same time, over all libraries (1 to 16)
-upload_limit = "2MB"      # per second; leave out or 0 for none (any profile)
-download_limit = "0"
-```
-
-What happens underneath, on every profile: a file is cut into pieces whose size depends on the size
-of the file (128 KiB up to 64 MiB, 1 MiB up to 16 GiB, 4 MiB above that), so a small file that
-changes sends little and a large file needs few requests; the largest file that can be synced is
-512 GiB. Sending and receiving on a connection do not wait for each other, files that are being
-fetched stay open on the sending side, and hashing and disk work are kept away from the network
-threads.
+- the same content on both sides is no conflict at all;
+- a change against a deletion: the change wins (unless it is exactly the content that was deleted);
+- two different changes: the later one keeps the name, and the other one is kept next to it as
+  `name.sync-conflict-<date>-<time>-<device>.ext`, which is synced like any other file. Nothing is
+  lost; look at both and delete the one you don't want.
 
 ## The Android app
 

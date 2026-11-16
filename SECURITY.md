@@ -202,7 +202,7 @@ sequenceDiagram
     A->>A: New entry: path, size, mode, chunk hashes, whole-file hash, time stamp
     A->>B: Index (changed entries)
     B->>B: Check every entry (path, sizes, hashes, clock, permissions)
-    B->>B: Conflict rule: higher (time stamp, hash) wins
+    B->>B: Newer version vector wins (independent changes: fixed rule, loser kept as a conflict copy)
     loop each piece that differs from B's copy (128 KiB to 4 MiB, by file size)
         B->>A: GetChunk (library, path, index, hash)
         A->>A: Re-read that piece of the file, check its hash
@@ -233,6 +233,15 @@ sequenceDiagram
 - A deletion says what was deleted (the hash of the file). A device deletes its copy only if it is
   that content, or what it indexed and has not changed; a different version is kept and becomes a
   newer version. So a deletion cannot remove work that never reached the deleting device.
+- Versions are version vectors (at most 64 devices each, checked to be well formed on arrival).
+  A device's own counter is never smaller than the time in seconds, so it keeps growing even if
+  that device lost its index. Which version is newer does not depend on clocks; the clock only
+  breaks the tie between two independent changes, and the loser of such a tie is kept as a
+  conflict copy, never thrown away.
+- What another device says it has (its index) is kept in memory, validated entry by entry as it
+  arrives, and limited to 512 MiB per device and library. It is only a list of what could be
+  fetched: nothing is written until this device has worked out, by itself, that a version is
+  newer than its own, and every piece that is then fetched is checked against its hash.
 - A file another device deleted is kept aside for up to five minutes (at most 20 000 files, in a
   private folder inside the library that is never synced or followed if it is a link) so that a
   rename does not fetch it again. It is only put back for an entry with the same hash and size,

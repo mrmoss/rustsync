@@ -92,6 +92,27 @@ impl Traffic {
         self.drop_if(lib, path, |p| p.stamp < stamp);
     }
 
+    /// What is to be fetched from this device for a library, as the puller worked it out:
+    /// (path, version, size). Files already counted keep what arrived of them; the rest is
+    /// replaced.
+    pub fn set_todo(&self, lib: &str, files: Vec<(String, u64, u64)>) {
+        let mut m = self.todo.lock().unwrap();
+        if files.is_empty() {
+            m.remove(lib);
+            return;
+        }
+        let old = m.remove(lib).unwrap_or_default();
+        let mut new: HashMap<String, Pending> = HashMap::with_capacity(files.len());
+        for (path, stamp, bytes) in files {
+            let p = match old.get(&path) {
+                Some(o) if o.stamp == stamp => Pending { stamp, bytes: o.bytes.min(bytes) },
+                _ => Pending { stamp, bytes },
+            };
+            new.insert(path, p);
+        }
+        m.insert(lib.to_string(), new);
+    }
+
     fn drop_if(&self, lib: &str, path: &str, test: impl Fn(&Pending) -> bool) {
         let mut m = self.todo.lock().unwrap();
         if let Some(files) = m.get_mut(lib) {
@@ -210,6 +231,22 @@ mod tests {
         t.file_done("lib", "big", 5);
         assert_eq!(t.left("lib"), (1, 9_000));
         t.file_done("lib", "big", 8);
+        assert_eq!(t.left("lib"), (0, 0));
+    }
+
+    #[test]
+    fn the_puller_sets_what_is_left() {
+        let t = Traffic::default();
+        t.set_todo("lib", vec![("a".into(), 1, 1000), ("b".into(), 1, 500)]);
+        t.got("lib", "a", 400);
+        assert_eq!(t.left("lib"), (2, 1100));
+        // worked out again: what arrived of a stays, b is gone (deleted), c is new
+        t.set_todo("lib", vec![("a".into(), 1, 1000), ("c".into(), 2, 10)]);
+        assert_eq!(t.left("lib"), (2, 610));
+        // a newer version of a starts from the beginning
+        t.set_todo("lib", vec![("a".into(), 3, 2000)]);
+        assert_eq!(t.left("lib"), (1, 2000));
+        t.set_todo("lib", vec![]);
         assert_eq!(t.left("lib"), (0, 0));
     }
 
