@@ -233,6 +233,10 @@ sequenceDiagram
 - A deletion says what was deleted (the hash of the file). A device deletes its copy only if it is
   that content, or what it indexed and has not changed; a different version is kept and becomes a
   newer version. So a deletion cannot remove work that never reached the deleting device.
+- A file another device deleted is kept aside for up to five minutes (at most 20 000 files, in a
+  private folder inside the library that is never synced or followed if it is a link) so that a
+  rename does not fetch it again. It is only put back for an entry with the same hash and size,
+  and a copy made from other local content is checked against the hash before it is used.
 - Ignore patterns come from `.rustsyncignore`, which is synced like any file: a device that syncs a
   library can change what the others leave out (as it could delete the files). Leaving something
   out never deletes it anywhere. The file is read without following links, at most 64 KiB and 500

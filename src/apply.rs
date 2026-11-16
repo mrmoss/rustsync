@@ -6,12 +6,13 @@
 //! hash before an atomic rename.
 
 use crate::index::{
-    chunk_size, disk_matches, fd_inside, hash_file, mtime_of, now_ns, open_nofollow, remote_wins, sanitize_remote, Entry,
-    Folder, Kind, TMP_PREFIX,
+    chunk_size, disk_matches, fd_inside, hash_file, mtime_of, now_ns, open_nofollow, remote_wins, safe_rel,
+    sanitize_remote, Entry, Folder, Kind, TMP_PREFIX,
 };
 use crate::sync::Remote;
 use anyhow::{anyhow, bail, Context, Result};
 use futures_util::StreamExt;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -118,13 +119,28 @@ pub async fn apply_entries(folder: &Arc<Folder>, remote: &Remote, entries: Vec<E
     // Several files at once where that helps (an SSD), one after another where it hurts (a hard
     // disk); never more than the device allows in total.
     let at_once = folder.files_at_once.load(Ordering::Relaxed).clamp(1, 16);
+    // Content that is already here under another name (a file that was copied, or renamed with
+    // the deletion still to come) is copied on this disk instead of fetched: hash -> path.
+    let sources: HashMap<String, String> = {
+        let wanted: HashSet<&str> = files.iter().filter(|e| e.size > 0).map(|e| e.hash.as_str()).collect();
+        if wanted.is_empty() {
+            HashMap::new()
+        } else {
+            let idx = folder.index.lock().unwrap();
+            idx.values()
+                .filter(|l| l.is_live_file() && l.size > 0 && wanted.contains(l.hash.as_str()))
+                .map(|l| (l.hash.clone(), l.path.clone()))
+                .collect()
+        }
+    };
     let (folder2, remote2) = (folder.clone(), remote.clone());
     let jobs = futures_util::stream::iter(files)
         .map(move |e| {
             let (folder, remote) = (folder2.clone(), remote2.clone());
+            let source = sources.get(&e.hash).filter(|p| **p != e.path).cloned();
             async move {
                 let _slot = remote.file_slot().await;
-                let res = apply_file(&folder, &remote, &e).await;
+                let res = apply_file(&folder, &remote, &e, source).await;
                 // Arrived, skipped or given up: it no longer counts as "left".
                 remote.file_done(&folder.id, &e.path, e.stamp);
                 (e, res)
@@ -232,7 +248,11 @@ fn apply_meta(folder: &Folder, e: &Entry) -> Result<Option<Entry>> {
                     warn!("not deleting {}: it has local changes", e.path);
                     return Ok(None);
                 }
-                fs::remove_file(&abs)?;
+                // Kept aside for a few minutes rather than deleted at once: if the same content
+                // is announced under another name, this was a rename, and the file is put there.
+                if !folder.stash_file(&abs, &e.hash, md.len()) {
+                    fs::remove_file(&abs)?;
+                }
             }
         }
     } else {
@@ -257,7 +277,48 @@ fn apply_meta(folder: &Folder, e: &Entry) -> Result<Option<Entry>> {
     Ok(Some(e.clone()))
 }
 
-async fn apply_file(folder: &Arc<Folder>, remote: &Remote, e: &Entry) -> Result<bool> {
+/// Put a finished temp file in place (or give it up), holding the lock that keeps scans away.
+async fn commit(folder: &Arc<Folder>, e: &Entry, tmp: &Path, planned: &Option<Entry>) -> Result<bool> {
+    let _guard = folder.fs_lock.lock().await;
+    let (f, e2, t2, l2) = (folder.clone(), e.clone(), tmp.to_path_buf(), planned.clone());
+    tokio::task::spawn_blocking(move || {
+        let res = commit_file(&f, &e2, &t2, l2.as_ref());
+        if !matches!(res, Ok(true)) {
+            let _ = fs::remove_file(&t2);
+            tidy_parents(&f, &e2.path);
+        }
+        res
+    })
+    .await?
+}
+
+/// Make `tmp` a copy of a local file that should have the content `hash`. False if it turned
+/// out to be something else (the caller removes `tmp`).
+fn copy_local(src: &Path, root: &Path, tmp: &Path, hash: &str) -> Result<bool> {
+    use std::io::{Read, Write};
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut from = open_nofollow(src, root)?;
+    let mut to = fs::OpenOptions::new().write(true).create_new(true).mode(0o600).custom_flags(libc::O_NOFOLLOW).open(tmp)?;
+    if !fd_inside(to.as_raw_fd(), root) {
+        bail!("{} would be written outside the library folder", tmp.display());
+    }
+    let mut whole = blake3::Hasher::new();
+    let mut buf = vec![0u8; 1 << 20];
+    loop {
+        let n = from.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        whole.update(&buf[..n]);
+        to.write_all(&buf[..n])?;
+    }
+    to.flush()?;
+    Ok(whole.finalize().to_hex().as_str() == hash)
+}
+
+/// `source`: the path of another file here that has the same content, if there is one.
+async fn apply_file(folder: &Arc<Folder>, remote: &Remote, e: &Entry, source: Option<String>) -> Result<bool> {
     let abs = folder.abs(&e.path);
     let local = folder.get(&e.path);
     if !remote_wins(local.as_ref(), e) {
@@ -284,12 +345,35 @@ async fn apply_file(folder: &Arc<Folder>, remote: &Remote, e: &Entry) -> Result<
 
     let parent = abs.parent().ok_or_else(|| anyhow!("bad path"))?;
     tokio::fs::create_dir_all(parent).await?;
+
+    // Renamed or moved on the other device: a file with exactly this content was deleted here a
+    // moment ago and is still kept aside. Put it back under the new name; nothing is fetched.
+    if let Some(stashed) = folder.take_stashed(&e.hash, e.size) {
+        debug!("{} is a file that was renamed or moved", e.path);
+        return commit(folder, e, &stashed, &local).await;
+    }
+
     let tmp: PathBuf = parent.join(format!(
         "{}{}-{}",
         TMP_PREFIX,
         std::process::id(),
         TMP_COUNTER.fetch_add(1, Ordering::Relaxed)
     ));
+
+    // The same content is here under another name: copy it on this disk instead of fetching it.
+    if let Some(src) = source {
+        let from = folder.abs(&src);
+        let usable = matches!(folder.get(&src), Some(l) if l.is_live_file() && l.hash == e.hash && l.size == e.size && disk_matches(&from, &l));
+        if usable && safe_rel(&src) {
+            let (root, t2, hash) = (folder.root.clone(), tmp.clone(), e.hash.clone());
+            let copied = tokio::task::spawn_blocking(move || copy_local(&from, &root, &t2, &hash)).await?;
+            if matches!(copied, Ok(true)) {
+                debug!("{} copied from {} (same content)", e.path, src);
+                return commit(folder, e, &tmp, &local).await;
+            }
+            let _ = tokio::fs::remove_file(&tmp).await;
+        }
+    }
 
     let built = build_temp(
         folder.clone(),
@@ -313,18 +397,7 @@ async fn apply_file(folder: &Arc<Folder>, remote: &Remote, e: &Entry) -> Result<
         return Err(err);
     }
 
-    let _guard = folder.fs_lock.lock().await;
-    let (f, e2, t2, l2) = (folder.clone(), e.clone(), tmp.clone(), local.clone());
-    let res = tokio::task::spawn_blocking(move || {
-        let res = commit_file(&f, &e2, &t2, l2.as_ref());
-        if !matches!(res, Ok(true)) {
-            let _ = fs::remove_file(&t2);
-            tidy_parents(&f, &e2.path);
-        }
-        res
-    })
-    .await?;
-    res
+    commit(folder, e, &tmp, &local).await
 }
 
 /// The file being fetched was changed or deleted meanwhile: the fetch stops.
@@ -648,6 +721,30 @@ mod tests {
         drop(t);
         assert!(apply_meta(&f, &deletion(&f, &hash)).unwrap().is_some());
         assert!(!data.join("f").exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_deleted_file_is_kept_aside_and_a_copy_is_made_from_local_content() {
+        let (dir, data, f) = folder("rename");
+        let entry = f.get("f").unwrap();
+        // deleted by another device: gone from its place, but still to be had by its content
+        assert!(apply_meta(&f, &deletion(&f, &entry.hash)).unwrap().is_some());
+        assert!(!data.join("f").exists());
+        let back = f.take_stashed(&entry.hash, entry.size).expect("kept aside");
+        assert_eq!(fs::read(&back).unwrap(), b"version one");
+        // put under a new name, as a rename does
+        let mut renamed = entry.clone();
+        renamed.path = "g".to_string();
+        assert!(commit_file(&f, &renamed, &back, None).unwrap());
+        assert_eq!(fs::read(data.join("g")).unwrap(), b"version one");
+        assert_eq!(f.get("g").unwrap().hash, entry.hash);
+        // a copy of local content is checked against the hash it should have
+        let tmp = data.join(format!("{}copy", TMP_PREFIX));
+        assert!(copy_local(&data.join("g"), &f.root, &tmp, &entry.hash).unwrap());
+        assert_eq!(fs::read(&tmp).unwrap(), b"version one");
+        fs::remove_file(&tmp).unwrap();
+        assert!(!copy_local(&data.join("g"), &f.root, &tmp, &"0".repeat(64)).unwrap());
         let _ = fs::remove_dir_all(&dir);
     }
 

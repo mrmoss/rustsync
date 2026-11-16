@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use crate::ignore::{Ignore, IGNORE_FILE, MAX_FILE_LEN};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tracing::{debug, warn};
 
 /// Files are cut into equal pieces ("chunks"); the size of the pieces depends only on the size of
@@ -26,6 +26,18 @@ pub const MAX_CHUNK: usize = 4 * 1024 * 1024;
 const SMALL_FILE: u64 = 64 * 1024 * 1024;
 const MEDIUM_FILE: u64 = 16 * 1024 * 1024 * 1024;
 pub const TMP_PREFIX: &str = ".fsync-tmp-";
+/// Files another device deleted wait here for a few minutes (in the top folder of the library;
+/// never synced, like every temp file): if the same content turns up under another name, the
+/// file was renamed or moved, and it is put back under the new name instead of fetched again.
+const STASH_DIR: &str = ".fsync-tmp-stash";
+pub const STASH_KEEP: Duration = Duration::from_secs(300);
+const MAX_STASH: usize = 20_000;
+
+struct Stashed {
+    path: PathBuf,
+    size: u64,
+    at: Instant,
+}
 /// Largest file we sync: its chunk list must fit comfortably in one index message.
 pub const MAX_CHUNKS: usize = 131_072;
 pub const MAX_FILE_SIZE: u64 = MAX_CHUNKS as u64 * MAX_CHUNK as u64;
@@ -281,6 +293,9 @@ pub struct Folder {
     pub perms: bool,
     /// The ignore patterns, and the (change time, size) of the file they were read from.
     ignore: Mutex<(Option<(u64, u64)>, Arc<Ignore>)>,
+    /// Deleted files that are kept for a moment, by the hash of their content (see STASH_DIR).
+    stash: Mutex<HashMap<String, Vec<Stashed>>>,
+    stash_seq: AtomicUsize,
 }
 
 /// Try whether permission bits set on a file in `root` stay as they were set.
@@ -335,7 +350,82 @@ impl Folder {
             hash_threads: AtomicUsize::new(1),
             perms,
             ignore: Mutex::new((None, Arc::new(Ignore::default()))),
+            stash: Mutex::new(HashMap::new()),
+            stash_seq: AtomicUsize::new(0),
         })
+    }
+
+    /// Instead of deleting a file right away, keep it aside for a few minutes under the hash of
+    /// its content. False if that is not possible (the caller then deletes it).
+    pub fn stash_file(&self, abs: &Path, hash: &str, size: u64) -> bool {
+        if hash.is_empty() || size == 0 {
+            return false;
+        }
+        let dir = self.root.join(STASH_DIR);
+        match fs::symlink_metadata(&dir) {
+            Ok(md) if md.is_dir() => {}
+            Ok(_) => return false,
+            Err(_) => {
+                use std::os::unix::fs::DirBuilderExt;
+                if fs::DirBuilder::new().mode(0o700).create(&dir).is_err() {
+                    return false;
+                }
+            }
+        }
+        let mut stash = self.stash.lock().unwrap();
+        if stash.values().map(|v| v.len()).sum::<usize>() >= MAX_STASH {
+            return false;
+        }
+        let n = self.stash_seq.fetch_add(1, Ordering::Relaxed);
+        let to = dir.join(format!("{}{}-{}", TMP_PREFIX, std::process::id(), n));
+        if fs::rename(abs, &to).is_err() {
+            return false;
+        }
+        stash.entry(hash.to_string()).or_default().push(Stashed { path: to, size, at: Instant::now() });
+        true
+    }
+
+    /// A file with this content that was deleted a moment ago, if there is one: it is the
+    /// caller's now (to move into place, or to remove).
+    pub fn take_stashed(&self, hash: &str, size: u64) -> Option<PathBuf> {
+        if hash.is_empty() || size == 0 {
+            return None;
+        }
+        let found = {
+            let mut stash = self.stash.lock().unwrap();
+            let mut list = stash.remove(hash)?;
+            let found = list.iter().position(|s| s.size == size).map(|i| list.swap_remove(i));
+            if !list.is_empty() {
+                stash.insert(hash.to_string(), list);
+            }
+            found?
+        };
+        match fs::symlink_metadata(&found.path) {
+            Ok(md) if md.is_file() && md.len() == size => Some(found.path),
+            _ => None,
+        }
+    }
+
+    /// Really delete what was kept aside for longer than `keep`.
+    pub fn purge_stash(&self, keep: Duration) {
+        let mut stash = self.stash.lock().unwrap();
+        if stash.is_empty() {
+            return;
+        }
+        let now = Instant::now();
+        for list in stash.values_mut() {
+            list.retain(|s| {
+                let old = now.duration_since(s.at) >= keep;
+                if old {
+                    let _ = fs::remove_file(&s.path);
+                }
+                !old
+            });
+        }
+        stash.retain(|_, list| !list.is_empty());
+        if stash.is_empty() {
+            let _ = fs::remove_dir(self.root.join(STASH_DIR));
+        }
     }
 
     /// The ignore patterns of this library (`.rustsyncignore` in its top folder), read again
@@ -510,6 +600,7 @@ pub fn scan(folder: &Folder, roots: &[String], deep: bool) -> Vec<Entry> {
     let mut updates: Vec<Entry> = Vec::new();
     let mut changed: Vec<Entry> = Vec::new();
     let mut to_hash: Vec<ToHash> = Vec::new();
+    folder.purge_stash(STASH_KEEP);
     let ign = folder.ignores();
     for r in &kept {
         walk(folder, &ign, r, &old, deep, &mut seen, &mut updates, &mut changed, &mut to_hash);
@@ -732,7 +823,6 @@ fn walk(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::Duration;
 
     #[test]
     fn hashes_must_be_lowercase_hex() {
@@ -900,6 +990,39 @@ mod tests {
         // and later changes in it are not seen
         fs::write(data.join("target/new"), b"x").unwrap();
         assert!(scan(&folder, &[String::new()], false).is_empty());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn deleted_files_wait_a_moment_and_can_be_taken_back() {
+        let (dir, data, state) = test_folder("stash");
+        fs::write(data.join("a"), b"hello").unwrap();
+        fs::write(data.join("b"), b"other").unwrap();
+        let folder = Folder::open("stash".into(), data.to_str().unwrap(), &state, 0).unwrap();
+        assert!(folder.stash_file(&data.join("a"), "h1", 5));
+        assert!(!data.join("a").exists());
+        // not seen by a scan, in either direction
+        let seen = scan(&folder, &[String::new()], false);
+        assert_eq!(seen.iter().map(|e| e.path.as_str()).collect::<Vec<_>>(), ["b"]);
+        // taken back by content (and size), once
+        assert!(folder.take_stashed("h1", 6).is_none());
+        let back = folder.take_stashed("h1", 5).unwrap();
+        assert_eq!(fs::read(&back).unwrap(), b"hello");
+        assert!(folder.take_stashed("h1", 5).is_none());
+        fs::remove_file(&back).unwrap();
+        // what nobody takes back is deleted after a while
+        assert!(folder.stash_file(&data.join("b"), "h2", 5));
+        folder.purge_stash(Duration::from_secs(3600));
+        fs::remove_file(folder.take_stashed("h2", 5).unwrap()).unwrap();
+        fs::write(data.join("c"), b"third").unwrap();
+        assert!(folder.stash_file(&data.join("c"), "h3", 5));
+        folder.purge_stash(Duration::ZERO);
+        assert!(folder.take_stashed("h3", 5).is_none());
+        assert!(!data.join(STASH_DIR).exists());
+        // empty files and unknown content are not kept
+        fs::write(data.join("e"), b"").unwrap();
+        assert!(!folder.stash_file(&data.join("e"), "h4", 0));
+        assert!(!folder.stash_file(&data.join("e"), "", 3));
         let _ = fs::remove_dir_all(&dir);
     }
 

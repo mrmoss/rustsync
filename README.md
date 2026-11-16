@@ -627,6 +627,14 @@ deletion reaches a device:
 Deletions are handled straight away, even while the device is still fetching other files, and a
 file that is deleted while it is being fetched stops being fetched.
 
+**Renaming and moving** files or folders does not send their content again. To the other devices a
+rename is a deletion and a new file with the same content; a device that gets the deletion keeps the
+file aside for a few minutes (in a hidden `.fsync-tmp-stash` folder at the top of the library) and
+puts it back under the new name when that is announced. If the new name is announced first, the
+file is copied on the device's own disk. Only content a device does not have at all is fetched.
+(Disk space of deleted files is therefore given back a few minutes after the deletion, not at
+once.)
+
 A file a device finds for the first time counts as being as old as its change time, so a copy
 that only turned up again cannot undo a later deletion. On disks that cannot keep Unix permissions
 (Android's shared storage, FAT/exFAT drives, many network shares) permissions are neither applied
