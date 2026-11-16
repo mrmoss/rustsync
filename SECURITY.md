@@ -214,8 +214,10 @@ sequenceDiagram
     B->>B: Pass the applied entries on to B's other sync partners
 ```
 
-- A **full scan** and re-announcement of every index also runs on a timer
-  (`sync_options.full_scan_interval`), which catches anything the file watcher missed.
+- A **full scan** also runs on a timer (`sync_options.full_scan_interval`), which catches anything
+  the file watcher missed. The whole index goes to a device when it connects, and again only when
+  it asks (`WantIndex`, at most every 20 seconds per library) because it had to drop or could not
+  apply part of it.
 - Requests are limited: for one device at most 64 MiB of file data is read or waits to be sent at
   a time (further requests wait their turn, and beyond 2048 waiting requests they are refused),
   queues are bounded, and an oversized or too-fast index is refused or skipped until the next full

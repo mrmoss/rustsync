@@ -143,7 +143,7 @@ impl Default for GuiConfig {
 
 #[derive(Debug, Deserialize)]
 pub struct SyncOptions {
-    /// Seconds between full scans (and full index re-announcements).
+    /// Seconds between full scans.
     #[serde(default = "default_scan_interval")]
     pub full_scan_interval: u64,
     /// Every Nth full scan re-hashes every file even if size/mtime are unchanged. 0 = never.

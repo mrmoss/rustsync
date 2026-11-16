@@ -131,6 +131,9 @@ pub enum Msg {
     Progress { lib: String, files: u64, bytes: u64 },
     /// I paused (or resumed) syncing a library with you; an empty `lib` means everything.
     Paused { lib: String, paused: bool },
+    /// Please send me your whole index of this library again (I had to drop or could not apply
+    /// some of it).
+    WantIndex { lib: String },
 }
 
 impl Msg {
@@ -297,9 +300,12 @@ impl Remote {
     }
 
     /// One file of a batch from this device is finished.
-    pub fn file_done(&self, lib: &str) {
+    /// A file of a batch is finished; `unfetched` bytes of it were not fetched (and so never
+    /// counted down as they arrived).
+    pub fn file_done(&self, lib: &str, unfetched: u64) {
         if let Some(t) = &self.traffic {
             t.file_done(lib);
+            t.got(lib, unfetched.min(usize::MAX as u64) as usize);
         }
     }
 
@@ -3206,8 +3212,9 @@ async fn watch_loop(
     }
 }
 
-/// Safety net: full rescan (catches dropped watcher events) and full index re-announcement
-/// (catches anything a peer missed). Every Nth scan re-hashes every file.
+/// Safety net: full rescan (catches dropped watcher events). Every Nth scan re-hashes every file.
+/// The whole index is not sent again on a timer: a device gets it when it connects, and asks for
+/// it again (`WantIndex`) when it had to drop or could not apply part of it.
 async fn periodic_loop(node: Arc<Node>, rt: Arc<LibRuntime>, every: u64, deep_every: u64) {
     let mut tick = tokio::time::interval(Duration::from_secs(every.max(1)));
     tick.tick().await;
@@ -3220,7 +3227,6 @@ async fn periodic_loop(node: Arc<Node>, rt: Arc<LibRuntime>, every: u64, deep_ev
         n += 1;
         let deep = deep_every > 0 && n % deep_every == 0;
         scan_and_broadcast(&node, &rt, vec![String::new()], deep).await;
-        node.broadcast(&rt.folder.id, &rt.folder.snapshot(), None);
     }
 }
 
@@ -3660,10 +3666,14 @@ async fn session_loop(
     };
 
     // Libraries we sync with this device: its index batches are applied one after another.
-    // `queued` counts the bytes waiting; beyond the budget new batches are skipped (they are
-    // re-sent at the next full scan), so a flood cannot grow our memory without limit.
+    // `queued` counts the bytes waiting; beyond the budget new batches are skipped (and the whole
+    // index is asked for again later), so a flood cannot grow our memory without limit.
     let queued = Arc::new(AtomicUsize::new(0));
-    let (apply_tx, mut apply_rx) = mpsc::unbounded_channel::<(String, Vec<Entry>, usize, u64, u64)>();
+    let wants = Arc::new(IndexWants { tx: tx.clone(), last: Mutex::new(HashMap::new()) });
+    // Files counted in "left" that are waiting or being fetched: (library, path) -> version. A
+    // file that is announced again before it arrived is not counted twice.
+    let inflight: Arc<Mutex<HashMap<(String, String), u64>>> = Arc::new(Mutex::new(HashMap::new()));
+    let (apply_tx, mut apply_rx) = mpsc::unbounded_channel::<(String, Vec<Entry>, usize, u64, u64, Vec<(String, u64)>)>();
     {
         let node = node.clone();
         let origin = dev.key.clone();
@@ -3671,10 +3681,20 @@ async fn session_loop(
         let handle = handle.clone();
         let queued = queued.clone();
         let traffic = traffic.clone();
+        let (wants, inflight) = (wants.clone(), inflight.clone());
         tokio::spawn(async move {
-            while let Some((lib, entries, cost, files_left, bytes_left)) = apply_rx.recv().await {
-                apply_batch(&node, &handle, &origin, &origin_name, &lib, entries).await;
+            while let Some((lib, entries, cost, files_left, bytes_left, counted)) = apply_rx.recv().await {
+                apply_batch(&node, &handle, &origin, &origin_name, &lib, entries, &wants).await;
                 traffic.finish(&lib, files_left, bytes_left);
+                {
+                    let mut infl = inflight.lock().unwrap();
+                    for (path, stamp) in counted {
+                        let key = (lib.clone(), path);
+                        if infl.get(&key) == Some(&stamp) {
+                            infl.remove(&key);
+                        }
+                    }
+                }
                 queued.fetch_sub(cost, Ordering::Relaxed);
             }
         });
@@ -3688,9 +3708,10 @@ async fn session_loop(
         let origin_name = dev.display_name().to_string();
         let handle = handle.clone();
         let queued = queued.clone();
+        let wants = wants.clone();
         tokio::spawn(async move {
             while let Some((lib, entries, cost)) = gone_rx.recv().await {
-                apply_batch(&node, &handle, &origin, &origin_name, &lib, entries).await;
+                apply_batch(&node, &handle, &origin, &origin_name, &lib, entries, &wants).await;
                 queued.fetch_sub(cost, Ordering::Relaxed);
             }
         });
@@ -3718,6 +3739,7 @@ async fn session_loop(
     let serve_budget = Arc::new(Semaphore::new(serve_units as usize));
     let serving = Arc::new(AtomicUsize::new(0));
     let open_files = Arc::new(OpenFiles::default());
+    let mut index_sent: HashMap<String, Instant> = HashMap::new();
     let mut asm = Reassembler::default();
     let mut ping = tokio::time::interval(Duration::from_secs(15));
     let mut progress = tokio::time::interval(Duration::from_secs(1));
@@ -3772,6 +3794,18 @@ async fn session_loop(
                     Msg::Resync => {
                         let _ = tx.try_send(node.libraries_msg_for(&dev.key));
                     }
+                    Msg::WantIndex { lib } => {
+                        // At most every 20 seconds per library: sending a whole index is work.
+                        let now = Instant::now();
+                        let due = index_sent.get(&lib).is_none_or(|t| now.duration_since(*t) > Duration::from_secs(20));
+                        if due && lib.len() <= 128 && node.is_peer(&lib, &dev.key) {
+                            if index_sent.len() > 4096 {
+                                index_sent.clear();
+                            }
+                            index_sent.insert(lib.clone(), now);
+                            node.push_index(&dev.key, &lib);
+                        }
+                    }
                     Msg::Paused { lib, paused } => {
                         if lib.len() <= 128 && (lib.is_empty() || node.shares(&lib, &dev.key)) {
                             node.their_pause(&dev.key, &lib, paused, &jobs_tx);
@@ -3817,16 +3851,27 @@ async fn session_loop(
                         if node.is_peer(&lib, &dev.key) && !node.pauses.any(&lib, &dev.key) {
                             let cost = bytes.len().max(256);
                             if queued.load(Ordering::Relaxed) + cost > MAX_QUEUED_APPLY {
-                                warn!(device = %dev.display_name(), "sending faster than we can apply; skipped an update (it is re-sent at the next full scan)");
+                                warn!(device = %dev.display_name(), "sending faster than we can apply; skipped an update (it is asked for again in a while)");
+                                wants.ask(&lib, Duration::from_secs(60));
                             } else {
-                                // How much of this we do not have yet (for the progress shown).
+                                // How much of this we do not have yet (for the progress shown);
+                                // files already counted (announced again before they arrived)
+                                // are not counted twice.
+                                let mut counted: Vec<(String, u64)> = Vec::new();
                                 let (files, size) = match node.lib_rt(&lib) {
                                     Some(rt) => {
                                         let idx = rt.folder.index.lock().unwrap();
-                                        entries
-                                            .iter()
-                                            .filter(|e| e.is_live_file() && index::remote_wins(idx.get(&e.path), e))
-                                            .fold((0u64, 0u64), |(f, b), e| (f + 1, b.saturating_add(e.size.min(1 << 50))))
+                                        let mut infl = inflight.lock().unwrap();
+                                        let mut sum = (0u64, 0u64);
+                                        for e in entries.iter().filter(|e| e.is_live_file() && index::remote_wins(idx.get(&e.path), e)) {
+                                            let key = (lib.clone(), e.path.clone());
+                                            if infl.get(&key) != Some(&e.stamp) {
+                                                infl.insert(key, e.stamp);
+                                                counted.push((e.path.clone(), e.stamp));
+                                                sum = (sum.0 + 1, sum.1.saturating_add(e.size.min(1 << 50)));
+                                            }
+                                        }
+                                        sum
                                     }
                                     None => (0, 0),
                                 };
@@ -3844,7 +3889,7 @@ async fn session_loop(
                                     traffic.queue(&lib, files, size);
                                     queued.fetch_add(c, Ordering::Relaxed);
                                     let lib2 = lib.clone();
-                                    if apply_tx.send((lib, entries, c, files, size)).is_err() {
+                                    if apply_tx.send((lib, entries, c, files, size, counted)).is_err() {
                                         queued.fetch_sub(c, Ordering::Relaxed);
                                         traffic.finish(&lib2, files, size);
                                     }
@@ -3933,8 +3978,44 @@ async fn session_loop(
     res
 }
 
+/// Asks a device for its whole index again (later, and not more than once at a time).
+struct IndexWants {
+    tx: mpsc::Sender<Msg>,
+    /// library -> when it was asked for (or is going to be)
+    last: Mutex<HashMap<String, Instant>>,
+}
+
+impl IndexWants {
+    fn ask(&self, lib: &str, after: Duration) {
+        {
+            let mut last = self.last.lock().unwrap();
+            let now = Instant::now();
+            if last.get(lib).is_some_and(|t| now.duration_since(*t) < after + Duration::from_secs(30)) {
+                return;
+            }
+            if last.len() > 4096 {
+                last.clear();
+            }
+            last.insert(lib.to_string(), now + after);
+        }
+        let (tx, lib) = (self.tx.clone(), lib.to_string());
+        tokio::spawn(async move {
+            tokio::time::sleep(after).await;
+            let _ = tx.send(Msg::WantIndex { lib }).await;
+        });
+    }
+}
+
 /// Apply one batch of changes a device sent, and pass on what changed here.
-async fn apply_batch(node: &Arc<Node>, handle: &Remote, origin: &str, origin_name: &str, lib: &str, entries: Vec<Entry>) {
+async fn apply_batch(
+    node: &Arc<Node>,
+    handle: &Remote,
+    origin: &str,
+    origin_name: &str,
+    lib: &str,
+    entries: Vec<Entry>,
+    wants: &IndexWants,
+) {
     if node.pauses.any(lib, origin) {
         return; // paused after it arrived: it is sent again when syncing is resumed
     }
@@ -3946,8 +4027,15 @@ async fn apply_batch(node: &Arc<Node>, handle: &Remote, origin: &str, origin_nam
             }
             node.broadcast(lib, &applied.changes, Some(origin));
             node.broadcast(lib, &applied.kept, None);
+            if applied.failed > 0 {
+                // Tried again with a fresh copy of its index in a while.
+                wants.ask(lib, Duration::from_secs(60));
+            }
         }
-        Err(e) => warn!(device = %origin_name, library = %node.lib_label(lib), "could not apply changes: {:#}", e),
+        Err(e) => {
+            warn!(device = %origin_name, library = %node.lib_label(lib), "could not apply changes: {:#}", e);
+            wants.ask(lib, Duration::from_secs(60));
+        }
     }
 }
 
