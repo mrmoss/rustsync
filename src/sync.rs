@@ -300,12 +300,11 @@ impl Remote {
     }
 
     /// One file of a batch from this device is finished.
-    /// A file of a batch is finished; `unfetched` bytes of it were not fetched (and so never
-    /// counted down as they arrived).
-    pub fn file_done(&self, lib: &str, unfetched: u64) {
+    /// This version of a file is finished (it arrived, was skipped or was given up): it no
+    /// longer counts as "left".
+    pub fn file_done(&self, lib: &str, path: &str, stamp: u64) {
         if let Some(t) = &self.traffic {
-            t.file_done(lib);
-            t.got(lib, unfetched.min(usize::MAX as u64) as usize);
+            t.file_done(lib, path, stamp);
         }
     }
 
@@ -360,7 +359,7 @@ impl Remote {
             bail!("syncing is paused");
         }
         self.down.take(len.min(MAX_CHUNK as u64) as usize).await;
-        let lib_id = lib.clone();
+        let (lib_id, path_id) = (lib.clone(), path.clone());
         let data = if let Some(vault) = &self.vault {
             let id = vault.blob_id(&hash);
             let id2 = id.clone();
@@ -372,7 +371,7 @@ impl Remote {
             self.call(move |req| Msg::GetChunk { req, lib, path, index, hash }).await?
         };
         if let Some(t) = &self.traffic {
-            t.got(&lib_id, data.len());
+            t.got(&lib_id, &path_id, data.len());
         }
         Ok((data, room))
     }
@@ -3670,10 +3669,9 @@ async fn session_loop(
     // index is asked for again later), so a flood cannot grow our memory without limit.
     let queued = Arc::new(AtomicUsize::new(0));
     let wants = Arc::new(IndexWants { tx: tx.clone(), last: Mutex::new(HashMap::new()) });
-    // Files counted in "left" that are waiting or being fetched: (library, path) -> version. A
-    // file that is announced again before it arrived is not counted twice.
-    let inflight: Arc<Mutex<HashMap<(String, String), u64>>> = Arc::new(Mutex::new(HashMap::new()));
-    let (apply_tx, mut apply_rx) = mpsc::unbounded_channel::<(String, Vec<Entry>, usize, u64, u64, Vec<(String, u64)>)>();
+    // With each batch goes the list of its files that were counted as "left" (path, version), so
+    // that whatever is still counted when the batch is done is taken off.
+    let (apply_tx, mut apply_rx) = mpsc::unbounded_channel::<(String, Vec<Entry>, usize, Vec<(String, u64)>)>();
     {
         let node = node.clone();
         let origin = dev.key.clone();
@@ -3681,19 +3679,12 @@ async fn session_loop(
         let handle = handle.clone();
         let queued = queued.clone();
         let traffic = traffic.clone();
-        let (wants, inflight) = (wants.clone(), inflight.clone());
+        let wants = wants.clone();
         tokio::spawn(async move {
-            while let Some((lib, entries, cost, files_left, bytes_left, counted)) = apply_rx.recv().await {
+            while let Some((lib, entries, cost, counted)) = apply_rx.recv().await {
                 apply_batch(&node, &handle, &origin, &origin_name, &lib, entries, &wants).await;
-                traffic.finish(&lib, files_left, bytes_left);
-                {
-                    let mut infl = inflight.lock().unwrap();
-                    for (path, stamp) in counted {
-                        let key = (lib.clone(), path);
-                        if infl.get(&key) == Some(&stamp) {
-                            infl.remove(&key);
-                        }
-                    }
+                for (path, stamp) in counted {
+                    traffic.file_done(&lib, &path, stamp);
                 }
                 queued.fetch_sub(cost, Ordering::Relaxed);
             }
@@ -3854,27 +3845,25 @@ async fn session_loop(
                                 warn!(device = %dev.display_name(), "sending faster than we can apply; skipped an update (it is asked for again in a while)");
                                 wants.ask(&lib, Duration::from_secs(60));
                             } else {
-                                // How much of this we do not have yet (for the progress shown);
-                                // files already counted (announced again before they arrived)
-                                // are not counted twice.
+                                // What of this we do not have yet is counted as "left" (for the
+                                // progress shown), file by file: a file announced again before it
+                                // arrived is not counted twice, and one that is deleted or
+                                // replaced meanwhile leaves the count at once, whatever else is
+                                // still waiting.
                                 let mut counted: Vec<(String, u64)> = Vec::new();
-                                let (files, size) = match node.lib_rt(&lib) {
-                                    Some(rt) => {
-                                        let idx = rt.folder.index.lock().unwrap();
-                                        let mut infl = inflight.lock().unwrap();
-                                        let mut sum = (0u64, 0u64);
-                                        for e in entries.iter().filter(|e| e.is_live_file() && index::remote_wins(idx.get(&e.path), e)) {
-                                            let key = (lib.clone(), e.path.clone());
-                                            if infl.get(&key) != Some(&e.stamp) {
-                                                infl.insert(key, e.stamp);
-                                                counted.push((e.path.clone(), e.stamp));
-                                                sum = (sum.0 + 1, sum.1.saturating_add(e.size.min(1 << 50)));
-                                            }
+                                if let Some(rt) = node.lib_rt(&lib) {
+                                    let idx = rt.folder.index.lock().unwrap();
+                                    for e in entries.iter() {
+                                        if e.deleted {
+                                            traffic.superseded(&lib, &e.path, e.stamp);
+                                        } else if e.is_live_file()
+                                            && index::remote_wins(idx.get(&e.path), e)
+                                            && traffic.queue_file(&lib, &e.path, e.stamp, e.size.min(1 << 50))
+                                        {
+                                            counted.push((e.path.clone(), e.stamp));
                                         }
-                                        sum
                                     }
-                                    None => (0, 0),
-                                };
+                                }
                                 let total = entries.len().max(1);
                                 let (gone, entries): (Vec<Entry>, Vec<Entry>) = entries.into_iter().partition(|e| e.deleted);
                                 if !gone.is_empty() {
@@ -3886,12 +3875,13 @@ async fn session_loop(
                                 }
                                 if !entries.is_empty() {
                                     let c = (cost * entries.len() / total).max(1);
-                                    traffic.queue(&lib, files, size);
                                     queued.fetch_add(c, Ordering::Relaxed);
-                                    let lib2 = lib.clone();
-                                    if apply_tx.send((lib, entries, c, files, size, counted)).is_err() {
+                                    if let Err(back) = apply_tx.send((lib, entries, c, counted)) {
                                         queued.fetch_sub(c, Ordering::Relaxed);
-                                        traffic.finish(&lib2, files, size);
+                                        let (lib, _, _, counted) = back.0;
+                                        for (path, stamp) in counted {
+                                            traffic.file_done(&lib, &path, stamp);
+                                        }
                                     }
                                 }
                             }

@@ -124,11 +124,9 @@ pub async fn apply_entries(folder: &Arc<Folder>, remote: &Remote, entries: Vec<E
             let (folder, remote) = (folder2.clone(), remote2.clone());
             async move {
                 let _slot = remote.file_slot().await;
-                let fetched = Arc::new(AtomicU64::new(0));
-                let res = apply_file(&folder, &remote, &e, fetched.clone()).await;
-                // Whatever was not fetched of it (taken from the local copy, skipped, given up)
-                // no longer counts as "left".
-                remote.file_done(&folder.id, e.size.saturating_sub(fetched.load(Ordering::Relaxed)));
+                let res = apply_file(&folder, &remote, &e).await;
+                // Arrived, skipped or given up: it no longer counts as "left".
+                remote.file_done(&folder.id, &e.path, e.stamp);
                 (e, res)
             }
         })
@@ -259,7 +257,7 @@ fn apply_meta(folder: &Folder, e: &Entry) -> Result<Option<Entry>> {
     Ok(Some(e.clone()))
 }
 
-async fn apply_file(folder: &Arc<Folder>, remote: &Remote, e: &Entry, fetched: Arc<AtomicU64>) -> Result<bool> {
+async fn apply_file(folder: &Arc<Folder>, remote: &Remote, e: &Entry) -> Result<bool> {
     let abs = folder.abs(&e.path);
     let local = folder.get(&e.path);
     if !remote_wins(local.as_ref(), e) {
@@ -302,7 +300,6 @@ async fn apply_file(folder: &Arc<Folder>, remote: &Remote, e: &Entry, fetched: A
         local_chunks,
         local_size,
         tmp.clone(),
-        fetched,
     )
     .await;
     if let Err(err) = built {
@@ -367,7 +364,6 @@ async fn build_temp(
     local_chunks: Vec<String>,
     local_size: u64,
     tmp: PathBuf,
-    fetched: Arc<AtomicU64>,
 ) -> Result<()> {
     let (folder_id, root) = (folder.id.clone(), folder.root.clone());
     let watch = folder;
@@ -455,9 +451,6 @@ async fn build_temp(
     while let Some(res) = fetches.next().await {
         match res {
             Ok(piece) => {
-                if let Piece::Fetched(data, _) = &piece {
-                    fetched.fetch_add(data.len() as u64, Ordering::Relaxed);
-                }
                 if piece_tx.send(piece).await.is_err() {
                     break; // the writer stopped: its error is reported below
                 }

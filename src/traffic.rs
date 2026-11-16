@@ -6,13 +6,11 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 
-/// A library's changes that were announced by one device and are still being fetched from it.
-#[derive(Default)]
-struct Left {
-    files: u64,
+/// One file that was announced by a device and has not arrived yet: its version, and how many
+/// bytes of it are still to come.
+struct Pending {
+    stamp: u64,
     bytes: u64,
-    files_done: u64,
-    bytes_got: u64,
 }
 
 #[derive(Default)]
@@ -23,8 +21,10 @@ pub struct Traffic {
     up_rate: AtomicU64,
     down_rate: AtomicU64,
     last: Mutex<(u64, u64)>,
-    /// library id -> what we are still fetching from this device
-    todo: Mutex<HashMap<String, Left>>,
+    /// library id -> path -> the files we are still to fetch from this device. Kept per file, so
+    /// that a file leaves the count the moment it arrived, was deleted or was replaced, whatever
+    /// else is still waiting.
+    todo: Mutex<HashMap<String, HashMap<String, Pending>>>,
     /// library id -> what this device says it is still fetching from us (files, bytes)
     remote: Mutex<HashMap<String, (u64, u64)>>,
     /// library id -> what we last told this device about our own `todo`
@@ -63,55 +63,54 @@ impl Traffic {
 
     // ---- what we are fetching from this device
 
-    /// A batch of changes from this device is waiting to be applied.
-    pub fn queue(&self, lib: &str, files: u64, bytes: u64) {
-        if files == 0 && bytes == 0 {
-            return;
-        }
+    /// A file this device announced is going to be fetched. Returns false if exactly this
+    /// version was counted already (announced again before it arrived).
+    pub fn queue_file(&self, lib: &str, path: &str, stamp: u64, bytes: u64) -> bool {
         let mut m = self.todo.lock().unwrap();
-        let l = m.entry(lib.to_string()).or_default();
-        l.files = l.files.saturating_add(files);
-        l.bytes = l.bytes.saturating_add(bytes);
+        let files = m.entry(lib.to_string()).or_default();
+        if files.get(path).is_some_and(|p| p.stamp == stamp) {
+            return false;
+        }
+        files.insert(path.to_string(), Pending { stamp, bytes });
+        true
     }
 
     /// Some data of a file arrived.
-    pub fn got(&self, lib: &str, n: usize) {
-        if let Some(l) = self.todo.lock().unwrap().get_mut(lib) {
-            if l.bytes > 0 {
-                l.bytes_got = l.bytes_got.saturating_add(n as u64);
-            }
+    pub fn got(&self, lib: &str, path: &str, n: usize) {
+        if let Some(p) = self.todo.lock().unwrap().get_mut(lib).and_then(|files| files.get_mut(path)) {
+            p.bytes = p.bytes.saturating_sub(n as u64);
         }
     }
 
-    /// One file of the batch is finished (applied or not).
-    pub fn file_done(&self, lib: &str) {
-        if let Some(l) = self.todo.lock().unwrap().get_mut(lib) {
-            if l.files > 0 {
-                l.files_done += 1;
-            }
-        }
+    /// This version of a file is finished: it arrived, was skipped or was given up.
+    pub fn file_done(&self, lib: &str, path: &str, stamp: u64) {
+        self.drop_if(lib, path, |p| p.stamp == stamp);
     }
 
-    /// The batch that was queued with these numbers is finished.
-    pub fn finish(&self, lib: &str, files: u64, bytes: u64) {
+    /// A newer change of the path arrived (it was deleted, say): what was waiting is not fetched.
+    pub fn superseded(&self, lib: &str, path: &str, stamp: u64) {
+        self.drop_if(lib, path, |p| p.stamp < stamp);
+    }
+
+    fn drop_if(&self, lib: &str, path: &str, test: impl Fn(&Pending) -> bool) {
         let mut m = self.todo.lock().unwrap();
-        if let Some(l) = m.get_mut(lib) {
-            l.files = l.files.saturating_sub(files);
-            l.bytes = l.bytes.saturating_sub(bytes);
-            l.files_done = 0;
-            l.bytes_got = 0;
-            if l.files == 0 && l.bytes == 0 {
+        if let Some(files) = m.get_mut(lib) {
+            if files.get(path).is_some_and(test) {
+                files.remove(path);
+            }
+            if files.is_empty() {
                 m.remove(lib);
             }
         }
     }
 
+    fn sum(files: &HashMap<String, Pending>) -> (u64, u64) {
+        (files.len() as u64, files.values().fold(0u64, |b, p| b.saturating_add(p.bytes)))
+    }
+
     /// (files, bytes) of a library still to be fetched from this device.
     pub fn left(&self, lib: &str) -> (u64, u64) {
-        match self.todo.lock().unwrap().get(lib) {
-            Some(l) => (l.files.saturating_sub(l.files_done), l.bytes.saturating_sub(l.bytes_got)),
-            None => (0, 0),
-        }
+        self.todo.lock().unwrap().get(lib).map(Self::sum).unwrap_or((0, 0))
     }
 
     // ---- what the device says it is fetching from us
@@ -134,9 +133,7 @@ impl Traffic {
     pub fn report(&self) -> Vec<(String, u64, u64)> {
         let now: HashMap<String, (u64, u64)> = {
             let m = self.todo.lock().unwrap();
-            m.iter()
-                .map(|(k, l)| (k.clone(), (l.files.saturating_sub(l.files_done), l.bytes.saturating_sub(l.bytes_got))))
-                .collect()
+            m.iter().map(|(k, files)| (k.clone(), Self::sum(files))).collect()
         };
         let mut reported = self.reported.lock().unwrap();
         let mut out = Vec::new();
@@ -168,22 +165,52 @@ mod tests {
     #[test]
     fn progress_counts_down_and_is_reported_once() {
         let t = Traffic::default();
-        t.queue("lib", 3, 3000);
+        assert!(t.queue_file("lib", "a", 1, 1000));
+        assert!(t.queue_file("lib", "b", 1, 1000));
+        assert!(t.queue_file("lib", "c", 1, 1000));
         assert_eq!(t.left("lib"), (3, 3000));
-        t.got("lib", 1000);
-        t.file_done("lib");
+        t.got("lib", "a", 600);
+        assert_eq!(t.left("lib"), (3, 2400));
+        t.file_done("lib", "a", 1);
         assert_eq!(t.left("lib"), (2, 2000));
         assert_eq!(t.report(), vec![("lib".to_string(), 2, 2000)]);
         assert!(t.report().is_empty());
-        t.finish("lib", 3, 3000);
+        t.file_done("lib", "b", 1);
+        t.file_done("lib", "c", 1);
         assert_eq!(t.left("lib"), (0, 0));
         assert_eq!(t.report(), vec![("lib".to_string(), 0, 0)]);
         assert!(t.report().is_empty());
         // data that arrives with nothing queued (a backup pull) changes nothing
-        t.got("lib", 500);
-        t.file_done("lib");
-        t.queue("lib", 1, 100);
-        assert_eq!(t.left("lib"), (1, 100));
+        t.got("lib", "x", 500);
+        t.file_done("lib", "x", 1);
+        assert_eq!(t.left("lib"), (0, 0));
+    }
+
+    #[test]
+    fn a_file_is_counted_once_and_leaves_when_it_is_deleted_or_replaced() {
+        let t = Traffic::default();
+        assert!(t.queue_file("lib", "big", 5, 7_000));
+        // announced again before it arrived: not counted twice
+        assert!(!t.queue_file("lib", "big", 5, 7_000));
+        assert_eq!(t.left("lib"), (1, 7_000));
+        for i in 0..1200 {
+            t.queue_file("lib", &format!("dir/f{}", i), 6, 10);
+        }
+        assert_eq!(t.left("lib"), (1201, 19_000));
+        // the folder is deleted while the big file is still on its way
+        for i in 0..1200 {
+            t.superseded("lib", &format!("dir/f{}", i), 9);
+        }
+        assert_eq!(t.left("lib"), (1, 7_000));
+        // an older deletion does not remove a newer version that is waiting
+        t.superseded("lib", "big", 4);
+        assert_eq!(t.left("lib"), (1, 7_000));
+        // a newer version replaces the one that was waiting; finishing the old one changes nothing
+        assert!(t.queue_file("lib", "big", 8, 9_000));
+        t.file_done("lib", "big", 5);
+        assert_eq!(t.left("lib"), (1, 9_000));
+        t.file_done("lib", "big", 8);
+        assert_eq!(t.left("lib"), (0, 0));
     }
 
     #[test]
